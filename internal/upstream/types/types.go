@@ -304,6 +304,42 @@ func (sm *StateManager) ValidateTransition(from, to ConnectionState) error {
 	return fmt.Errorf("invalid transition from %s to %s", from, to)
 }
 
+// ResetPreservingRetryState resets the connection state to Disconnected for a
+// reconnection attempt while preserving the retry counter so that exponential
+// backoff accumulates across attempts instead of restarting from zero each time.
+// OAuth errors are not auto-retried, so OAuth fields are not relied on here but
+// are preserved for consistency.
+func (sm *StateManager) ResetPreservingRetryState() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	oldState := sm.currentState
+	sm.currentState = StateDisconnected
+	sm.lastError = nil
+	sm.serverName = ""
+	sm.serverVersion = ""
+	// retryCount, lastRetryTime, oauthRetryCount, lastOAuthAttempt,
+	// and isOAuthError are intentionally preserved
+
+	info := ConnectionInfo{
+		State:            sm.currentState,
+		LastError:        sm.lastError,
+		RetryCount:       sm.retryCount,
+		LastRetryTime:    sm.lastRetryTime,
+		ServerName:       sm.serverName,
+		ServerVersion:    sm.serverVersion,
+		LastOAuthAttempt: sm.lastOAuthAttempt,
+		OAuthRetryCount:  sm.oauthRetryCount,
+		IsOAuthError:     sm.isOAuthError,
+	}
+
+	callback := sm.onStateChange
+
+	if callback != nil {
+		go callback(oldState, StateDisconnected, &info)
+	}
+}
+
 // Reset resets the state manager to disconnected state
 func (sm *StateManager) Reset() {
 	sm.mu.Lock()

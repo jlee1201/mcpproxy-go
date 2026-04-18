@@ -246,6 +246,17 @@ func (p *ActorPoolSimple) IsUserLoggedOut(name string) bool {
 	return client.IsUserLoggedOut()
 }
 
+func (p *ActorPoolSimple) ShouldSkipReconnect(name string) bool {
+	client, exists := p.manager.GetClient(name)
+	if !exists {
+		return false
+	}
+	if client.StateManager.IsOAuthError() {
+		return true
+	}
+	return !client.ShouldRetry()
+}
+
 // Subscribe returns a channel that receives supervisor events.
 func (p *ActorPoolSimple) Subscribe() <-chan Event {
 	p.eventMu.Lock()

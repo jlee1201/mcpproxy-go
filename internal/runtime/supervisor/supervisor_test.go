@@ -110,6 +110,10 @@ func (m *MockUpstreamAdapter) IsUserLoggedOut(name string) bool {
 	return false
 }
 
+func (m *MockUpstreamAdapter) ShouldSkipReconnect(name string) bool {
+	return false
+}
+
 func (m *MockUpstreamAdapter) Subscribe() <-chan Event {
 	return m.eventCh
 }

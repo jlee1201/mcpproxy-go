@@ -303,6 +303,25 @@ func (p *ActorPool) IsUserLoggedOut(name string) bool {
 	return client.IsUserLoggedOut()
 }
 
+func (p *ActorPool) ShouldSkipReconnect(name string) bool {
+	p.mu.RLock()
+	a, exists := p.actors[name]
+	p.mu.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	client := a.GetClient()
+	if client == nil {
+		return false
+	}
+	if client.StateManager.IsOAuthError() {
+		return true
+	}
+	return !client.ShouldRetry()
+}
+
 // forwardActorEvents subscribes to actor events and forwards them as supervisor events.
 func (p *ActorPool) forwardActorEvents(name string, a *actor.Actor) {
 	events := a.Events()

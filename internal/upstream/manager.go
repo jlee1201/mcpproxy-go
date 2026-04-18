@@ -1045,6 +1045,13 @@ func (m *Manager) ConnectAll(ctx context.Context) error {
 			continue
 		}
 
+		if client.GetState() == types.StateError && client.StateManager.IsOAuthError() {
+			m.logger.Debug("Skipping connect: OAuth requires user action",
+				zap.String("id", id),
+				zap.String("name", client.Config.Name))
+			continue
+		}
+
 		if client.GetState() == types.StateError && !client.ShouldRetry() {
 			info := client.GetConnectionInfo()
 			m.logger.Debug("Client backoff active, skipping connect attempt",
@@ -1348,6 +1355,11 @@ func (m *Manager) RetryConnection(serverName string) error {
 		m.logger.Info("Skipping retry: client already connecting",
 			zap.String("server", serverName),
 			zap.String("state", client.GetState().String()))
+		return nil
+	}
+	if client.StateManager.IsOAuthError() {
+		m.logger.Debug("Skipping retry: OAuth requires user action",
+			zap.String("server", serverName))
 		return nil
 	}
 
