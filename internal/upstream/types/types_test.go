@@ -98,3 +98,23 @@ func TestStateManager_ShouldRetryOAuth_LoggedOut(t *testing.T) {
 	sm.SetUserLoggedOut(true)
 	assert.False(t, sm.ShouldRetryOAuth())
 }
+
+// TestStateManager_ClearOAuthError verifies the OAuth-error gate is fully
+// cleared: flag off, backoff counter reset, and state moved out of Error so a
+// fresh reconnect can proceed.
+func TestStateManager_ClearOAuthError(t *testing.T) {
+	sm := NewStateManager()
+
+	// Two OAuth failures: flag set, backoff advanced, state Error.
+	sm.SetOAuthError(errors.New("oauth failed"))
+	sm.SetOAuthError(errors.New("oauth failed again"))
+	assert.True(t, sm.IsOAuthError())
+	assert.Equal(t, StateError, sm.GetState())
+
+	sm.ClearOAuthError()
+
+	assert.False(t, sm.IsOAuthError(), "OAuth-error flag should be cleared")
+	info := sm.GetConnectionInfo()
+	assert.Equal(t, 0, info.OAuthRetryCount, "OAuth backoff should reset")
+	assert.Equal(t, StateDisconnected, sm.GetState(), "state should leave Error so reconnect is clean")
+}

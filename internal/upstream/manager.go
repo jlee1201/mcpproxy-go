@@ -1727,6 +1727,12 @@ func (m *Manager) scanForNewTokens() {
 			zap.String("server", cfg.Name),
 			zap.Time("token_expires_at", tok.ExpiresAt))
 
+		// A freshly-persisted token is the user action the OAuth guard waits
+		// for, so clear the OAuth-error gate before retrying. Otherwise
+		// RetryConnection's IsOAuthError guard skips the reconnect, the flag is
+		// never cleared on success, and this scan loops forever.
+		c.StateManager.ClearOAuthError()
+
 		// Remember trigger time and retry connection
 		m.tokenReconnect[id] = now
 		_ = m.RetryConnection(cfg.Name)

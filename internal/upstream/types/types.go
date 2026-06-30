@@ -409,6 +409,50 @@ func (sm *StateManager) SetOAuthError(err error) {
 	}
 }
 
+// ClearOAuthError clears the OAuth-error gate and resets the OAuth backoff.
+//
+// It is called when a freshly-persisted token is detected (i.e. the user has
+// completed `auth login`) — the user action the OAuth guards in
+// Manager.RetryConnection / ConnectAll wait for. Without this, those guards
+// skip every reconnect while IsOAuthError stays true, and the flag is only
+// cleared on a *successful* connection (TransitionTo StateReady) — a connection
+// that, being skipped, never happens. The result is an infinite
+// "Detected persisted OAuth token; triggering reconnect" loop until the client
+// is rebuilt via disable+enable. Clearing the gate here lets the reconnect
+// actually run. State is moved out of Error so the next attempt is treated as a
+// clean reconnect.
+func (sm *StateManager) ClearOAuthError() {
+	sm.mu.Lock()
+
+	oldState := sm.currentState
+	sm.isOAuthError = false
+	sm.oauthRetryCount = 0
+	if sm.currentState == StateError {
+		sm.currentState = StateDisconnected
+		sm.lastError = nil
+	}
+
+	info := ConnectionInfo{
+		State:            sm.currentState,
+		LastError:        sm.lastError,
+		RetryCount:       sm.retryCount,
+		LastRetryTime:    sm.lastRetryTime,
+		ServerName:       sm.serverName,
+		ServerVersion:    sm.serverVersion,
+		LastOAuthAttempt: sm.lastOAuthAttempt,
+		OAuthRetryCount:  sm.oauthRetryCount,
+		IsOAuthError:     sm.isOAuthError,
+	}
+	newState := sm.currentState
+	callback := sm.onStateChange
+	sm.mu.Unlock()
+
+	// Call the callback outside the lock to avoid deadlocks (mirrors Reset).
+	if callback != nil {
+		go callback(oldState, newState, &info)
+	}
+}
+
 // ShouldRetryOAuth returns true if OAuth should be retried with much longer backoff intervals
 func (sm *StateManager) ShouldRetryOAuth() bool {
 	sm.mu.RLock()

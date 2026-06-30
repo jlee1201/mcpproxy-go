@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/managed"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 )
 
 // TestRefreshOAuthToken_DynamicOAuthDiscovery tests that RefreshOAuthToken works
@@ -175,4 +177,84 @@ func TestRefreshOAuthToken_ServerNotFound(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "server not found")
+}
+
+// TestScanForNewTokens_ClearsOAuthErrorWhenTokenPresent reproduces the OAuth
+// token-conflict loop: after a fresh `auth login`, the new token is persisted,
+// but the client is still flagged IsOAuthError. scanForNewTokens detects the
+// token and calls RetryConnection — which (since 8e31b1e) bails out on the
+// IsOAuthError guard, so the reconnect never runs, the flag is never cleared on
+// success, and the daemon loops forever on "Detected persisted OAuth token;
+// triggering reconnect". A disable+enable works only because it rebuilds the
+// client with a fresh StateManager.
+//
+// The fix: when scanForNewTokens sees a freshly-persisted token (the user's
+// browser action), it must clear the OAuth-error gate so RetryConnection
+// actually attempts the reconnect.
+func TestScanForNewTokens_ClearsOAuthErrorWhenTokenPresent(t *testing.T) {
+	logger := zap.NewNop()
+	sugaredLogger := logger.Sugar()
+
+	serverConfig := &config.ServerConfig{
+		Name:     "test-oauth-recovery",
+		URL:      "http://127.0.0.1:1/mcp", // unroutable: background Connect fails fast
+		Protocol: "http",
+		Enabled:  true,
+		Created:  time.Now(),
+	}
+
+	tempDir := t.TempDir()
+	db, err := storage.NewBoltDB(tempDir, sugaredLogger)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Persist a FRESH (future-expiry) token — simulates the user having just
+	// completed `auth login`.
+	serverKey := oauth.GenerateServerKey(serverConfig.Name, serverConfig.URL)
+	token := &storage.OAuthTokenRecord{
+		ServerName:   serverKey,
+		DisplayName:  serverConfig.Name,
+		AccessToken:  "fresh-access-token",
+		RefreshToken: "fresh-refresh-token",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Now().Add(1 * time.Hour),
+		Created:      time.Now(),
+		Updated:      time.Now(),
+	}
+	require.NoError(t, db.SaveOAuthToken(token))
+
+	manager := &Manager{
+		clients:        make(map[string]*managed.Client),
+		logger:         logger,
+		storage:        db,
+		secretResolver: secret.NewResolver(),
+		tokenReconnect: make(map[string]time.Time),
+	}
+
+	client, err := managed.NewClient(
+		serverConfig.Name,
+		serverConfig,
+		logger,
+		nil,
+		&config.Config{},
+		db,
+		secret.NewResolver(),
+	)
+	require.NoError(t, err)
+	manager.clients[serverConfig.Name] = client
+
+	// Put the client into OAuth-error state, as it would be after the token expired.
+	client.StateManager.SetOAuthError(errors.New("OAuth authentication required"))
+	require.True(t, client.StateManager.IsOAuthError())
+	require.Equal(t, types.StateError, client.GetState())
+
+	// Act: the daemon detects the freshly-persisted token.
+	manager.scanForNewTokens()
+
+	// Assert: the OAuth-error gate is cleared so RetryConnection can actually
+	// reconnect. Before the fix this stays true forever → the reconnect loop.
+	// (A background failure to the unroutable URL uses SetError, not
+	// SetOAuthError, so it cannot flip this flag back to true.)
+	assert.False(t, client.StateManager.IsOAuthError(),
+		"scanForNewTokens must clear the OAuth-error flag when a fresh token is present")
 }
