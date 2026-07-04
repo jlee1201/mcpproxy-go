@@ -68,6 +68,13 @@ type Options struct {
 	RequirePKCE              bool // Default: true
 	RequireResourceIndicator bool // RFC 8707: Require resource parameter (default: false)
 
+	// StrictRefreshRotation enables single-use refresh tokens with reuse
+	// detection (RFC 6749 §10.4). Each refresh_token grant rotates the token
+	// under a single lock; presenting an already-consumed refresh token is
+	// treated as theft and revokes the entire token family. Models providers
+	// like Notion; default false keeps the lenient (non-rotating) behavior.
+	StrictRefreshRotation bool
+
 	// Error injection
 	ErrorMode ErrorMode
 

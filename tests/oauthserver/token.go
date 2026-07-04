@@ -223,6 +223,13 @@ func (s *OAuthTestServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Strict rotation with reuse detection is handled separately (atomic
+	// check-consume-rotate under a single lock).
+	if s.options.StrictRefreshRotation {
+		s.handleStrictRefreshRotation(w, r, clientID)
+		return
+	}
+
 	// Validate refresh token
 	tokenData, valid := s.validateRefreshToken(refreshToken)
 	if !valid {

@@ -28,7 +28,11 @@ type OAuthTestServer struct {
 	authCodes     map[string]*AuthorizationCode
 	deviceCodes   map[string]*DeviceCode
 	refreshTokens map[string]*RefreshTokenData
-	issuedTokens  []TokenInfo
+	// consumedRefreshTokens tracks refresh tokens that have already been
+	// exchanged, used only when Options.StrictRefreshRotation is set to detect
+	// refresh-token reuse. Lazily initialized by handleStrictRefreshRotation.
+	consumedRefreshTokens map[string]*RefreshTokenData
+	issuedTokens          []TokenInfo
 
 	mu sync.RWMutex
 
