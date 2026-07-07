@@ -300,12 +300,25 @@ func (p *PersistentTokenStore) ClearToken() error {
 func (p *PersistentTokenStore) beginRefresh() (isLeader bool, wait chan struct{}) {
 	p.refreshMu.Lock()
 	defer p.refreshMu.Unlock()
-	if p.refreshWait != nil && time.Since(p.refreshStart) < refreshCoalesceLease {
-		return false, p.refreshWait
+	if p.refreshWait != nil {
+		if time.Since(p.refreshStart) < refreshCoalesceLease {
+			return false, p.refreshWait
+		}
+		// Stale lease: the previous leader ran past the lease (hung/slow/errored and
+		// never called SaveToken). Close its channel NOW so its followers wake and
+		// retry instead of each blocking on their own timeout, then take over with a
+		// fresh channel. All refreshWait mutations happen under refreshMu, so each
+		// channel is closed exactly once (here on takeover, or in finishRefresh —
+		// whichever runs first for that generation; the other sees a non-matching
+		// refreshWait). A late SaveToken from the dead leader can still close our new
+		// channel early, but only ever wakes followers with an already-persisted valid
+		// token — never a deadlock or double-close.
+		close(p.refreshWait)
+		p.refreshWait = nil
 	}
 	p.refreshWait = make(chan struct{})
 	p.refreshStart = time.Now()
-	return true, nil
+	return true, p.refreshWait
 }
 
 // finishRefresh wakes any followers waiting on the in-flight refresh. Safe to
