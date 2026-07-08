@@ -31,18 +31,95 @@ type CallbackServerManager struct {
 	logger  *zap.Logger
 }
 
-// CallbackServer represents an active OAuth callback server
+// CallbackServer represents an active OAuth callback server.
+//
+// Callbacks are routed to waiters by their OAuth `state` parameter. This is
+// deliberate: a single callback server is shared per upstream server name, but
+// multiple OAuth flows (a manual `auth login`, an automatic reconnect, a retry)
+// can be in flight against it concurrently. Each flow generates a unique random
+// `state` and registers a dedicated channel via Register(state). handleCallback
+// delivers each callback ONLY to the waiter that owns its state. Without this,
+// concurrent waiters raced on one shared channel and a callback could be
+// delivered to the wrong flow, producing spurious "state mismatch" rejections
+// and discarding a valid token (the completing browser tab always looked
+// "successful" to the user while the token was silently dropped).
 type CallbackServer struct {
-	Port         int
-	RedirectURI  string
-	Server       *http.Server
-	CallbackChan chan map[string]string
-	logger       *zap.Logger
+	Port        int
+	RedirectURI string
+	Server      *http.Server
+	logger      *zap.Logger
+
+	mu      sync.Mutex
+	waiters map[string]chan map[string]string // OAuth state -> dedicated waiter channel
+	closed  bool
+}
+
+// Register creates and registers a dedicated callback channel for the given
+// OAuth state, returning it for the caller to wait on. The caller MUST call
+// Unregister(state) when the flow completes or times out (defer it). The
+// channel is buffered so handleCallback never blocks delivering to it.
+func (c *CallbackServer) Register(state string) <-chan map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan map[string]string, 1)
+	if c.closed {
+		// Server is shutting down; hand back an already-closed channel so the
+		// caller unblocks immediately rather than waiting for its timeout.
+		close(ch)
+		return ch
+	}
+	if c.waiters == nil {
+		c.waiters = make(map[string]chan map[string]string)
+	}
+	c.waiters[state] = ch
+	c.logger.Debug("Registered OAuth callback waiter", zap.String("state", state), zap.Int("active_waiters", len(c.waiters)))
+	return ch
+}
+
+// Unregister removes and closes the waiter channel for the given state. Safe to
+// call more than once. Delivery in handleCallback and Unregister are serialized
+// by c.mu, so a channel is never closed while a send is in flight.
+func (c *CallbackServer) Unregister(state string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch, ok := c.waiters[state]; ok {
+		delete(c.waiters, state)
+		close(ch)
+	}
 }
 
 var globalCallbackManager = &CallbackServerManager{
 	servers: make(map[string]*CallbackServer),
 	logger:  zap.L().Named("oauth-callback"),
+}
+
+// Global browser-open throttle, keyed by upstream server name. Unlike the
+// per-Client lastOAuthTimestamp, this coordinates across Client instances so an
+// automatic reconnect running on a freshly-created Client won't reopen a browser
+// tab while another flow for the same server just did (single-flight, defense in
+// depth on top of state-routed callbacks). Manual `auth login` flows bypass it.
+var (
+	browserOpenMu   sync.Mutex
+	lastBrowserOpen = make(map[string]time.Time)
+)
+
+// RecordBrowserOpen notes that a browser was just opened for server's OAuth flow.
+func RecordBrowserOpen(server string) {
+	browserOpenMu.Lock()
+	lastBrowserOpen[server] = time.Now()
+	browserOpenMu.Unlock()
+}
+
+// TimeSinceBrowserOpen reports how long since the last recorded browser open for
+// server, across all Client instances. Returns a very large duration if none.
+func TimeSinceBrowserOpen(server string) time.Duration {
+	browserOpenMu.Lock()
+	defer browserOpenMu.Unlock()
+	t, ok := lastBrowserOpen[server]
+	if !ok {
+		return 365 * 24 * time.Hour
+	}
+	return time.Since(t)
 }
 
 // Global token store manager to persist tokens across client instances
@@ -821,9 +898,6 @@ func (m *CallbackServerManager) StartCallbackServer(serverName string, preferred
 	port := addr.Port
 	redirectURI := fmt.Sprintf("%s:%d%s", DefaultRedirectURIBase, port, DefaultRedirectPath)
 
-	// Create callback channel
-	callbackChan := make(chan map[string]string, 1)
-
 	// Create HTTP server with dedicated mux
 	mux := http.NewServeMux()
 	server := &http.Server{
@@ -836,11 +910,11 @@ func (m *CallbackServerManager) StartCallbackServer(serverName string, preferred
 
 	// Create callback server instance
 	callbackServer := &CallbackServer{
-		Port:         port,
-		RedirectURI:  redirectURI,
-		Server:       server,
-		CallbackChan: callbackChan,
-		logger:       m.logger.With(zap.String("server", serverName), zap.Int("port", port)),
+		Port:        port,
+		RedirectURI: redirectURI,
+		Server:      server,
+		logger:      m.logger.With(zap.String("server", serverName), zap.Int("port", port)),
+		waiters:     make(map[string]chan map[string]string),
 	}
 
 	// Set up HTTP handler for OAuth callback
@@ -901,10 +975,12 @@ func (m *CallbackServerManager) StartCallbackServer(serverName string, preferred
 
 // handleCallback handles OAuth callback requests
 func (c *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) {
+	// NOTE: do NOT log r.URL.RawQuery here — on the authorization-code redirect it
+	// is `code=…&state=…`, i.e. the raw authorization code, and this logs at INFO
+	// (lands in daemon.log). The sanitized shape is logged just below.
 	c.logger.Info("🎯 OAuth callback received",
 		zap.String("method", r.Method),
 		zap.String("path", r.URL.Path),
-		zap.String("query", r.URL.RawQuery),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.String("user_agent", r.UserAgent()))
 
@@ -916,31 +992,67 @@ func (c *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	// Log specific OAuth parameters
+	// Log callback shape WITHOUT leaking the authorization code or full state.
+	state := params["state"]
 	c.logger.Info("🔍 OAuth callback parameters extracted",
-		zap.String("code", params["code"]),
-		zap.String("state", params["state"]),
+		zap.Bool("has_code", params["code"] != ""),
+		zap.String("state", state),
 		zap.String("error", params["error"]),
 		zap.String("error_description", params["error_description"]),
 		zap.Int("total_params", len(params)))
 
-	// Send parameters to the channel (non-blocking)
-	select {
-	case c.CallbackChan <- params:
-		c.logger.Info("✅ OAuth callback parameters sent to channel successfully",
-			zap.Any("params", params))
-	default:
-		c.logger.Error("❌ OAuth callback channel full, dropping parameters - THIS IS BAD!",
-			zap.Any("params", params))
+	// Route the callback to the waiter that owns this state. Delivery happens
+	// under c.mu so it is serialized with Unregister (no send on a closed chan).
+	// `known` = a live flow owns this state; distinct from `delivered` — a same-state
+	// DUPLICATE (double 302 / refresh) finds the cap-1 buffer already full, which is a
+	// harmless no-op for a flow that succeeded, NOT a stale/unknown callback. Base the
+	// user-facing page on `known` so a duplicate still shows success, not the 409.
+	c.mu.Lock()
+	ch, known := c.waiters[state]
+	if known {
+		select {
+		case ch <- params:
+		default: // buffer already holds this state's callback — duplicate, no-op
+		}
 	}
+	activeWaiters := len(c.waiters)
+	c.mu.Unlock()
 
-	// Respond to the user
 	w.Header().Set("Content-Type", "text/html")
-	successPage := `
+
+	if !known {
+		// No live flow owns this state. This is almost always a STALE browser
+		// tab from an earlier login attempt completing late. Previously this
+		// path poisoned whatever flow was currently waiting; now we drop it
+		// cleanly and tell the user the truth so they don't think it worked.
+		c.logger.Warn("⚠️ OAuth callback for unknown/stale state — no active waiter; ignoring (likely a stale browser tab from a previous attempt)",
+			zap.String("state", state),
+			zap.Int("active_waiters", activeWaiters))
+		stalePage := `
 		<html>
 			<body>
-				<h1>Authorization Successful</h1>
-				<p>You can now close this window and return to the application.</p>
+				<h1>This authorization link is stale</h1>
+				<p>It was already used or superseded by a newer sign-in attempt, so it was ignored.</p>
+				<p>Close this tab, return to mcpproxy, and start a fresh login. Do not reuse old authorization tabs.</p>
+			</body>
+		</html>
+	`
+		w.WriteHeader(http.StatusConflict)
+		if _, err := w.Write([]byte(stalePage)); err != nil {
+			c.logger.Error("Error writing OAuth callback response", zap.Error(err))
+		}
+		return
+	}
+
+	c.logger.Info("✅ OAuth callback routed to its waiter (token exchange proceeds in the flow)",
+		zap.String("state", state))
+	// Note: token exchange happens in the waiting flow AFTER this response is
+	// written, so we can only honestly say the callback was received & routed.
+	receivedPage := `
+		<html>
+			<body>
+				<h1>Authorization received</h1>
+				<p>Completing sign-in&hellip; you can close this window and return to the application.</p>
 				<script>
 					setTimeout(function() {
 						window.close();
@@ -949,7 +1061,7 @@ func (c *CallbackServer) handleCallback(w http.ResponseWriter, r *http.Request) 
 			</body>
 		</html>
 	`
-	if _, err := w.Write([]byte(successPage)); err != nil {
+	if _, err := w.Write([]byte(receivedPage)); err != nil {
 		c.logger.Error("Error writing OAuth callback response", zap.Error(err))
 	}
 }
@@ -988,8 +1100,15 @@ func (m *CallbackServerManager) StopCallbackServer(serverName string) error {
 			zap.Error(err))
 	}
 
-	// Close the callback channel
-	close(server.CallbackChan)
+	// Close every outstanding waiter channel and mark the server closed so any
+	// in-flight flows unblock instead of hanging until their 120s timeout.
+	server.mu.Lock()
+	server.closed = true
+	for state, ch := range server.waiters {
+		delete(server.waiters, state)
+		close(ch)
+	}
+	server.mu.Unlock()
 
 	// Remove from map
 	delete(m.servers, serverName)

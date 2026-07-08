@@ -2456,6 +2456,12 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 	c.oauthMu.RLock()
 	timeSinceLastBrowser := time.Since(c.lastOAuthTimestamp)
 	c.oauthMu.RUnlock()
+	// Single-flight (B): also honor a global, cross-Client-instance browser-open
+	// timestamp so an automatic reconnect on a new Client won't reopen a tab the
+	// moment another flow for this server just did.
+	if globalSince := oauth.TimeSinceBrowserOpen(c.config.Name); globalSince < timeSinceLastBrowser {
+		timeSinceLastBrowser = globalSince
+	}
 
 	if !isManualFlow && timeSinceLastBrowser < browserRateLimit {
 		c.logger.Warn("⏱️ Browser opening rate limited - OAuth attempt too soon after previous attempt",
@@ -2490,6 +2496,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		c.oauthMu.Lock()
 		c.lastOAuthTimestamp = time.Now()
 		c.oauthMu.Unlock()
+		oauth.RecordBrowserOpen(c.config.Name)
 	}
 
 	// Wait for the callback using our callback server coordination system
@@ -2505,9 +2512,23 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		return fmt.Errorf("callback server not found for %s", c.config.Name)
 	}
 
+	// Register a waiter keyed by THIS flow's state so a concurrent flow's
+	// callback can't be delivered to us (and ours can't be stolen).
+	callbackCh := callbackServer.Register(state)
+	defer callbackServer.Unregister(state)
+
 	// Wait for the authorization code with extended timeout for remote/systemd scenarios
 	select {
-	case params := <-callbackServer.CallbackChan:
+	case params, ok := <-callbackCh:
+		if !ok {
+			// Channel was closed by StopCallbackServer (server disable/restart, or a
+			// sibling flow completed and tore the callback server down). This flow was
+			// superseded — abort cleanly instead of emitting a bogus "state mismatch",
+			// which is the exact diagnostic noise this state-routing change removes.
+			c.logger.Info("OAuth callback channel closed before completion (server shutdown/superseded)",
+				zap.String("server", c.config.Name))
+			return fmt.Errorf("OAuth callback channel closed for %s (server shutdown or superseded)", c.config.Name)
+		}
 		waitDuration := time.Since(waitStartTime)
 		c.logger.Info("🎯 OAuth callback received",
 			zap.String("server", c.config.Name),
@@ -2787,6 +2808,9 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 		fmt.Printf("Please open the following URL in your browser: %s\n", authURL)
 	} else {
 		result.BrowserOpened = true
+		// Record for the cross-instance browser-open throttle so a following
+		// auto-reconnect on another Client instance won't open a second tab.
+		oauth.RecordBrowserOpen(c.config.Name)
 	}
 
 	// Update the timestamp
@@ -2800,8 +2824,18 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 		return result, fmt.Errorf("callback server not found for %s", c.config.Name)
 	}
 
+	// Route by this flow's state (see CallbackServer docs).
+	callbackCh := callbackServer.Register(state)
+	defer callbackServer.Unregister(state)
+
 	select {
-	case params := <-callbackServer.CallbackChan:
+	case params, ok := <-callbackCh:
+		if !ok {
+			c.logger.Info("OAuth callback channel closed before completion (server shutdown/superseded)",
+				zap.String("server", c.config.Name),
+				zap.String("correlation_id", result.CorrelationID))
+			return result, fmt.Errorf("OAuth callback channel closed for %s (server shutdown or superseded)", c.config.Name)
+		}
 		c.logger.Info("🎯 OAuth callback received",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", result.CorrelationID))
@@ -3045,6 +3079,9 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, er
 		result.BrowserError = err.Error()
 	} else {
 		result.BrowserOpened = true
+		// Record for the cross-instance browser-open throttle so a following
+		// auto-reconnect on another Client instance won't open a second tab.
+		oauth.RecordBrowserOpen(c.config.Name)
 		c.logger.Info("✅ Browser opened successfully",
 			zap.String("server", c.config.Name))
 	}
@@ -3237,8 +3274,20 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 		return
 	}
 
+	// Route by this flow's state (see CallbackServer docs).
+	callbackCh := callbackServer.Register(state)
+	defer callbackServer.Unregister(state)
+
 	select {
-	case params := <-callbackServer.CallbackChan:
+	case params, ok := <-callbackCh:
+		if !ok {
+			// Channel closed by StopCallbackServer (server shutdown/superseded) —
+			// abort quietly instead of logging a bogus "state mismatch".
+			c.logger.Info("OAuth callback channel closed before completion (server shutdown/superseded)",
+				zap.String("server", c.config.Name),
+				zap.String("correlation_id", correlationID))
+			return
+		}
 		c.logger.Info("🎯 OAuth callback received",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", correlationID))
