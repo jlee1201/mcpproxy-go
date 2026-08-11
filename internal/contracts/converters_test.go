@@ -103,3 +103,69 @@ func TestConvertGenericServersToTyped_NoOAuth(t *testing.T) {
 	require.Len(t, servers, 1)
 	assert.Nil(t, servers[0].OAuth, "Servers without OAuth config should have nil OAuth field")
 }
+
+// TestConvertGenericServersToTyped_HealthAndFreshnessFields is the D6/A4
+// regression guard: this converter used to drop `health` entirely (only
+// management/service.go's separate extraction kept it), and effective_status
+// / last_success_at / last_auth_failure_at (A2/A3) didn't exist yet. Any
+// caller routed through ConvertGenericServersToTyped must see all four.
+func TestConvertGenericServersToTyped_HealthAndFreshnessFields(t *testing.T) {
+	successAt := time.Date(2026, 8, 11, 11, 55, 0, 0, time.UTC)
+	authFailureAt := time.Date(2026, 8, 11, 11, 50, 0, 0, time.UTC)
+	healthStatus := &HealthStatus{
+		Level:      "healthy",
+		AdminState: "enabled",
+		Summary:    "Connected (5 tools)",
+	}
+
+	genericServers := []map[string]interface{}{
+		{
+			"id":                   "gcalgusto",
+			"name":                 "gcalgusto",
+			"enabled":              true,
+			"connected":            true,
+			"health":               healthStatus,
+			"effective_status":     "ready",
+			"last_success_at":      successAt,
+			"last_auth_failure_at": authFailureAt,
+		},
+	}
+
+	servers := ConvertGenericServersToTyped(genericServers)
+
+	require.Len(t, servers, 1)
+	server := servers[0]
+
+	require.NotNil(t, server.Health, "health must survive ConvertGenericServersToTyped")
+	assert.Equal(t, "healthy", server.Health.Level)
+	assert.Equal(t, "Connected (5 tools)", server.Health.Summary)
+
+	assert.Equal(t, "ready", server.EffectiveStatus)
+	require.NotNil(t, server.LastSuccessAt)
+	assert.Equal(t, successAt, *server.LastSuccessAt)
+	require.NotNil(t, server.LastAuthFailureAt)
+	assert.Equal(t, authFailureAt, *server.LastAuthFailureAt)
+}
+
+// TestConvertGenericServersToTyped_FreshnessFieldsAbsentWhenNotSet verifies
+// the additive fields stay nil/empty for a generic map produced by an old
+// binary that doesn't populate them -- no panics, no zero-time surprises.
+func TestConvertGenericServersToTyped_FreshnessFieldsAbsentWhenNotSet(t *testing.T) {
+	genericServers := []map[string]interface{}{
+		{
+			"id":        "legacy-server",
+			"name":      "legacy-server",
+			"enabled":   true,
+			"connected": true,
+		},
+	}
+
+	servers := ConvertGenericServersToTyped(genericServers)
+
+	require.Len(t, servers, 1)
+	server := servers[0]
+	assert.Nil(t, server.Health)
+	assert.Empty(t, server.EffectiveStatus)
+	assert.Nil(t, server.LastSuccessAt)
+	assert.Nil(t, server.LastAuthFailureAt)
+}

@@ -19,10 +19,10 @@ import (
 
 // BulkOperationResult holds the results of a bulk operation across multiple servers.
 type BulkOperationResult struct {
-	Total      int               `json:"total"`       // Total servers processed
-	Successful int               `json:"successful"`  // Number of successful operations
-	Failed     int               `json:"failed"`      // Number of failed operations
-	Errors     map[string]string `json:"errors"`      // Map of server name to error message
+	Total      int               `json:"total"`      // Total servers processed
+	Successful int               `json:"successful"` // Number of successful operations
+	Failed     int               `json:"failed"`     // Number of failed operations
+	Errors     map[string]string `json:"errors"`     // Map of server name to error message
 }
 
 // Service defines the management interface for all server lifecycle and diagnostic operations.
@@ -300,6 +300,19 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		// Extract unified health status
 		if health, ok := srvRaw["health"].(*contracts.HealthStatus); ok {
 			srv.Health = health
+		}
+
+		// R3/A2/A3: freshness-aware surfaces added by the status-staleness
+		// fix. Additive alongside the unchanged status/connected fields
+		// above -- see health.DeriveEffectiveStatus.
+		if effectiveStatus, ok := srvRaw["effective_status"].(string); ok {
+			srv.EffectiveStatus = effectiveStatus
+		}
+		if lastSuccessAt, ok := srvRaw["last_success_at"].(time.Time); ok && !lastSuccessAt.IsZero() {
+			srv.LastSuccessAt = &lastSuccessAt
+		}
+		if lastAuthFailureAt, ok := srvRaw["last_auth_failure_at"].(time.Time); ok && !lastAuthFailureAt.IsZero() {
+			srv.LastAuthFailureAt = &lastAuthFailureAt
 		}
 
 		servers = append(servers, srv)

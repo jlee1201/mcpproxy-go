@@ -23,6 +23,11 @@ const (
 
 	// OAuthStatusError indicates OAuth authentication error.
 	OAuthStatusError OAuthStatus = "error"
+
+	// OAuthStatusUnknown indicates a token record exists but its validity
+	// cannot be determined -- specifically a zero ExpiresAt (D3.2 / A4).
+	// Zero ExpiresAt must NOT be read as "valid forever": it is unknown.
+	OAuthStatusUnknown OAuthStatus = "unknown"
 )
 
 // String returns the string representation of the OAuthStatus.
@@ -33,7 +38,7 @@ func (s OAuthStatus) String() string {
 // IsValid returns true if the status represents a valid OAuth state.
 func (s OAuthStatus) IsValid() bool {
 	switch s {
-	case OAuthStatusNone, OAuthStatusAuthenticated, OAuthStatusExpired, OAuthStatusError:
+	case OAuthStatusNone, OAuthStatusAuthenticated, OAuthStatusExpired, OAuthStatusError, OAuthStatusUnknown:
 		return true
 	default:
 		return false

@@ -214,6 +214,40 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 			}
 		}
 
+		// D6/A4: this converter used to drop `health` entirely -- only
+		// management/service.go's hand-rolled extraction (line ~301) kept
+		// it, so any caller routed through ConvertGenericServersToTyped
+		// silently lost the one field the design doc found reliable.
+		if h, ok := generic["health"].(*HealthStatus); ok {
+			server.Health = h
+		}
+
+		// R3/A2/A3: the freshness-aware surfaces. Additive, alongside the
+		// unchanged `status`/`connected` fields above.
+		if effectiveStatus, ok := generic["effective_status"].(string); ok {
+			server.EffectiveStatus = effectiveStatus
+		}
+		switch v := generic["last_success_at"].(type) {
+		case time.Time:
+			if !v.IsZero() {
+				server.LastSuccessAt = &v
+			}
+		case *time.Time:
+			if v != nil && !v.IsZero() {
+				server.LastSuccessAt = v
+			}
+		}
+		switch v := generic["last_auth_failure_at"].(type) {
+		case time.Time:
+			if !v.IsZero() {
+				server.LastAuthFailureAt = &v
+			}
+		case *time.Time:
+			if v != nil && !v.IsZero() {
+				server.LastAuthFailureAt = v
+			}
+		}
+
 		// Extract args slice
 		if args, ok := generic["args"].([]interface{}); ok {
 			server.Args = make([]string, len(args))

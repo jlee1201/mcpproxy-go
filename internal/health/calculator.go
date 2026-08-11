@@ -2,11 +2,13 @@
 package health
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/stringutil"
 )
 
@@ -59,6 +61,15 @@ type HealthCalculatorInput struct {
 	RefreshRetryCount  int          // Number of retry attempts
 	RefreshLastError   string       // Human-readable error message
 	RefreshNextAttempt *time.Time   // When next retry will occur
+
+	// Call-outcome bookkeeping (design doc R1 / implementation plan A2/A3b).
+	// Populated from StateManager.LastSuccessAt() / LastAuthFailureAt().
+	// Used to close the health-hole where OAuthRequired is false (no stored
+	// token AND no explicit OAuth config): without this, a true zombie --
+	// an auth failure on a connection nothing else flags as broken -- would
+	// skip step 5 entirely and land on step 7's "healthy".
+	LastSuccessAt     time.Time
+	LastAuthFailureAt time.Time
 }
 
 // HealthCalculatorConfig contains configurable thresholds for health calculation.
@@ -270,6 +281,21 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 		}
 	}
 
+	// 6b. Zombie check (A3b): a real call failed with an auth error more
+	// recently than any real call succeeded. This catches the case step 5
+	// cannot see -- OAuthRequired is false (no stored token, no explicit
+	// OAuth config) -- so it must run unconditionally, not nested under the
+	// `if input.OAuthRequired` block above.
+	if input.LastAuthFailureAt.After(input.LastSuccessAt) {
+		return &contracts.HealthStatus{
+			Level:      LevelUnhealthy,
+			AdminState: StateEnabled,
+			Summary:    "Authentication required",
+			Detail:     input.LastError,
+			Action:     ActionLogin,
+		}
+	}
+
 	// 7. Healthy state - connected with valid authentication (if required)
 	return &contracts.HealthStatus{
 		Level:      LevelHealthy,
@@ -382,7 +408,23 @@ func isOAuthRelatedError(err string) bool {
 	if err == "" {
 		return false
 	}
-	// Check for common OAuth-related error patterns
+
+	// Delegate to the canonical classifier (A1) first: it recognizes the
+	// live post-connect 401 string ("no valid token available,
+	// authorization required") that this function's own list did not,
+	// which meant a zombie landing in the "error" state branch (step 4,
+	// above) kept ActionRestart instead of ActionLogin -- the health-hole's
+	// sibling for the action field specifically. errors.New is safe here:
+	// IsAuthFailure's string fallback only inspects err.Error().
+	if oauth.IsAuthFailure(errors.New(err)) {
+		return true
+	}
+
+	// Broader display-purpose patterns beyond IsAuthFailure's deliberately
+	// narrow state-invalidation list. This function only picks a
+	// remediation hint (login vs restart); it does not flip connection
+	// state, so wider matching here carries none of IsAuthFailure's
+	// false-positive risk.
 	oauthPatterns := []string{
 		"oauth",
 		"authentication required",

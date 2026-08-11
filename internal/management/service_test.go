@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -174,6 +175,43 @@ func TestListServers(t *testing.T) {
 		assert.Equal(t, "https://oauth.example.com/authorize", server.OAuth.AuthURL)
 		assert.Equal(t, "https://oauth.example.com/token", server.OAuth.TokenURL)
 	})
+
+	// R3/A2/A3 regression guard: ListServers is the primary path behind the
+	// HTTP/socket API. Before this, it extracted `health` but had no
+	// knowledge of effective_status / last_success_at / last_auth_failure_at
+	// -- those fields simply didn't exist. Guard against them silently
+	// getting dropped here the way `health` used to be dropped by the
+	// generic converter (D6).
+	t.Run("server with freshness fields", func(t *testing.T) {
+		successAt := time.Date(2026, 8, 11, 11, 55, 0, 0, time.UTC)
+		authFailureAt := time.Date(2026, 8, 11, 11, 50, 0, 0, time.UTC)
+
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{
+				"id":                   "gcalgusto",
+				"name":                 "gcalgusto",
+				"enabled":              true,
+				"connected":            true,
+				"effective_status":     "ready",
+				"last_success_at":      successAt,
+				"last_auth_failure_at": authFailureAt,
+			},
+		}
+
+		svc := NewService(runtime, cfg, emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+
+		require.NoError(t, err)
+		require.Len(t, servers, 1)
+
+		server := servers[0]
+		assert.Equal(t, "ready", server.EffectiveStatus)
+		require.NotNil(t, server.LastSuccessAt)
+		assert.Equal(t, successAt, *server.LastSuccessAt)
+		require.NotNil(t, server.LastAuthFailureAt)
+		assert.Equal(t, authFailureAt, *server.LastAuthFailureAt)
+	})
 }
 
 // T019: Unit test for EnableServer
@@ -263,14 +301,14 @@ func TestRestartServer(t *testing.T) {
 
 // mockRuntimeOperations implements RuntimeOperations for testing
 type mockRuntimeOperations struct {
-	servers       []map[string]interface{}
-	enableCalls   []enableCall
-	restartCalls  []string
-	enableError   error
-	restartError  error
-	getAllError   error
-	failOnServer  string // If set, only fail operations on this specific server
-	mu            sync.Mutex
+	servers      []map[string]interface{}
+	enableCalls  []enableCall
+	restartCalls []string
+	enableError  error
+	restartError error
+	getAllError  error
+	failOnServer string // If set, only fail operations on this specific server
+	mu           sync.Mutex
 }
 
 type enableCall struct {

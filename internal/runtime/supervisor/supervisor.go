@@ -75,7 +75,7 @@ type UpstreamInterface interface {
 	ConnectAll(ctx context.Context) error
 	GetServerState(name string) (*ServerState, error)
 	GetAllStates() map[string]*ServerState
-	IsUserLoggedOut(name string) bool    // Returns true if user explicitly logged out (prevents auto-reconnect)
+	IsUserLoggedOut(name string) bool     // Returns true if user explicitly logged out (prevents auto-reconnect)
 	ShouldSkipReconnect(name string) bool // Returns true if server should not be auto-reconnected (OAuth error or backoff active)
 	Subscribe() <-chan Event
 	Unsubscribe(ch <-chan Event)
@@ -525,6 +525,19 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot) {
 	}
 }
 
+// connectionStateString normalizes types.ConnectionState to the single
+// lowercase string StateView writes for status.State (D6 / A4): before this,
+// updateStateView lowercased (line ~566, "error") but
+// updateSnapshotFromEvent did not (line ~777, "Error"), so which casing a
+// caller saw depended on which of the two write paths last ran. One helper,
+// used by both.
+func connectionStateString(ci *types.ConnectionInfo) string {
+	if ci == nil {
+		return ""
+	}
+	return strings.ToLower(ci.State.String())
+}
+
 // updateStateView updates the stateview with current server state.
 func (s *Supervisor) updateStateView(name string, state *ServerState) {
 	s.stateView.UpdateServer(name, func(status *stateview.ServerStatus) {
@@ -563,7 +576,7 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 		// Map connection state to string
 		// Use detailed state from ConnectionInfo when available to avoid mislabeling disconnected servers as "connecting"
 		if state.ConnectionInfo != nil {
-			status.State = strings.ToLower(state.ConnectionInfo.State.String())
+			status.State = connectionStateString(state.ConnectionInfo)
 		} else if state.Connected {
 			status.State = "connected"
 		} else if state.Enabled && !state.Quarantined {
@@ -610,6 +623,17 @@ func (s *Supervisor) updateStateView(name string, state *ServerState) {
 
 			// Copy retry count
 			status.RetryCount = state.ConnectionInfo.RetryCount
+
+			// Copy call-outcome bookkeeping (A2/A3): last_success_at /
+			// last_auth_failure_at flow through exactly like RetryCount.
+			if !state.ConnectionInfo.LastSuccessAt.IsZero() {
+				t := state.ConnectionInfo.LastSuccessAt
+				status.LastSuccessAt = &t
+			}
+			if !state.ConnectionInfo.LastAuthFailureAt.IsZero() {
+				t := state.ConnectionInfo.LastAuthFailureAt
+				status.LastAuthFailureAt = &t
+			}
 
 			// Store full connection info in metadata for debugging
 			if status.Metadata == nil {
@@ -774,7 +798,7 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 
 				// Use detailed state from ConnectionInfo if available
 				if connInfo != nil && connInfo.State != types.StateDisconnected {
-					status.State = connInfo.State.String()
+					status.State = connectionStateString(connInfo)
 				} else if connected {
 					status.State = "connected"
 				} else {
@@ -821,6 +845,17 @@ func (s *Supervisor) updateSnapshotFromEvent(event Event) {
 					// Note: We already cleared error above when connected=true
 					// Only set error from connInfo if it has one
 					status.RetryCount = connInfo.RetryCount
+
+					// Copy call-outcome bookkeeping (A2/A3), same as the
+					// other writer above.
+					if !connInfo.LastSuccessAt.IsZero() {
+						t := connInfo.LastSuccessAt
+						status.LastSuccessAt = &t
+					}
+					if !connInfo.LastAuthFailureAt.IsZero() {
+						t := connInfo.LastAuthFailureAt
+						status.LastAuthFailureAt = &t
+					}
 				}
 			})
 

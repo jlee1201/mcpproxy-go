@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/secret"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
@@ -183,6 +184,11 @@ func (mc *Client) Connect(ctx context.Context) error {
 	if serverInfo := mc.coreClient.GetServerInfo(); serverInfo != nil {
 		mc.StateManager.SetServerInfo(serverInfo.ServerInfo.Name, serverInfo.ServerInfo.Version)
 	}
+
+	// A successful MCP initialize during Connect counts as a success write
+	// (design doc R1 / A2 startup semantics): a server that reconnects on a
+	// valid token comes up reporting ready/fresh, not unknown.
+	mc.StateManager.RecordSuccess()
 
 	mc.logger.Info("Successfully established managed connection",
 		zap.String("server", mc.Config.Name))
@@ -418,17 +424,26 @@ func (mc *Client) ListTools(ctx context.Context) ([]*config.ToolMetadata, error)
 			zap.String("server", mc.Config.Name),
 			zap.Error(err))
 
-		// Check if it's a connection error and update state
-		if mc.isConnectionError(err) {
+		// Classify and update state: auth failures take the OAuth path,
+		// transport failures take the connection-error path (see
+		// recordCallFailure / D2 / A1).
+		if oauth.IsAuthFailure(err) {
+			mc.logger.Error("Authentication failure detected during ListTools, updating server state",
+				zap.String("server", mc.Config.Name),
+				zap.Error(err))
+		} else if mc.isConnectionError(err) {
 			mc.logger.Warn("Connection error detected during ListTools, updating server state",
 				zap.String("server", mc.Config.Name),
 				zap.Error(err))
-			mc.StateManager.SetError(err)
 		}
+		mc.recordCallFailure(err)
 		return nil, fmt.Errorf("ListTools failed: %w", err)
 	}
 
-	// Cache the latest tool count for non-blocking stats consumers
+	// A real call just succeeded -- record it as the health signal (design
+	// doc R1 / A2). Cache the latest tool count for non-blocking stats
+	// consumers.
+	mc.StateManager.RecordSuccess()
 	mc.setToolCountCache(len(tools))
 
 	return tools, nil
@@ -442,8 +457,18 @@ func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string
 
 	result, err := mc.coreClient.CallTool(ctx, toolName, args)
 	if err != nil {
-		// Check if it's a connection error and update state
-		if mc.isConnectionError(err) {
+		// Classify the error first: an auth failure (D2 / A1) must take the
+		// OAuth path even though it also arrives as a transport-level error
+		// from mcp-go -- it is not a connectivity problem and must not be
+		// retried like one (8e31b1e's no-retry guard is keyed on
+		// IsOAuthError).
+		switch {
+		case oauth.IsAuthFailure(err):
+			mc.logger.Error("Tool call failed due to authentication failure",
+				zap.String("server", mc.Config.Name),
+				zap.String("tool", toolName),
+				zap.Error(err))
+		case mc.isConnectionError(err):
 			// Use different log levels based on error type
 			if mc.isNormalReconnectionError(err) {
 				mc.logger.Warn("Tool call failed due to connection loss, will attempt reconnection",
@@ -457,18 +482,50 @@ func (mc *Client) CallTool(ctx context.Context, toolName string, args map[string
 					zap.String("tool", toolName),
 					zap.Error(err))
 			}
-			mc.StateManager.SetError(err)
-		} else {
-			// Log non-connection errors at error level
+		default:
+			// Log non-connection, non-auth errors at error level
 			mc.logger.Error("Tool call failed",
 				zap.String("server", mc.Config.Name),
 				zap.String("tool", toolName),
 				zap.Error(err))
 		}
+		mc.recordCallFailure(err)
 		return nil, err
 	}
 
+	// A real call just succeeded -- record it as the health signal (design
+	// doc R1 / A2).
+	mc.StateManager.RecordSuccess()
+
 	return result, nil
+}
+
+// recordCallFailure classifies a post-connect error from CallTool, ListTools,
+// or the tool-count fetch, and updates connection state accordingly.
+//
+// Auth failures (oauth.IsAuthFailure) take the OAuth path -- SetOAuthError --
+// so 8e31b1e's no-retry backoff engages and last_auth_failure_at is recorded,
+// exactly like a connect-time 401 already does via isOAuthAuthorizationRequired
+// (see Connect, above). Pure transport failures keep going through the
+// existing isConnectionError path. This is the fix for D2 / A1: before this,
+// a post-connect 401 satisfied neither list, was logged and returned, and
+// the client stayed Ready forever.
+//
+// Auth failures are checked first and are mutually exclusive with the
+// connection-error path -- an auth failure must never also count as a
+// connection error, or SetError would immediately overwrite the OAuth gate
+// SetOAuthError just set.
+func (mc *Client) recordCallFailure(err error) {
+	if err == nil {
+		return
+	}
+	if oauth.IsAuthFailure(err) {
+		mc.StateManager.SetOAuthError(err)
+		return
+	}
+	if mc.isConnectionError(err) {
+		mc.StateManager.SetError(err)
+	}
 }
 
 func (mc *Client) cancelInFlightListTools() {
@@ -1016,10 +1073,9 @@ func (mc *Client) GetCachedToolCount(ctx context.Context) (int, error) {
 			zap.Error(err),
 			zap.Int("cached_count", cachedCount))
 
-		// Check if it's a connection error and update state
-		if mc.isConnectionError(err) {
-			mc.StateManager.SetError(err)
-		}
+		// Classify and update state (auth vs. connection failure -- see
+		// recordCallFailure / D2 / A1).
+		mc.recordCallFailure(err)
 
 		// Return cached count if available, even if stale
 		if !cachedTime.IsZero() {
@@ -1029,6 +1085,10 @@ func (mc *Client) GetCachedToolCount(ctx context.Context) (int, error) {
 	}
 
 	freshCount := len(tools)
+
+	// A real call just succeeded -- record it as the health signal (design
+	// doc R1 / A2).
+	mc.StateManager.RecordSuccess()
 
 	// Update cache with the latest count
 	mc.setToolCountCache(freshCount)
