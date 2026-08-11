@@ -202,6 +202,47 @@ func (p *PersistentTokenStore) GetToken(ctx context.Context) (*client.Token, err
 	return token, nil
 }
 
+// PeekToken returns the persisted token as a read-only look, without
+// triggering `coalesceRefresh`'s leader/follower election and without
+// applying the proactive-refresh grace-period adjustment `GetToken` uses for
+// mcp-go's benefit.
+//
+// Callers that only want to know "is there a token, and has it changed"
+// (e.g. Manager.scanForNewTokens) must use this instead of GetToken: GetToken
+// elects the caller refresh leader whenever the (grace-adjusted) token looks
+// expired and a refresh token is present, and a caller with no intention of
+// ever calling SaveToken holds that lease until the 30s stale-lease takeover,
+// starving real refreshers (D5).
+//
+// ExpiresAt is returned exactly as persisted, including a zero value, which
+// means the record's expiry is unknown rather than "expired" or "valid
+// forever" — callers must not reinterpret it.
+func (p *PersistentTokenStore) PeekToken(ctx context.Context) (*client.Token, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	record, err := p.storage.GetOAuthToken(p.serverKey)
+	if err != nil || record == nil {
+		p.logger.Debug("🔍 PeekToken: no stored OAuth token found",
+			zap.String("server_name", p.serverName),
+			zap.String("server_key", p.serverKey),
+			zap.Error(err))
+		return nil, transport.ErrNoToken
+	}
+
+	return &client.Token{
+		AccessToken:  record.AccessToken,
+		RefreshToken: record.RefreshToken,
+		TokenType:    record.TokenType,
+		ExpiresAt:    record.ExpiresAt, // raw, no grace-period adjustment
+		Scope:        strings.Join(record.Scopes, " "),
+	}, nil
+}
+
 // SaveToken stores the OAuth token to persistent storage
 func (p *PersistentTokenStore) SaveToken(ctx context.Context, token *client.Token) error {
 	if ctx == nil {
