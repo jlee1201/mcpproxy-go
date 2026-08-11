@@ -2,6 +2,8 @@ package upstream
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"os/exec"
@@ -66,6 +68,12 @@ type Manager struct {
 	// cannot write due to DB lock). Prevents rapid retrigger loops.
 	tokenReconnect map[string]time.Time
 
+	// tokenFingerprint keeps the fingerprint of the last token that
+	// scanForNewTokens acted on per server, so a persisted token that hasn't
+	// changed (e.g. a long-dead one from before the guard engaged) doesn't
+	// re-clear the OAuth-error gate and re-trigger a reconnect on every scan.
+	tokenFingerprint map[string]string
+
 	// Context for shutdown coordination
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
@@ -125,16 +133,17 @@ func cloneServerConfig(cfg *config.ServerConfig) *config.ServerConfig {
 func NewManager(logger *zap.Logger, globalConfig *config.Config, boltStorage *storage.BoltDB, secretResolver *secret.Resolver, storageMgr *storage.Manager) *Manager {
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	manager := &Manager{
-		clients:         make(map[string]*managed.Client),
-		logger:          logger,
-		globalConfig:    globalConfig,
-		storage:         boltStorage,
-		notificationMgr: NewNotificationManager(),
-		secretResolver:  secretResolver,
-		tokenReconnect:  make(map[string]time.Time),
-		shutdownCtx:     shutdownCtx,
-		shutdownCancel:  shutdownCancel,
-		storageMgr:      storageMgr,
+		clients:          make(map[string]*managed.Client),
+		logger:           logger,
+		globalConfig:     globalConfig,
+		storage:          boltStorage,
+		notificationMgr:  NewNotificationManager(),
+		secretResolver:   secretResolver,
+		tokenReconnect:   make(map[string]time.Time),
+		tokenFingerprint: make(map[string]string),
+		shutdownCtx:      shutdownCtx,
+		shutdownCancel:   shutdownCancel,
+		storageMgr:       storageMgr,
 	}
 
 	// Set up OAuth completion callback to trigger connection retries (in-process)
@@ -1370,14 +1379,21 @@ func (m *Manager) RetryConnection(serverName string) error {
 	isConnected := client.IsConnected()
 	isConnecting := client.IsConnecting()
 
-	// Check persistent token presence (daemon uses BBolt-backed token store)
+	// Check persistent token presence (daemon uses BBolt-backed token store).
+	// This is a read-only look purely for the log line below, so it must use
+	// PeekToken, not GetToken: GetToken would elect this call refresh leader
+	// whenever the token looks expired and a refresh token is present, and
+	// nothing here ever calls SaveToken to release that lease before the 30s
+	// stale-lease takeover — the same D5 bug scanForNewTokens had, at a
+	// second call site.
 	var hasToken bool
 	var tokenExpires time.Time
 	if m.storage != nil {
-		ts := oauth.NewPersistentTokenStore(client.Config.Name, client.Config.URL, m.storage)
-		if tok, err := ts.GetToken(context.Background()); err == nil && tok != nil {
-			hasToken = true
-			tokenExpires = tok.ExpiresAt
+		if ts, ok := oauth.NewPersistentTokenStore(client.Config.Name, client.Config.URL, m.storage).(*oauth.PersistentTokenStore); ok {
+			if tok, err := ts.PeekToken(context.Background()); err == nil && tok != nil {
+				hasToken = true
+				tokenExpires = tok.ExpiresAt
+			}
 		}
 	}
 
@@ -1680,9 +1696,34 @@ func (m *Manager) processOAuthEvents() error {
 	return nil
 }
 
-// scanForNewTokens checks persistent token store for each client in Error state
-// and triggers a reconnect if a token is present. This complements DB-based
-// events and handles DB lock scenarios.
+// scanForNewTokens checks persistent token store for each client in Error
+// state and triggers a reconnect if a genuinely new, usable token is
+// present. This complements DB-based events and handles DB lock scenarios.
+//
+// Gating, in order (fixes the D4 reconnect storm — see
+// docs/reports/mcpproxy-status-staleness-design.md):
+//  1. Peek the persisted token via PeekToken (never GetToken: a look must not
+//     enter the refresh-leader election, see D5 and PeekToken's doc comment).
+//  2. Skip only a token that is genuinely unrecoverable: expired AND with no
+//     refresh token. An expired token that still has a refresh token is the
+//     normal overnight-recovery case — RetryConnection's Connect drives
+//     mcp-go's getValidToken, which performs the refresh grant — and must
+//     still fire once. RefreshManager does not cover this at runtime (only
+//     at daemon startup, via executeStartupRefreshes; its runtime scheduling
+//     path explicitly skips an already-expired token), and every other
+//     reconnect path (ConnectAll, the runtime ticker, supervisor reconcile)
+//     is gated on IsOAuthError, so this scan is the only lazy recovery for a
+//     long-running daemon whose token expired mid-run. A ZERO ExpiresAt
+//     means the record's expiry is unknown, not expired (e.g.
+//     notiongusto/gmailgusto persist without one) — never skip on that basis
+//     alone.
+//  3. Skip a token whose fingerprint hasn't changed since the last time this
+//     server fired. This is what actually prevents the storm: a token that
+//     already got its one attempt (recovered, or failed because its refresh
+//     token was also dead) never re-fires. Only a genuinely new token
+//     (rotated by a fresh `auth login`, or a proactive refresh) clears the
+//     gate again.
+//  4. The existing 10s per-server rate limit remains as a backstop.
 func (m *Manager) scanForNewTokens() {
 	if m.storage == nil {
 		return
@@ -1694,6 +1735,12 @@ func (m *Manager) scanForNewTokens() {
 		clients[id] = c
 	}
 	m.mu.RUnlock()
+
+	// Guard against Manager values constructed without NewManager (e.g. in
+	// tests) that don't initialize this map.
+	if m.tokenFingerprint == nil {
+		m.tokenFingerprint = make(map[string]string)
+	}
 
 	now := time.Now()
 	for id, c := range clients {
@@ -1711,15 +1758,47 @@ func (m *Manager) scanForNewTokens() {
 			continue
 		}
 
-		// Rate-limit triggers per server
+		// Rate-limit triggers per server (backstop)
 		if last, ok := m.tokenReconnect[id]; ok && now.Sub(last) < 10*time.Second {
 			continue
 		}
 
-		// Check for a persisted token
+		// Check for a persisted token via the read-only peek: a look here
+		// must never elect this scan as refresh leader (D5).
 		ts := oauth.NewPersistentTokenStore(cfg.Name, cfg.URL, m.storage)
-		tok, err := ts.GetToken(context.Background())
+		pts, ok := ts.(*oauth.PersistentTokenStore)
+		if !ok {
+			// NewPersistentTokenStore always returns *oauth.PersistentTokenStore;
+			// defensive only.
+			continue
+		}
+		tok, err := pts.PeekToken(context.Background())
 		if err != nil || tok == nil {
+			continue
+		}
+
+		// A zero ExpiresAt means the record's expiry is unknown, not
+		// expired — never skip on that basis alone. Otherwise, skip ONLY a
+		// token that is genuinely unrecoverable: expired with no refresh
+		// token. An expired token that still has a refresh token must still
+		// fire — that is the overnight-recovery case a fresh token's
+		// RetryConnection->Connect->getValidToken refreshes; the fingerprint
+		// gate below still limits this to exactly one attempt.
+		if !tok.ExpiresAt.IsZero() && now.After(tok.ExpiresAt) && tok.RefreshToken == "" {
+			m.logger.Debug("Skipping token scan reconnect: token expired with no refresh token",
+				zap.String("server", cfg.Name),
+				zap.Time("token_expires_at", tok.ExpiresAt))
+			continue
+		}
+
+		// Only act when the token is genuinely new for this server. Without
+		// this, any persisted token — including one already acted on, or a
+		// long-dead one from before the guard engaged — re-clears the gate on
+		// every scan forever (D4).
+		fp := tokenFingerprint(tok.AccessToken)
+		if last, ok := m.tokenFingerprint[id]; ok && last == fp {
+			m.logger.Debug("Skipping token scan reconnect: token unchanged since last attempt",
+				zap.String("server", cfg.Name))
 			continue
 		}
 
@@ -1733,10 +1812,19 @@ func (m *Manager) scanForNewTokens() {
 		// never cleared on success, and this scan loops forever.
 		c.StateManager.ClearOAuthError()
 
-		// Remember trigger time and retry connection
+		// Remember trigger time + fingerprint, then retry connection.
 		m.tokenReconnect[id] = now
+		m.tokenFingerprint[id] = fp
 		_ = m.RetryConnection(cfg.Name)
 	}
+}
+
+// tokenFingerprint returns a short, stable fingerprint for an access token,
+// used by scanForNewTokens to detect a genuinely new persisted token without
+// storing the token itself in memory.
+func tokenFingerprint(accessToken string) string {
+	sum := sha256.Sum256([]byte(accessToken))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // StartManualOAuth performs an in-process OAuth flow for the given server.
