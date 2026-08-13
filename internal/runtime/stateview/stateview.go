@@ -32,6 +32,14 @@ type ServerStatus struct {
 	ToolCount      int
 	Tools          []ToolInfo // Phase 7.1: Cached tool list for lock-free reads
 	Metadata       map[string]interface{}
+
+	// LastSuccessAt / LastAuthFailureAt are the call-outcome bookkeeping
+	// added by the status-staleness fix (design doc R1, implementation plan
+	// A2/A3). nil means "never, since process start" -- distinct from a
+	// zero time.Time so JSON omits the field rather than emitting the Unix
+	// epoch.
+	LastSuccessAt     *time.Time
+	LastAuthFailureAt *time.Time
 }
 
 // ServerStatusSnapshot is an immutable snapshot of all server statuses.
@@ -100,6 +108,14 @@ func (v *View) UpdateServer(name string, fn func(*ServerStatus)) {
 			t := *vs.DisconnectedAt
 			newStatus.DisconnectedAt = &t
 		}
+		if vs.LastSuccessAt != nil {
+			t := *vs.LastSuccessAt
+			newStatus.LastSuccessAt = &t
+		}
+		if vs.LastAuthFailureAt != nil {
+			t := *vs.LastAuthFailureAt
+			newStatus.LastAuthFailureAt = &t
+		}
 		if vs.Tools != nil {
 			// Phase 7.1: Clone tools slice
 			newStatus.Tools = make([]ToolInfo, len(vs.Tools))
@@ -166,6 +182,14 @@ func (v *View) RemoveServer(name string) {
 		if vs.DisconnectedAt != nil {
 			t := *vs.DisconnectedAt
 			newStatus.DisconnectedAt = &t
+		}
+		if vs.LastSuccessAt != nil {
+			t := *vs.LastSuccessAt
+			newStatus.LastSuccessAt = &t
+		}
+		if vs.LastAuthFailureAt != nil {
+			t := *vs.LastAuthFailureAt
+			newStatus.LastAuthFailureAt = &t
 		}
 		if vs.Tools != nil {
 			// Phase 7.1: Clone tools slice

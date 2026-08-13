@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
@@ -20,6 +21,11 @@ const (
 	// This prevents race conditions where a token expires during an API call.
 	// Setting this to 5 minutes allows proactive token refresh before expiration.
 	TokenRefreshGracePeriod = 5 * time.Minute
+
+	// refreshCoalesceLease bounds how long a follower waits for the leader's
+	// refresh to land, and how long a leader "owns" the refresh before its lease
+	// is considered stale (so a failed refresh can't deadlock future callers).
+	refreshCoalesceLease = 30 * time.Second
 )
 
 // PersistentTokenStore implements client.TokenStore using BBolt storage
@@ -28,6 +34,15 @@ type PersistentTokenStore struct {
 	serverKey  string // Unique key combining server name and URL (used for storage)
 	storage    *storage.BoltDB
 	logger     *zap.Logger
+
+	// Refresh coalescing: when a token needs refreshing, exactly one caller (the
+	// "leader") returns the expired token to mc-go so it performs a single
+	// refresh_token grant; concurrent callers wait for the leader's SaveToken and
+	// then receive the rotated token. This stops multiple goroutines submitting
+	// the same refresh token, which strict providers reject as reuse.
+	refreshMu    sync.Mutex
+	refreshWait  chan struct{} // non-nil while a refresh is in flight; closed on completion
+	refreshStart time.Time     // when the current leader started (for stale-lease recovery)
 }
 
 // NewPersistentTokenStore creates a new persistent token store for a server
@@ -171,10 +186,61 @@ func (p *PersistentTokenStore) GetToken(ctx context.Context) (*client.Token, err
 			zap.Time("expires_at", record.ExpiresAt))
 	}
 
+	// Coalesce concurrent refreshes: if mc-go will treat this token as expired
+	// (now past the adjusted ExpiresAt) and we have a refresh token, make exactly
+	// one caller trigger the refresh and have the rest reuse its rotated token.
+	// This prevents concurrent goroutines from submitting the same refresh token,
+	// which strict providers (e.g. Notion) reject as reuse and then revoke the
+	// whole family — forcing a full interactive re-auth.
+	if record.RefreshToken != "" && time.Now().After(token.ExpiresAt) {
+		token = p.coalesceRefresh(ctx, token)
+	}
+
 	// Return the token - mcp-go library will check IsExpired() and handle refresh if needed
 	// For long-lived tokens, we subtract the grace period from ExpiresAt to trigger refresh earlier
 	// For short-lived tokens, we use the actual expiration to avoid falsely marking them as expired
 	return token, nil
+}
+
+// PeekToken returns the persisted token as a read-only look, without
+// triggering `coalesceRefresh`'s leader/follower election and without
+// applying the proactive-refresh grace-period adjustment `GetToken` uses for
+// mcp-go's benefit.
+//
+// Callers that only want to know "is there a token, and has it changed"
+// (e.g. Manager.scanForNewTokens) must use this instead of GetToken: GetToken
+// elects the caller refresh leader whenever the (grace-adjusted) token looks
+// expired and a refresh token is present, and a caller with no intention of
+// ever calling SaveToken holds that lease until the 30s stale-lease takeover,
+// starving real refreshers (D5).
+//
+// ExpiresAt is returned exactly as persisted, including a zero value, which
+// means the record's expiry is unknown rather than "expired" or "valid
+// forever" — callers must not reinterpret it.
+func (p *PersistentTokenStore) PeekToken(ctx context.Context) (*client.Token, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	record, err := p.storage.GetOAuthToken(p.serverKey)
+	if err != nil || record == nil {
+		p.logger.Debug("🔍 PeekToken: no stored OAuth token found",
+			zap.String("server_name", p.serverName),
+			zap.String("server_key", p.serverKey),
+			zap.Error(err))
+		return nil, transport.ErrNoToken
+	}
+
+	return &client.Token{
+		AccessToken:  record.AccessToken,
+		RefreshToken: record.RefreshToken,
+		TokenType:    record.TokenType,
+		ExpiresAt:    record.ExpiresAt, // raw, no grace-period adjustment
+		Scope:        strings.Join(record.Scopes, " "),
+	}, nil
 }
 
 // SaveToken stores the OAuth token to persistent storage
@@ -238,6 +304,10 @@ func (p *PersistentTokenStore) SaveToken(ctx context.Context, token *client.Toke
 		HasRefreshToken: token.RefreshToken != "",
 	})
 
+	// Wake any callers coalescing on this refresh so they can use the rotated
+	// token instead of re-submitting the old (now-consumed) refresh token.
+	p.finishRefresh()
+
 	// Notify RefreshManager about the new token so it can schedule proactive refresh
 	// Use serverName (not serverKey) so RefreshManager can look up the actual server
 	globalTokenStoreManager.NotifyTokenSaved(p.serverName, token.ExpiresAt)
@@ -261,4 +331,92 @@ func (p *PersistentTokenStore) ClearToken() error {
 	p.logger.Info("✅ OAuth token cleared from persistent storage successfully",
 		zap.String("server_key", p.serverKey))
 	return nil
+}
+
+// beginRefresh assigns exactly one leader to perform a token refresh at a time.
+// Returns isLeader=true for the caller that should trigger the refresh; other
+// concurrent callers get isLeader=false and a channel that closes when the
+// leader's SaveToken lands. A stale lease (leader that never completed) is taken
+// over so a failed refresh cannot deadlock future callers.
+func (p *PersistentTokenStore) beginRefresh() (isLeader bool, wait chan struct{}) {
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+	if p.refreshWait != nil {
+		if time.Since(p.refreshStart) < refreshCoalesceLease {
+			return false, p.refreshWait
+		}
+		// Stale lease: the previous leader ran past the lease (hung/slow/errored and
+		// never called SaveToken). Close its channel NOW so its followers wake and
+		// retry instead of each blocking on their own timeout, then take over with a
+		// fresh channel. All refreshWait mutations happen under refreshMu, so each
+		// channel is closed exactly once (here on takeover, or in finishRefresh —
+		// whichever runs first for that generation; the other sees a non-matching
+		// refreshWait). A late SaveToken from the dead leader can still close our new
+		// channel early, but only ever wakes followers with an already-persisted valid
+		// token — never a deadlock or double-close.
+		close(p.refreshWait)
+		p.refreshWait = nil
+	}
+	p.refreshWait = make(chan struct{})
+	p.refreshStart = time.Now()
+	return true, p.refreshWait
+}
+
+// finishRefresh wakes any followers waiting on the in-flight refresh. Safe to
+// call when no refresh is in flight (no-op).
+func (p *PersistentTokenStore) finishRefresh() {
+	p.refreshMu.Lock()
+	if p.refreshWait != nil {
+		close(p.refreshWait)
+		p.refreshWait = nil
+	}
+	p.refreshMu.Unlock()
+}
+
+// coalesceRefresh serializes concurrent refreshes of an expired token. The
+// leader returns the expired token so mc-go performs a single refresh_token
+// grant; followers wait for that refresh to persist a rotated token and return
+// it instead of submitting the same (now-consumed) refresh token.
+func (p *PersistentTokenStore) coalesceRefresh(ctx context.Context, expired *client.Token) *client.Token {
+	isLeader, wait := p.beginRefresh()
+	if isLeader {
+		p.logger.Debug("🔑 Refresh leader: returning expired token for a single refresh",
+			zap.String("server_key", p.serverKey))
+		return expired
+	}
+
+	p.logger.Debug("⏳ Refresh follower: waiting for in-flight refresh to complete",
+		zap.String("server_key", p.serverKey))
+	select {
+	case <-wait:
+		if fresh, err := p.storage.GetOAuthToken(p.serverKey); err == nil {
+			p.logger.Debug("✅ Refresh follower: using rotated token from leader",
+				zap.String("server_key", p.serverKey))
+			return p.recordToToken(fresh)
+		}
+		// Re-read failed; fall back to the expired token (mc-go will try to refresh).
+		return expired
+	case <-ctx.Done():
+		return expired
+	case <-time.After(refreshCoalesceLease):
+		p.logger.Warn("⚠️ Refresh follower timed out waiting for leader; proceeding to refresh itself",
+			zap.String("server_key", p.serverKey))
+		return expired
+	}
+}
+
+// recordToToken converts a stored record into an mc-go token, applying the same
+// proactive-refresh grace adjustment as GetToken.
+func (p *PersistentTokenStore) recordToToken(record *storage.OAuthTokenRecord) *client.Token {
+	adjustedExpiresAt := record.ExpiresAt
+	if time.Until(record.ExpiresAt) > TokenRefreshGracePeriod {
+		adjustedExpiresAt = record.ExpiresAt.Add(-TokenRefreshGracePeriod)
+	}
+	return &client.Token{
+		AccessToken:  record.AccessToken,
+		RefreshToken: record.RefreshToken,
+		TokenType:    record.TokenType,
+		ExpiresAt:    adjustedExpiresAt,
+		Scope:        strings.Join(record.Scopes, " "),
+	}
 }

@@ -71,7 +71,10 @@ if [ "$INSTALL_FLAG" == "--install" ]; then
     fi
     
     cp mcpproxy ~/bin/mcpproxy
-    echo "✅ Installed: ~/bin/mcpproxy"
+    # Overwriting the binary in place invalidates its code signature, so macOS
+    # SIGKILLs it on next exec ("Killed: 9"). Re-sign ad-hoc so it runs. (2026-07-08)
+    codesign --force --sign - ~/bin/mcpproxy 2>/dev/null || true
+    echo "✅ Installed: ~/bin/mcpproxy (ad-hoc re-signed)"
     ~/bin/mcpproxy --version
     
     echo ""

@@ -765,6 +765,119 @@ func TestFormatRefreshRetryDetail(t *testing.T) {
 	})
 }
 
+// TestCalculateHealth_ZombieAuthFailureNoOAuthConfig closes the health-hole
+// noted in the design doc's falsification section: when OAuthRequired is
+// false (no stored token AND no explicit OAuth config), CalculateHealth
+// skips the whole OAuth section (step 5) and would otherwise fall straight
+// through to step 7's "healthy" -- a true zombie (a call that just failed
+// with an auth error, on a connection nothing else flags as broken) reports
+// healthy. LastAuthFailureAt after LastSuccessAt must catch this regardless
+// of OAuthRequired.
+func TestCalculateHealth_ZombieAuthFailureNoOAuthConfig(t *testing.T) {
+	now := time.Now()
+	input := HealthCalculatorInput{
+		Name:              "test-server",
+		Enabled:           true,
+		State:             "connected",
+		Connected:         true,
+		ToolCount:         5,
+		OAuthRequired:     false, // the hole: no stored token, no explicit OAuth config
+		LastSuccessAt:     now.Add(-time.Hour),
+		LastAuthFailureAt: now, // after LastSuccessAt -- the zombie signal
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelUnhealthy, result.Level)
+	assert.Equal(t, "Authentication required", result.Summary)
+	assert.Equal(t, ActionLogin, result.Action)
+}
+
+// TestCalculateHealth_NoAuthFailure_StillHealthy is the control: with no
+// auth failure recorded (the zero-value default every pre-A2 caller
+// produces), a connected, tool-serving, non-OAuth server stays healthy.
+// Guards against the new check being too eager.
+func TestCalculateHealth_NoAuthFailure_StillHealthy(t *testing.T) {
+	input := HealthCalculatorInput{
+		Name:      "test-server",
+		Enabled:   true,
+		State:     "connected",
+		Connected: true,
+		ToolCount: 5,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelHealthy, result.Level)
+}
+
+// TestCalculateHealth_AuthFailureBeforeSuccess_StillHealthy: an auth failure
+// that happened before the most recent success (e.g. a transient blip that
+// was later followed by a real success) must not retroactively mark the
+// server unhealthy. Ordering, not mere presence, is the signal.
+func TestCalculateHealth_AuthFailureBeforeSuccess_StillHealthy(t *testing.T) {
+	now := time.Now()
+	input := HealthCalculatorInput{
+		Name:              "test-server",
+		Enabled:           true,
+		State:             "connected",
+		Connected:         true,
+		ToolCount:         5,
+		LastAuthFailureAt: now.Add(-time.Hour),
+		LastSuccessAt:     now, // after LastAuthFailureAt
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelHealthy, result.Level)
+}
+
+// TestCalculateHealth_ZombieErrorState_ActionLogin verifies the action-field
+// sibling of the health-hole: post-A1, a classified auth failure flips state
+// to Error, StateView writes State="error", and CalculateHealth returns at
+// step 4 -- never reaching the 6b zombie check below, which only runs when
+// State is NOT error/disconnected/connecting/idle. Step 4's own
+// isOAuthRelatedError check must recognize the real error string
+// ("no valid token available, authorization required") or it falls back to
+// ActionRestart for a dead token -- wrong remediation, and the one Track C's
+// scripts route on.
+func TestCalculateHealth_ZombieErrorState_ActionLogin(t *testing.T) {
+	now := time.Now()
+	liveErrorString := "CallTool failed for 'echo': transport error: failed to send request: no valid token available, authorization required"
+
+	input := HealthCalculatorInput{
+		Name:              "dxgusto",
+		Enabled:           true,
+		State:             "error",
+		Connected:         false,
+		LastError:         liveErrorString,
+		OAuthRequired:     true,
+		LastSuccessAt:     now.Add(-time.Hour),
+		LastAuthFailureAt: now,
+	}
+
+	result := CalculateHealth(input, nil)
+
+	assert.Equal(t, LevelUnhealthy, result.Level)
+	assert.Equal(t, "Authentication required", result.Summary)
+	assert.Equal(t, ActionLogin, result.Action,
+		"the live post-connect 401 string must route to ActionLogin, not ActionRestart")
+}
+
+// TestIsOAuthRelatedError_RecognizesLiveAuthFailureString is the narrower
+// regression guard: before delegating to oauth.IsAuthFailure, this
+// function's own pattern list did not match "authorization required" or
+// "no valid token available" -- only "authentication required", a
+// different string.
+func TestIsOAuthRelatedError_RecognizesLiveAuthFailureString(t *testing.T) {
+	assert.True(t, isOAuthRelatedError("no valid token available, authorization required"))
+	assert.True(t, isOAuthRelatedError("transport error: failed to send request: no valid token available, authorization required"))
+	// Control: the function's pre-existing patterns must still work.
+	assert.True(t, isOAuthRelatedError("authentication required"))
+	assert.False(t, isOAuthRelatedError("connection refused"))
+	assert.False(t, isOAuthRelatedError(""))
+}
+
 // TestRefreshStateSync ensures health.RefreshState values stay in sync with oauth.RefreshState.
 // The health package mirrors oauth.RefreshState for decoupling, but the values must match
 // for proper state mapping when wiring RefreshManager state into health calculation.

@@ -516,6 +516,61 @@ func TestStartCallbackServerDynamicPort(t *testing.T) {
 	assert.Contains(t, callbackServer.RedirectURI, "http://127.0.0.1:", "Redirect URI should have localhost base")
 }
 
+// TestCallbackServer_RoutesByState verifies that a callback is delivered ONLY
+// to the waiter that owns its OAuth state, and that a callback for an unknown/
+// stale state is dropped instead of poisoning an active waiter. This is the
+// regression test for the concurrent-flow "state mismatch" bug where multiple
+// flows shared one channel and a callback could be stolen by the wrong flow.
+func TestCallbackServer_RoutesByState(t *testing.T) {
+	manager := GetGlobalCallbackManager()
+	serverName := "test-route-by-state"
+	cb, err := manager.StartCallbackServer(serverName, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.StopCallbackServer(serverName) })
+
+	// Two concurrent flows register their own state-keyed waiters.
+	chA := cb.Register("state-A")
+	chB := cb.Register("state-B")
+
+	// A callback arrives for state-A only.
+	resp, err := http.Get(fmt.Sprintf("%s?state=state-A&code=code-A", cb.RedirectURI))
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "matched callback should return 200")
+
+	// Waiter A receives exactly its callback...
+	select {
+	case params := <-chA:
+		assert.Equal(t, "state-A", params["state"])
+		assert.Equal(t, "code-A", params["code"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter A did not receive its callback")
+	}
+
+	// ...and waiter B is untouched (no cross-delivery).
+	select {
+	case p := <-chB:
+		t.Fatalf("waiter B wrongly received a callback: %v", p)
+	case <-time.After(200 * time.Millisecond):
+		// expected: B still waiting
+	}
+
+	// A stale/unknown-state callback is dropped (409) and does NOT poison B.
+	resp2, err := http.Get(fmt.Sprintf("%s?state=state-STALE&code=code-X", cb.RedirectURI))
+	require.NoError(t, err)
+	_ = resp2.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp2.StatusCode, "unknown/stale callback should return 409, not 200")
+
+	select {
+	case p := <-chB:
+		t.Fatalf("waiter B wrongly received the stale callback: %v", p)
+	case <-time.After(200 * time.Millisecond):
+		// expected: B still waiting, unpoisoned
+	}
+
+	cb.Unregister("state-B")
+}
+
 // T008: Test CreateOAuthConfig falls back to server URL when metadata lacks resource field
 func TestCreateOAuthConfig_FallsBackToServerURL(t *testing.T) {
 	// Variable to hold server URL for use in handler

@@ -331,39 +331,30 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// SaveConfig saves configuration to file
+// SaveConfig saves configuration to file.
+//
+// Note: this is called on every reconnect/state change. It must NOT emit
+// per-call/per-server chatter to stdout — doing so floods daemon.log (which
+// captures stdout) regardless of --log-level and buries the events that matter
+// when troubleshooting. Errors are returned to the caller to log with context.
 func SaveConfig(cfg *Config, path string) error {
-	fmt.Printf("[DEBUG] SaveConfig called with path: %s\n", path)
-	fmt.Printf("[DEBUG] SaveConfig - server count: %d\n", len(cfg.Servers))
-
-	// Log server states for debugging
-	for _, server := range cfg.Servers {
-		fmt.Printf("[DEBUG] SaveConfig - server %s: enabled=%v, quarantined=%v\n",
-			server.Name, server.Enabled, server.Quarantined)
-	}
-
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - JSON marshal failed: %v\n", err)
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - MkdirAll failed: %v\n", err)
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
 	// Atomic write with fsync to prevent race conditions
 	// This ensures core never reads partially written config files
-	fmt.Printf("[DEBUG] SaveConfig - about to write file atomically: %s\n", path)
 	if err := atomicWriteFile(path, data, 0600); err != nil {
-		fmt.Printf("[DEBUG] SaveConfig - atomicWriteFile failed: %v\n", err)
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
-	fmt.Printf("[DEBUG] SaveConfig - successfully wrote file: %s\n", path)
 	return nil
 }
 

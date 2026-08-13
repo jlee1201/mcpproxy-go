@@ -72,10 +72,10 @@ type Runtime struct {
 	truncator         *truncate.Truncator
 	secretResolver    *secret.Resolver
 	tokenizer         tokens.Tokenizer
-	refreshManager    *oauth.RefreshManager    // Proactive OAuth token refresh
-	updateChecker     *updatecheck.Checker     // Background version checking
-	managementService interface{}              // Initialized later to avoid import cycle
-	activityService   *ActivityService         // Activity logging service
+	refreshManager    *oauth.RefreshManager // Proactive OAuth token refresh
+	updateChecker     *updatecheck.Checker  // Background version checking
+	managementService interface{}           // Initialized later to avoid import cycle
+	activityService   *ActivityService      // Activity logging service
 
 	// Phase 6: Supervisor for state reconciliation (lock-free reads via StateView)
 	supervisor *supervisor.Supervisor
@@ -1494,6 +1494,26 @@ func (r *Runtime) EmitServersChanged(reason string, extra map[string]any) {
 	r.emitServersChanged(reason, extra)
 }
 
+// oauthStatusForToken decides token_valid / oauth_status for a persisted
+// OAuth token record, given its raw ExpiresAt and the current time. Pure and
+// unit-testable in isolation from GetAllServers' storage/StateView plumbing.
+//
+// D3.2 / A4 fix: a zero ExpiresAt means UNKNOWN validity, not "valid
+// forever". Before this, zero ExpiresAt unconditionally produced
+// token_valid=true / oauth_status=authenticated -- a standing false-positive
+// live on exactly the two servers (notiongusto, gmailgusto) that expire
+// most often. Why those records land with zero ExpiresAt is a separate,
+// out-of-scope bug (likely a refresh path persisting without expires_in).
+func oauthStatusForToken(expiresAt time.Time, now time.Time) (tokenValid bool, status oauth.OAuthStatus) {
+	if expiresAt.IsZero() {
+		return false, oauth.OAuthStatusUnknown
+	}
+	if now.Before(expiresAt) {
+		return true, oauth.OAuthStatusAuthenticated
+	}
+	return false, oauth.OAuthStatusExpired
+}
+
 // GetAllServers implements RuntimeOperations interface for management service.
 // Returns all servers with their current status using the Supervisor's StateView.
 func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
@@ -1592,45 +1612,36 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 					zap.Error(err))
 
 				if err == nil && token != nil {
-				authenticated = true
-				tokenExpiresAt = token.ExpiresAt
-				hasRefreshToken = token.RefreshToken != ""
-				r.logger.Info("OAuth token found for server",
-					zap.String("server", serverStatus.Name),
-					zap.String("server_key", serverKey),
-					zap.Time("expires_at", token.ExpiresAt),
-					zap.Bool("has_refresh_token", hasRefreshToken))
+					authenticated = true
+					tokenExpiresAt = token.ExpiresAt
+					hasRefreshToken = token.RefreshToken != ""
+					r.logger.Info("OAuth token found for server",
+						zap.String("server", serverStatus.Name),
+						zap.String("server_key", serverKey),
+						zap.Time("expires_at", token.ExpiresAt),
+						zap.Bool("has_refresh_token", hasRefreshToken))
 
-				// For autodiscovery servers (no explicit OAuth config), create minimal oauthConfig
-				if oauthConfig == nil {
-					oauthConfig = map[string]interface{}{
-						"autodiscovery": true,
+					// For autodiscovery servers (no explicit OAuth config), create minimal oauthConfig
+					if oauthConfig == nil {
+						oauthConfig = map[string]interface{}{
+							"autodiscovery": true,
+						}
 					}
-				}
 
-				// Add token expiration info to oauth config
-				if !token.ExpiresAt.IsZero() {
-					oauthConfig["token_expires_at"] = token.ExpiresAt.Format(time.RFC3339)
-					// Check if token is expired
-					isValid := time.Now().Before(token.ExpiresAt)
-					oauthConfig["token_valid"] = isValid
-					if isValid {
-						oauthStatus = string(oauth.OAuthStatusAuthenticated)
-					} else {
-						oauthStatus = string(oauth.OAuthStatusExpired)
+					// Add token expiration info to oauth config
+					if !token.ExpiresAt.IsZero() {
+						oauthConfig["token_expires_at"] = token.ExpiresAt.Format(time.RFC3339)
 					}
+					tokenValid, statusForToken := oauthStatusForToken(token.ExpiresAt, time.Now())
+					oauthConfig["token_valid"] = tokenValid
+					oauthStatus = string(statusForToken)
 				} else {
-					// No expiration means token is valid indefinitely
-					oauthConfig["token_valid"] = true
-					oauthStatus = string(oauth.OAuthStatusAuthenticated)
-				}
-			} else {
-				// No token found - check if OAuth config exists to determine status
-				if oauthConfig != nil {
-					oauthStatus = string(oauth.OAuthStatusNone)
+					// No token found - check if OAuth config exists to determine status
+					if oauthConfig != nil {
+						oauthStatus = string(oauth.OAuthStatusNone)
+					}
 				}
 			}
-		}
 		}
 
 		// Check for OAuth error in last_error - this indicates OAuth autodiscovery detected
@@ -1679,6 +1690,18 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			serverMap["token_expires_at"] = tokenExpiresAt
 		}
 
+		// Call-outcome bookkeeping (A2/A3): flows through from StateManager
+		// via StateView, same path as retry_count.
+		var lastSuccessAt, lastAuthFailureAt time.Time
+		if serverStatus.LastSuccessAt != nil {
+			lastSuccessAt = *serverStatus.LastSuccessAt
+			serverMap["last_success_at"] = lastSuccessAt
+		}
+		if serverStatus.LastAuthFailureAt != nil {
+			lastAuthFailureAt = *serverStatus.LastAuthFailureAt
+			serverMap["last_auth_failure_at"] = lastAuthFailureAt
+		}
+
 		// Add user_logged_out flag from managed client
 		// This indicates if the user explicitly logged out, which prevents auto-reconnection
 		var userLoggedOut bool
@@ -1709,6 +1732,9 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 			ToolCount:       serverStatus.ToolCount,
 			MissingSecret:   health.ExtractMissingSecret(serverStatus.LastError),
 			OAuthConfigErr:  health.ExtractOAuthConfigError(serverStatus.LastError),
+
+			LastSuccessAt:     lastSuccessAt,
+			LastAuthFailureAt: lastAuthFailureAt,
 		}
 		if !tokenExpiresAt.IsZero() {
 			healthInput.TokenExpiresAt = &tokenExpiresAt
@@ -1726,6 +1752,20 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 
 		healthStatus := health.CalculateHealth(healthInput, healthConfig)
 		serverMap["health"] = healthStatus
+
+		// R3/A3: derive a freshness-aware status alongside the existing,
+		// never-expiring `status` field. Pure and local -- see
+		// health.DeriveEffectiveStatus.
+		effectiveStatusInput := health.EffectiveStatusInput{
+			Connected:         connected,
+			State:             status,
+			LastSuccessAt:     lastSuccessAt,
+			LastAuthFailureAt: lastAuthFailureAt,
+		}
+		if !tokenExpiresAt.IsZero() {
+			effectiveStatusInput.TokenExpiresAt = &tokenExpiresAt
+		}
+		serverMap["effective_status"] = health.DeriveEffectiveStatus(effectiveStatusInput, time.Now())
 
 		// M-005: Log health status for debugging
 		r.logger.Debug("Server health calculated",

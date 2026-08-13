@@ -59,6 +59,17 @@ type ConnectionInfo struct {
 	LastOAuthAttempt time.Time       `json:"last_oauth_attempt,omitempty"`
 	OAuthRetryCount  int             `json:"oauth_retry_count"`
 	IsOAuthError     bool            `json:"is_oauth_error"`
+
+	// Call-outcome bookkeeping (design doc R1 / implementation plan A2).
+	// Process-local, not persisted: a restart zeroes these, which is
+	// intentional -- see RecordSuccess. Written only by RecordSuccess,
+	// SetError, and SetOAuthError; never cleared by TransitionTo, Reset, or
+	// ClearOAuthError, so ordering between LastSuccessAt and
+	// LastAuthFailureAt stays meaningful as zombie evidence across a
+	// fingerprint-gated reconnect.
+	LastSuccessAt     time.Time `json:"last_success_at,omitempty"`
+	LastAuthFailureAt time.Time `json:"last_auth_failure_at,omitempty"`
+	LastErrorAt       time.Time `json:"last_error_at,omitempty"`
 }
 
 // StateManager manages the state transitions for an upstream connection
@@ -74,6 +85,12 @@ type StateManager struct {
 	oauthRetryCount  int
 	isOAuthError     bool
 	userLoggedOut    bool // When true, prevents auto-reconnection until user explicitly logs in
+
+	// Call-outcome bookkeeping (design doc R1 / implementation plan A2). See
+	// the ConnectionInfo field doc comments for the "never cleared" rule.
+	lastSuccessAt     time.Time
+	lastAuthFailureAt time.Time
+	lastErrorAt       time.Time
 
 	// Callbacks for state transitions
 	onStateChange func(oldState, newState ConnectionState, info *ConnectionInfo)
@@ -122,6 +139,10 @@ func (sm *StateManager) GetConnectionInfo() ConnectionInfo {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 }
 
@@ -158,6 +179,10 @@ func (sm *StateManager) TransitionTo(newState ConnectionState) {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 
 	callback := sm.onStateChange
@@ -179,6 +204,7 @@ func (sm *StateManager) SetError(err error) {
 	sm.lastError = err
 	sm.retryCount++
 	sm.lastRetryTime = time.Now()
+	sm.lastErrorAt = time.Now()
 
 	info := ConnectionInfo{
 		State:            sm.currentState,
@@ -190,6 +216,10 @@ func (sm *StateManager) SetError(err error) {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 
 	callback := sm.onStateChange
@@ -331,6 +361,10 @@ func (sm *StateManager) ResetPreservingRetryState() {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 
 	callback := sm.onStateChange
@@ -366,6 +400,10 @@ func (sm *StateManager) Reset() {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 
 	callback := sm.onStateChange
@@ -387,6 +425,7 @@ func (sm *StateManager) SetOAuthError(err error) {
 	sm.oauthRetryCount++
 	sm.lastOAuthAttempt = time.Now()
 	sm.lastRetryTime = time.Now()
+	sm.lastAuthFailureAt = time.Now()
 
 	info := ConnectionInfo{
 		State:            sm.currentState,
@@ -398,6 +437,10 @@ func (sm *StateManager) SetOAuthError(err error) {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 
 	callback := sm.onStateChange
@@ -442,6 +485,10 @@ func (sm *StateManager) ClearOAuthError() {
 		LastOAuthAttempt: sm.lastOAuthAttempt,
 		OAuthRetryCount:  sm.oauthRetryCount,
 		IsOAuthError:     sm.isOAuthError,
+
+		LastSuccessAt:     sm.lastSuccessAt,
+		LastAuthFailureAt: sm.lastAuthFailureAt,
+		LastErrorAt:       sm.lastErrorAt,
 	}
 	newState := sm.currentState
 	callback := sm.onStateChange
@@ -494,4 +541,49 @@ func (sm *StateManager) IsOAuthError() bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.isOAuthError
+}
+
+// RecordSuccess marks that a real call to the upstream succeeded just now.
+// Callers write this on any successful CallTool / ListTools / MCP
+// initialize (design doc R1) -- it is the only source of truth for "known
+// good" versus "haven't checked lately" (see health.DeriveEffectiveStatus).
+//
+// Deliberately NOT cleared by TransitionTo, Reset, ResetPreservingRetryState,
+// or ClearOAuthError: those all fire on a reconnect attempt, and wiping this
+// timestamp there would erase the ordering against LastAuthFailureAt that
+// makes a zombie connection detectable across a fingerprint-gated retry.
+//
+// Process-local, not persisted to config.db: a restart zeroes this
+// deliberately. A server that reconnects on a valid token writes a fresh
+// success immediately (during Connect); one that can't comes up reporting
+// "unknown" / "auth_expired", which is the truth.
+func (sm *StateManager) RecordSuccess() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.lastSuccessAt = time.Now()
+}
+
+// LastSuccessAt returns the time of the last successful upstream call, or
+// the zero Time if none has been recorded since process start.
+func (sm *StateManager) LastSuccessAt() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastSuccessAt
+}
+
+// LastAuthFailureAt returns the time of the last classified auth failure
+// (SetOAuthError), or the zero Time if none has occurred since process
+// start.
+func (sm *StateManager) LastAuthFailureAt() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastAuthFailureAt
+}
+
+// LastErrorAt returns the time of the last generic error (SetError), or the
+// zero Time if none has occurred since process start.
+func (sm *StateManager) LastErrorAt() time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.lastErrorAt
 }
