@@ -37,9 +37,13 @@ type Supervisor struct {
 	stateView *stateview.View
 
 	// Event publishing
-	eventCh   chan Event
 	listeners []chan Event
 	eventMu   sync.RWMutex
+
+	// lastDroppedEvents is the last-observed value of upstream.DroppedEventCount(),
+	// used by reconciliationLoop's fast-check case to detect a new drop and
+	// trigger an early corrective reconcile.
+	lastDroppedEvents uint64
 
 	// Callback for reactive tool discovery on server connection
 	onServerConnectedCallback func(serverName string)
@@ -80,6 +84,9 @@ type UpstreamInterface interface {
 	Subscribe() <-chan Event
 	Unsubscribe(ch <-chan Event)
 	Close()
+	// DroppedEventCount returns the cumulative count of events dropped due to
+	// a full listener channel. Used to trigger an early corrective reconcile.
+	DroppedEventCount() uint64
 }
 
 // New creates a new supervisor.
@@ -96,7 +103,6 @@ func New(configSvc *configsvc.Service, upstream UpstreamInterface, logger *zap.L
 		upstream:             upstream,
 		version:              0,
 		stateView:            stateview.New(),
-		eventCh:              make(chan Event, 500), // Phase 6: Increased buffer for async operations
 		listeners:            make([]chan Event, 0),
 		inspectionExemptions: make(map[string]time.Time),
 		inspectionFailures:   make(map[string]*inspectionFailureInfo),
@@ -157,11 +163,23 @@ func (s *Supervisor) reconciliationLoop(configUpdates <-chan configsvc.Update) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// dropCheckTicker is a cheap (atomic-load-only) fast path: if the
+	// upstream event channel dropped anything since we last checked, don't
+	// wait out the full 30s ticker to self-correct -- reconcile now. See
+	// ActorPoolSimple.DroppedEventCount's doc comment for why this matters:
+	// a dropped connected/disconnected event otherwise leaves updateSnapshot's
+	// cached state wrong until some unrelated later event happens to land.
+	dropCheckTicker := time.NewTicker(3 * time.Second)
+	defer dropCheckTicker.Stop()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			s.logger.Info("Supervisor reconciliation loop stopping")
 			return
+
+		case <-dropCheckTicker.C:
+			s.checkDroppedEventsAndReconcile()
 
 		case update, ok := <-configUpdates:
 			if !ok {
@@ -201,6 +219,26 @@ func (s *Supervisor) reconciliationLoop(configUpdates <-chan configsvc.Update) {
 				s.logger.Error("Periodic reconciliation failed", zap.Error(err))
 			}
 		}
+	}
+}
+
+// checkDroppedEventsAndReconcile compares the upstream's current
+// DroppedEventCount against the last-seen value and, if it increased,
+// triggers an immediate reconcile (which re-derives Connected state live via
+// updateSnapshot) instead of waiting for the next scheduled tick. Extracted
+// from reconciliationLoop's ticker case so it's testable without a real
+// timer.
+func (s *Supervisor) checkDroppedEventsAndReconcile() {
+	dropped := s.upstream.DroppedEventCount()
+	if dropped == s.lastDroppedEvents {
+		return
+	}
+	s.logger.Warn("Detected dropped upstream events, triggering early corrective reconcile",
+		zap.Uint64("total_dropped", dropped),
+		zap.Uint64("previously_seen", s.lastDroppedEvents))
+	s.lastDroppedEvents = dropped
+	if err := s.reconcile(s.configSvc.Current()); err != nil {
+		s.logger.Error("Corrective reconciliation failed", zap.Error(err))
 	}
 }
 
@@ -248,6 +286,34 @@ func (s *Supervisor) exemptionCleanupLoop() {
 // reconcile compares desired vs actual state and takes corrective actions.
 // Phase 6 Fix: Made fully async to prevent blocking HTTP server startup.
 func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
+	// Read live state BEFORE taking stateMu, and deliberately outside it.
+	// GetAllStates() is non-blocking with respect to mc.mu (see
+	// ActorPoolSimple.GetAllStates), but it does take Manager.mu.RLock(),
+	// which AddServerConfig holds for its whole duration including secret
+	// resolution (found in adversarial review of the F1 fix). Since this
+	// reconcile's own action dispatch below can itself trigger
+	// AddServerConfig for a newly-added server, calling GetAllStates() while
+	// holding stateMu would let that stall block stateMu -- which is exactly
+	// the lock updateSnapshotFromEvent (the hot per-event path) needs,
+	// reintroducing the same class of stall via a new route. Reading it here
+	// means a stall only delays this reconcile's own goroutine, never the
+	// event-forwarding one.
+	//
+	// Accepted tradeoff: reading liveStates before stateMu (rather than
+	// inside the same critical section as the write) opens a narrow window
+	// between this read and updateSnapshot's write below where a real,
+	// successfully-delivered event for the same server could land via
+	// updateSnapshotFromEvent and get transiently overwritten by this
+	// reconcile's now-stale liveStates. That's strictly better than the bug
+	// being fixed here (an unbounded-forever stale value): the overwrite
+	// self-heals within one more reconcile interval -- ~3s if drops are
+	// still occurring (the fast path re-fires), otherwise the normal 30s
+	// ticker -- and it can only happen when the event path is working
+	// correctly in the first place. Never blocking the hot
+	// per-event path is the harder requirement to give up, so this is the
+	// intentional choice, not an oversight.
+	liveStates := s.upstream.GetAllStates()
+
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 
@@ -281,7 +347,7 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 	}
 
 	// Update state snapshot immediately (actions run in background)
-	s.updateSnapshot(configSnapshot)
+	s.updateSnapshot(configSnapshot, liveStates)
 
 	s.logger.Debug("Reconciliation dispatched",
 		zap.Int("actions_dispatched", actionCount),
@@ -359,15 +425,7 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *R
 
 // configChanged checks if server configuration has changed.
 func (s *Supervisor) configChanged(old, new *config.ServerConfig) bool {
-	if old == nil || new == nil {
-		return old != new
-	}
-
-	return old.URL != new.URL ||
-		old.Protocol != new.Protocol ||
-		old.Command != new.Command ||
-		old.Enabled != new.Enabled ||
-		old.Quarantined != new.Quarantined
+	return configFieldsDiffer(old, new)
 }
 
 // executeAction performs the specified action on a server.
@@ -461,19 +519,60 @@ func (s *Supervisor) executeAction(serverName string, action ReconcileAction, co
 }
 
 // updateSnapshot updates the current state snapshot.
-// Phase 7.1 FIX: Removed GetAllStates() call to prevent blocking on slow servers.
-// State updates now happen via events only, keeping this method fast and non-blocking.
-func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot) {
+//
+// F4/self-healing fix (2026-08-13): this used to carry forward whatever
+// Connected/ConnectionInfo/ToolCount was already cached in the Supervisor's
+// own snapshot, on the theory (see the removed comment below) that querying
+// live state here would block on ListTools(). That's no longer true --
+// ActorPoolSimple.GetAllStates() was fixed under Phase 7.1 to use only
+// non-blocking, mc.mu-free accessors (IsConnected/GetConnectionInfo/
+// GetCachedToolCountNonBlocking) -- but nobody undid this caller-side
+// workaround, so "carry forward the cache" remained the only path, and it
+// has no invalidator: if an upstream connected/disconnected/state_changed
+// event was ever dropped (see actor_pool.go's "Event channel full, dropping
+// event"), the stale value it should have corrected stayed wrong
+// *indefinitely* -- reconcile()'s own action-planning reads this same stale
+// value (computeReconcilePlan), so it can't self-heal either. Reading live
+// state here on every reconcile (30s ticker, every config change, and now
+// also the drop-triggered fast path in reconciliationLoop) bounds staleness
+// to one reconcile interval instead of forever.
+//
+// Several things this must NOT do, found in a second (adversarial-review)
+// pass over the first version of this fix: (a) it must not call the
+// reactive-tool-discovery callback that updateSnapshotFromEvent fires on
+// connect -- updateStateView (below) has no such call, so routing through it
+// is safe by construction; re-adding that call here would re-trigger a real
+// ListTools()+reindex on every tick for every already-connected server.
+// (b) it must not unconditionally deep-clone the whole StateView
+// (stateview.UpdateServer clones every server on every call) for every
+// configured server on every tick -- with N servers that's O(N^2) work done
+// while s.stateMu is held, which stalls the same lock the hot per-event path
+// (updateSnapshotFromEvent) needs. So this only calls updateStateView for
+// servers whose live-relevant fields actually changed, and it emits a
+// state-changed event for those so the Web UI (which has no other poll path
+// for the server list) still gets nudged even though no per-event
+// notification carried the correction. (c) it must not take ToolCount
+// straight from live state -- see the comment inline below, that field is
+// never populated in production and doing so would zero out every
+// discovery-derived tool count on every reconcile. (d) LastSeen must not be
+// bumped on every pass either, or StateView's "connected at" timestamp would
+// read as "last resynced" instead of "when it actually connected". (e) the
+// live read itself (liveStates, passed in) must happen in reconcile()
+// BEFORE s.stateMu is acquired, not in here -- GetAllStates() takes
+// Manager.mu.RLock(), which AddServerConfig can hold for a while (secret
+// resolution); doing that read while holding stateMu would let that stall
+// block stateMu, which is exactly the lock the hot per-event path needs.
+func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot, liveStates map[string]*ServerState) {
 	s.version++
 
-	// Phase 7.1 FIX: Don't call GetAllStates() here! It blocks on ListTools() for all servers.
-	// Instead, rely on existing state and event-driven updates.
-	// Get actual state from existing snapshot (non-blocking)
+	// Fallback for a server the manager doesn't know about yet (e.g. not yet
+	// added this reconcile), and the source of truth for anything live state
+	// doesn't carry (Tools/ToolCount from background discovery, LastSeen).
 	currentSnapshot := s.CurrentSnapshot()
-	actualStates := make(map[string]*ServerState)
+	previousStates := make(map[string]*ServerState)
 	if currentSnapshot != nil {
 		for name, state := range currentSnapshot.Servers {
-			actualStates[name] = state
+			previousStates[name] = state
 		}
 	}
 
@@ -484,11 +583,15 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot) {
 		Version:   s.version,
 	}
 
+	var corrected []string
+
 	// Add all configured servers
 	for _, srv := range configSnapshot.Config.Servers {
 		if srv == nil {
 			continue
 		}
+
+		prevState := previousStates[srv.Name]
 
 		state := &ServerState{
 			Name:           srv.Name,
@@ -499,19 +602,60 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot) {
 			LastReconcile:  time.Now(),
 		}
 
-		// Merge with actual state if available
-		if actualState, ok := actualStates[srv.Name]; ok {
-			state.Connected = actualState.Connected
-			state.ConnectionInfo = actualState.ConnectionInfo
-			state.LastSeen = actualState.LastSeen
-			state.ToolCount = actualState.ToolCount
-			state.Tools = actualState.Tools // Phase 7.1: Copy tools for caching
+		if liveState, ok := liveStates[srv.Name]; ok {
+			state.Connected = liveState.Connected
+			state.ConnectionInfo = liveState.ConnectionInfo
+
+			// ToolCount/LastSeen need care, not a blind take:
+			//
+			// liveState.ToolCount comes from
+			// client.GetCachedToolCountNonBlocking(), which reads
+			// mc.toolCount -- and nothing in the runtime background
+			// discovery path (RefreshToolsFromDiscovery) ever writes that
+			// field; only the client's own GetCachedToolCount(ctx) does,
+			// which has zero production callers. So mc.toolCount is always
+			// 0 in production, and blindly taking liveState.ToolCount here
+			// would reset every connected server's displayed tool count to
+			// 0 on every reconcile. updateSnapshotFromEvent already guards
+			// this exact case ("if len(status.Tools) == 0" before writing
+			// ToolCount) -- mirror it: only take the live count when we
+			// don't already have discovery-derived tools cached.
+			if prevState != nil && len(prevState.Tools) > 0 {
+				state.ToolCount = prevState.ToolCount
+				state.Tools = prevState.Tools
+			} else {
+				state.ToolCount = liveState.ToolCount
+			}
+
+			// LastSeen feeds StateView's ConnectedAt ("when it connected",
+			// a user-visible uptime field) -- it must not become "when we
+			// last resynced". Only bump it on an actual disconnected->
+			// connected transition (or if we've never seen this server
+			// connected before); otherwise carry the old value forward.
+			if liveState.Connected && (prevState == nil || !prevState.Connected) {
+				state.LastSeen = time.Now()
+			} else if prevState != nil {
+				state.LastSeen = prevState.LastSeen
+			}
+		} else if prevState != nil {
+			// Manager doesn't have this client yet -- fall back to whatever
+			// we last had rather than resetting to zero-value.
+			state.Connected = prevState.Connected
+			state.ConnectionInfo = prevState.ConnectionInfo
+			state.LastSeen = prevState.LastSeen
+			state.ToolCount = prevState.ToolCount
+			state.Tools = prevState.Tools
 		}
 
 		newSnapshot.Servers[srv.Name] = state
 
-		// Update stateview (Phase 4)
-		s.updateStateView(srv.Name, state)
+		// Only pay for the StateView clone (updateStateView) when something
+		// a reader actually cares about changed, or this is a server we've
+		// never written to StateView before.
+		if stateViewNeedsUpdate(prevState, state) {
+			s.updateStateView(srv.Name, state)
+			corrected = append(corrected, srv.Name)
+		}
 	}
 
 	s.snapshot.Store(newSnapshot)
@@ -523,6 +667,73 @@ func (s *Supervisor) updateSnapshot(configSnapshot *configsvc.Snapshot) {
 			s.stateView.RemoveServer(name)
 		}
 	}
+
+	// Nudge listeners (-> Runtime.supervisorEventForwarder -> SSE
+	// servers.changed) for anything this resync actually changed. The
+	// frontend only refreshes the server list on mount or on that SSE
+	// event, so a silent StateView correction with no accompanying event
+	// would never reach it.
+	for _, name := range corrected {
+		s.emitEvent(Event{
+			Type:       EventServerStateChanged,
+			ServerName: name,
+			Timestamp:  time.Now(),
+			Payload:    map[string]interface{}{"source": "resync"},
+		})
+	}
+}
+
+// stateViewNeedsUpdate reports whether state differs from prev in a way
+// that matters to StateView readers (status/connected/health/effective_status),
+// used to skip the O(N) StateView clone in updateStateView when a resync
+// found nothing new for this server. A nil prev (never written before)
+// always needs the write.
+func stateViewNeedsUpdate(prev, state *ServerState) bool {
+	if prev == nil {
+		return true
+	}
+	if prev.Connected != state.Connected || prev.ToolCount != state.ToolCount {
+		return true
+	}
+	prevErr, newErr := "", ""
+	if prev.ConnectionInfo != nil && prev.ConnectionInfo.LastError != nil {
+		prevErr = prev.ConnectionInfo.LastError.Error()
+	}
+	if state.ConnectionInfo != nil && state.ConnectionInfo.LastError != nil {
+		newErr = state.ConnectionInfo.LastError.Error()
+	}
+	if prevErr != newErr {
+		return true
+	}
+	// A config change (rename/URL/enabled/etc.) also needs a fresh write
+	// even if Connected hasn't flipped yet. Compare the actual fields that
+	// matter -- NOT pointer identity. configSnapshot.Config.Servers entries
+	// are stable pointers between config updates (configsvc.Service.Current()
+	// returns the same *Snapshot until the next real Update()), so pointer
+	// comparison happens to work in the steady state, but relying on that
+	// is fragile: it would silently stop detecting anything (never mind
+	// over- or under-firing) the moment configsvc started returning
+	// per-read copies. Same field list configChanged already uses for the
+	// same reason (deciding whether a change is actionable).
+	return configFieldsDiffer(prev.Config, state.Config)
+}
+
+// configFieldsDiffer reports whether two server configs differ in a field
+// that stateViewNeedsUpdate/configChanged care about. Mirrors
+// Supervisor.configChanged's field list (kept as a free function so
+// stateViewNeedsUpdate stays testable without a *Supervisor).
+func configFieldsDiffer(a, b *config.ServerConfig) bool {
+	if a == b {
+		return false
+	}
+	if a == nil || b == nil {
+		return true
+	}
+	return a.URL != b.URL ||
+		a.Protocol != b.Protocol ||
+		a.Command != b.Command ||
+		a.Enabled != b.Enabled ||
+		a.Quarantined != b.Quarantined
 }
 
 // connectionStateString normalizes types.ConnectionState to the single
@@ -890,7 +1101,7 @@ func (s *Supervisor) Subscribe() <-chan Event {
 	s.eventMu.Lock()
 	defer s.eventMu.Unlock()
 
-	ch := make(chan Event, 200) // Phase 6: Increased buffer for async reconciliation
+	ch := make(chan Event, 500) // F3: bumped from 200, defense-in-depth headroom (see actor_pool.go Subscribe)
 	s.listeners = append(s.listeners, ch)
 	return ch
 }

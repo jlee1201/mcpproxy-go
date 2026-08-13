@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,9 +20,14 @@ type ActorPoolSimple struct {
 	logger  *zap.Logger
 
 	// Event forwarding
-	eventCh   chan Event
 	listeners []chan Event
 	eventMu   sync.RWMutex
+
+	// droppedEvents counts events dropped by emitEvent because a listener's
+	// buffer was full (see emitEvent). Supervisor polls this to trigger an
+	// early corrective reconcile instead of waiting out the normal ticker --
+	// see Supervisor.reconciliationLoop's fast-check case.
+	droppedEvents atomic.Uint64
 }
 
 // NewActorPoolSimple creates a simplified actor pool that delegates to UpstreamManager.
@@ -33,7 +39,6 @@ func NewActorPoolSimple(manager *upstream.Manager, logger *zap.Logger) *ActorPoo
 	pool := &ActorPoolSimple{
 		manager:   manager,
 		logger:    logger,
-		eventCh:   make(chan Event, 100),
 		listeners: make([]chan Event, 0),
 	}
 
@@ -162,6 +167,22 @@ func (p *ActorPoolSimple) ConnectAll(ctx context.Context) error {
 
 // GetServerState returns the current state of a server from the manager.
 // Phase 7.1 FIX: Fetches tools for the specific server to avoid blocking all servers.
+//
+// Deliberately does NOT call client.GetConfig() and does not populate
+// Config/Enabled/Quarantined. This is the sole caller-facing accessor used on
+// the hot event-consumption path (Supervisor.updateSnapshotFromEvent, which
+// only reads ToolCount and ConnectionInfo from the result -- verified as the
+// only production call site). client.GetConfig() takes mc.mu.RLock(), and
+// managed.Client.Connect()/Disconnect() hold that same mutex for the whole
+// call including network I/O. During an OAuth reconnect burst, that meant
+// this method blocked -- on the single event-forwarder goroutine -- for
+// however long a concurrent Connect() took, stalling delivery for every
+// other server's events too and overflowing the 50-slot channel upstream
+// ("Event channel full, dropping event"). IsConnected()/GetConnectionInfo()/
+// GetCachedToolCountNonBlocking() are all StateManager-/cache-scoped and
+// never touch mc.mu. If a future caller needs Config/Enabled/Quarantined
+// from this method, populate them explicitly and re-audit every caller for
+// this same blocking risk -- don't just add GetConfig() back in.
 func (p *ActorPoolSimple) GetServerState(name string) (*ServerState, error) {
 	client, exists := p.manager.GetClient(name)
 	if !exists {
@@ -169,20 +190,13 @@ func (p *ActorPoolSimple) GetServerState(name string) (*ServerState, error) {
 	}
 
 	connected := client.IsConnected()
-	config := client.GetConfig() // Thread-safe config access
 
 	state := &ServerState{
 		Name:      name,
-		Config:    config,
-		Enabled:   config.Enabled,
 		Connected: connected,
 	}
 
-	if config.Quarantined {
-		state.Quarantined = true
-	}
-
-	// Get connection info
+	// Get connection info (StateManager-scoped copy, does not take mc.mu)
 	connInfo := client.GetConnectionInfo()
 	state.ConnectionInfo = &connInfo
 
@@ -262,7 +276,11 @@ func (p *ActorPoolSimple) Subscribe() <-chan Event {
 	p.eventMu.Lock()
 	defer p.eventMu.Unlock()
 
-	ch := make(chan Event, 50)
+	// F3: bumped 50 -> 500 as defense-in-depth headroom against burst
+	// producers (see emitEvent). Not a fix by itself -- F1 (this file) and
+	// the live resync in Supervisor.updateSnapshot are what actually bound
+	// staleness; this just buys more room before that matters.
+	ch := make(chan Event, 500)
 	p.listeners = append(p.listeners, ch)
 	return ch
 }
@@ -290,11 +308,23 @@ func (p *ActorPoolSimple) emitEvent(event Event) {
 		select {
 		case ch <- event:
 		default:
+			p.droppedEvents.Add(1)
 			p.logger.Warn("Event channel full, dropping event",
 				zap.String("event_type", string(event.Type)),
 				zap.String("server", event.ServerName))
 		}
 	}
+}
+
+// DroppedEventCount returns the number of events dropped so far because a
+// listener's channel was full. Supervisor polls this on a short ticker to
+// trigger an immediate corrective reconcile (which re-derives Connected
+// state live from the manager, see updateSnapshot) rather than waiting for
+// the next scheduled reconcile -- a dropped connected/disconnected
+// notification would otherwise leave the cached state wrong until whatever
+// later event happens to get through.
+func (p *ActorPoolSimple) DroppedEventCount() uint64 {
+	return p.droppedEvents.Load()
 }
 
 // Close cleans up the pool.

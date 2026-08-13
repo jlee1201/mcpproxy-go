@@ -2,7 +2,9 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,17 +13,19 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/runtime/configsvc"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/types"
 )
 
 // MockUpstreamAdapter is a test double for UpstreamAdapter
 type MockUpstreamAdapter struct {
-	mu              sync.Mutex
-	addedServers    map[string]*config.ServerConfig
-	removedServers  []string
-	connected       map[string]bool
-	disconnected    []string
-	eventCh         chan Event
-	states          map[string]*ServerState
+	mu             sync.Mutex
+	addedServers   map[string]*config.ServerConfig
+	removedServers []string
+	connected      map[string]bool
+	disconnected   []string
+	eventCh        chan Event
+	states         map[string]*ServerState
+	droppedEvents  atomic.Uint64
 }
 
 func NewMockUpstreamAdapter() *MockUpstreamAdapter {
@@ -97,10 +101,16 @@ func (m *MockUpstreamAdapter) GetServerState(name string) (*ServerState, error) 
 func (m *MockUpstreamAdapter) GetAllStates() map[string]*ServerState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Return a copy to prevent data races
+	// Return a copy to prevent data races. Must copy the *ServerState value,
+	// not just the map -- copying only the pointer left the caller reading
+	// the same struct that ConnectServer/DisconnectServer mutate in place,
+	// unsynchronized once this function returns and releases m.mu (found by
+	// -race once Supervisor.updateSnapshot became the first real caller of
+	// this method).
 	statesCopy := make(map[string]*ServerState, len(m.states))
 	for k, v := range m.states {
-		statesCopy[k] = v
+		copied := *v
+		statesCopy[k] = &copied
 	}
 	return statesCopy
 }
@@ -124,6 +134,10 @@ func (m *MockUpstreamAdapter) Unsubscribe(ch <-chan Event) {
 
 func (m *MockUpstreamAdapter) Close() {
 	close(m.eventCh)
+}
+
+func (m *MockUpstreamAdapter) DroppedEventCount() uint64 {
+	return m.droppedEvents.Load()
 }
 
 // SetServerTools sets tools for a specific server (for testing)
@@ -733,5 +747,381 @@ func TestSupervisor_InspectionExemption_MultipleServers(t *testing.T) {
 	}
 	if !supervisor.IsInspectionExempted("server3") {
 		t.Error("Expected server3 to still be exempted")
+	}
+}
+
+// --- Regression tests for the actor_pool event-channel-overflow fix
+// (2026-08-13): dropped connected/state_changed events used to leave
+// StateView/CurrentSnapshot stuck showing stale Connected forever, since
+// updateSnapshot only ever carried forward whatever was already cached.
+// See actor_pool.go's DroppedEventCount/emitEvent doc comments and
+// supervisor.go's updateSnapshot doc comment for the full causal chain.
+
+func TestSupervisor_UpdateSnapshot_SelfHealsStaleConnectedState(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond) // let the async ConnectServer action land
+
+	mockUpstream.mu.Lock()
+	require.True(t, mockUpstream.connected["test-server"], "mock should be connected by now")
+	mockUpstream.mu.Unlock()
+
+	// Deterministically seed the exact divergence a dropped event would
+	// leave behind: force Supervisor's own cached snapshot to Connected=false
+	// while the live upstream genuinely is connected. There is deliberately
+	// no code path left that produces this on its own -- that's the fix --
+	// so this pokes the internal snapshot directly rather than relying on
+	// the reconcile-vs-ConnectServer-goroutine race (which is timing-
+	// dependent and could go either way).
+	supervisor.snapshot.Store(&ServerStateSnapshot{
+		Servers: map[string]*ServerState{
+			"test-server": {Name: "test-server", Enabled: true, Connected: false},
+		},
+		Timestamp: time.Now(),
+		Version:   999,
+	})
+
+	// Regression check: call updateSnapshot again with no new event and no
+	// config change -- simulating a periodic or drop-triggered resync.
+	// Pre-fix, this carried forward whatever was already cached (false, just
+	// seeded above) forever, with no other path to correct it. Post-fix, it
+	// reads live state from the upstream on every call.
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+
+	snap := supervisor.CurrentSnapshot()
+	require.True(t, snap.Servers["test-server"].Connected,
+		"updateSnapshot should self-heal from live state, not carry forward a stale cached value")
+
+	status, ok := supervisor.StateView().GetServer("test-server")
+	require.True(t, ok)
+	require.True(t, status.Connected, "StateView should also reflect live state after resync")
+}
+
+func TestSupervisor_UpdateSnapshot_DoesNotRefireConnectCallback(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	var callbackCount atomic.Int32
+	supervisor.SetOnServerConnectedCallback(func(_ string) {
+		callbackCount.Add(1)
+	})
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond)
+
+	// Multiple resync passes while the server stays connected must NOT
+	// re-trigger reactive tool discovery. Only updateSnapshotFromEvent (a
+	// real connect *event*) may invoke that callback; this path must not,
+	// or a periodic/drop-triggered resync would re-poll ListTools on every
+	// pass for every already-connected server.
+	for i := 0; i < 5; i++ {
+		supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+	}
+
+	require.EqualValues(t, 0, callbackCount.Load(),
+		"updateSnapshot must never invoke the reactive-connect callback -- only updateSnapshotFromEvent may")
+}
+
+func TestSupervisor_UpdateSnapshot_EmitsEventOnCorrection(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond)
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates()) // settle: cache now matches live (Connected=true)
+
+	eventCh := supervisor.Subscribe()
+	defer supervisor.Unsubscribe(eventCh)
+
+	// Simulate a dropped disconnect notification: live state disagrees with
+	// what Supervisor has cached.
+	mockUpstream.mu.Lock()
+	mockUpstream.states["test-server"].Connected = false
+	mockUpstream.mu.Unlock()
+
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+
+	select {
+	case ev := <-eventCh:
+		require.Equal(t, EventServerStateChanged, ev.Type)
+		require.Equal(t, "test-server", ev.ServerName)
+		require.Equal(t, "resync", ev.Payload["source"])
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected a state-changed event when resync corrects cached state -- " +
+			"the Web UI has no other path to learn about the correction")
+	}
+}
+
+func TestSupervisor_CheckDroppedEventsAndReconcile(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	// No drop observed yet -> must not reconcile.
+	supervisor.checkDroppedEventsAndReconcile()
+	time.Sleep(20 * time.Millisecond)
+	mockUpstream.mu.Lock()
+	_, added := mockUpstream.addedServers["test-server"]
+	mockUpstream.mu.Unlock()
+	require.False(t, added, "expected no reconcile when dropped count is unchanged (0)")
+
+	// A drop is detected -> must trigger reconcile immediately, without
+	// waiting for the normal 30s ticker.
+	mockUpstream.droppedEvents.Store(1)
+	supervisor.checkDroppedEventsAndReconcile()
+	time.Sleep(50 * time.Millisecond)
+
+	mockUpstream.mu.Lock()
+	_, added = mockUpstream.addedServers["test-server"]
+	connected := mockUpstream.connected["test-server"]
+	mockUpstream.mu.Unlock()
+	require.True(t, added, "expected reconcile to run after a detected drop")
+	require.True(t, connected)
+	require.EqualValues(t, 1, supervisor.lastDroppedEvents)
+
+	// Calling again with the same dropped count must be a no-op.
+	supervisor.checkDroppedEventsAndReconcile()
+	require.EqualValues(t, 1, supervisor.lastDroppedEvents)
+}
+
+func TestStateViewNeedsUpdate(t *testing.T) {
+	cfgA := &config.ServerConfig{Name: "a"}
+	base := &ServerState{Connected: true, ToolCount: 3, Config: cfgA}
+
+	require.True(t, stateViewNeedsUpdate(nil, base), "nil prev must always need a write")
+
+	identical := &ServerState{Connected: true, ToolCount: 3, Config: cfgA}
+	require.False(t, stateViewNeedsUpdate(base, identical), "identical state should not need a write")
+
+	changedConnected := &ServerState{Connected: false, ToolCount: 3, Config: cfgA}
+	require.True(t, stateViewNeedsUpdate(base, changedConnected))
+
+	changedToolCount := &ServerState{Connected: true, ToolCount: 4, Config: cfgA}
+	require.True(t, stateViewNeedsUpdate(base, changedToolCount))
+
+	withErr := &ServerState{Connected: true, ToolCount: 3, Config: cfgA,
+		ConnectionInfo: &types.ConnectionInfo{LastError: errors.New("boom")}}
+	require.True(t, stateViewNeedsUpdate(base, withErr))
+
+	sameErrTwice := &ServerState{Connected: true, ToolCount: 3, Config: cfgA,
+		ConnectionInfo: &types.ConnectionInfo{LastError: errors.New("boom")}}
+	require.False(t, stateViewNeedsUpdate(withErr, sameErrTwice), "same error text twice should not need a write")
+
+	// Must compare config FIELDS, not pointer identity -- configFieldsDiffer
+	// deliberately ignores Name (not one of configChanged's fields either)
+	// so a different *ServerConfig pointer with otherwise-identical
+	// URL/Protocol/Command/Enabled/Quarantined must NOT be seen as changed.
+	samePointerDifferentName := &ServerState{Connected: true, ToolCount: 3,
+		Config: &config.ServerConfig{Name: "a-renamed"}}
+	require.False(t, stateViewNeedsUpdate(base, samePointerDifferentName),
+		"a config field configFieldsDiffer doesn't track (Name) must not trigger a write")
+
+	changedURL := &ServerState{Connected: true, ToolCount: 3,
+		Config: &config.ServerConfig{Name: "a", URL: "https://changed.example.com"}}
+	require.True(t, stateViewNeedsUpdate(base, changedURL))
+}
+
+func TestConfigFieldsDiffer(t *testing.T) {
+	a := &config.ServerConfig{Name: "x", URL: "https://a.example.com", Enabled: true}
+	require.False(t, configFieldsDiffer(a, a), "identical pointer is never different")
+	require.False(t, configFieldsDiffer(nil, nil))
+	require.True(t, configFieldsDiffer(nil, a))
+	require.True(t, configFieldsDiffer(a, nil))
+
+	sameFields := &config.ServerConfig{Name: "renamed-only", URL: a.URL, Enabled: a.Enabled}
+	require.False(t, configFieldsDiffer(a, sameFields),
+		"a different pointer with identical tracked fields must read as unchanged")
+
+	diffURL := &config.ServerConfig{Name: "x", URL: "https://b.example.com", Enabled: true}
+	require.True(t, configFieldsDiffer(a, diffURL))
+
+	diffEnabled := &config.ServerConfig{Name: "x", URL: a.URL, Enabled: false}
+	require.True(t, configFieldsDiffer(a, diffEnabled))
+}
+
+// TestSupervisor_UpdateSnapshot_PreservesDiscoveredToolCount is a regression
+// test for a bug found in the SAME review pass that produced the fix (not
+// pre-existing): ActorPoolSimple.GetAllStates()'s ToolCount comes from
+// client.GetCachedToolCountNonBlocking(), which reads mc.toolCount -- a
+// field with zero production writers (only Client.GetCachedToolCount(ctx),
+// itself with zero production callers, ever sets it). Blindly taking
+// liveState.ToolCount on every resync would silently reset every connected
+// server's real, discovery-derived tool count to 0 every ~30s (or faster,
+// via the drop-triggered fast path). updateSnapshotFromEvent already guards
+// this same case; updateSnapshot must too.
+func TestSupervisor_UpdateSnapshot_PreservesDiscoveredToolCount(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate background tool discovery populating real tools/count, the
+	// way runtime.DiscoverAndIndexTools -> RefreshToolsFromDiscovery does.
+	tools := []*config.ToolMetadata{
+		{Name: "tool_a", ServerName: "test-server"},
+		{Name: "tool_b", ServerName: "test-server"},
+		{Name: "tool_c", ServerName: "test-server"},
+	}
+	require.NoError(t, supervisor.RefreshToolsFromDiscovery(tools))
+
+	snap := supervisor.CurrentSnapshot()
+	require.Equal(t, 3, snap.Servers["test-server"].ToolCount, "sanity: discovery populated 3 tools")
+
+	// The mock's own live ToolCount (GetAllStates -> AddServer's zero-value)
+	// is 0/unset here -- exactly like production's mc.toolCount always
+	// being 0. A resync must not use it and stomp the discovered count.
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+
+	snap = supervisor.CurrentSnapshot()
+	require.Equal(t, 3, snap.Servers["test-server"].ToolCount,
+		"updateSnapshot must preserve discovery-derived ToolCount, not reset it from live state's always-0 cache")
+
+	status, ok := supervisor.StateView().GetServer("test-server")
+	require.True(t, ok)
+	require.Equal(t, 3, status.ToolCount, "StateView must also keep the discovered count")
+}
+
+// TestSupervisor_UpdateSnapshot_PreservesConnectedAtAcrossResyncs is a
+// regression test for the same review pass: LastSeen feeds StateView's
+// ConnectedAt (a user-visible "when did this connect" timestamp via
+// updateStateView's "if state.Connected && !state.LastSeen.IsZero()"
+// branch). Bumping it to time.Now() on every resync would make that field
+// read as "last time we resynced" instead of "when it actually connected".
+func TestSupervisor_UpdateSnapshot_PreservesConnectedAtAcrossResyncs(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond)
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates()) // settle
+
+	status, ok := supervisor.StateView().GetServer("test-server")
+	require.True(t, ok)
+	require.NotNil(t, status.ConnectedAt, "should have a ConnectedAt after settling while connected")
+	firstConnectedAt := *status.ConnectedAt
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Multiple further resyncs while the server stays connected the whole
+	// time must not move ConnectedAt.
+	for i := 0; i < 3; i++ {
+		supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+	}
+
+	status, ok = supervisor.StateView().GetServer("test-server")
+	require.True(t, ok)
+	require.NotNil(t, status.ConnectedAt)
+	require.True(t, status.ConnectedAt.Equal(firstConnectedAt),
+		"ConnectedAt must not advance on resyncs that don't change Connected -- "+
+			"got %v, want unchanged %v", status.ConnectedAt, firstConnectedAt)
+}
+
+// TestSupervisor_UpdateSnapshot_NoSpuriousEventsWhenNothingChanged guards
+// against configFieldsDiffer/stateViewNeedsUpdate over-firing on every
+// resync tick because of comparing config pointer identity instead of
+// fields (raised in review: configsvc.Service.Current() happens to return
+// stable pointers between real config updates, but relying on that would be
+// fragile). Calling updateSnapshot repeatedly with a truly-unchanged config
+// snapshot and unchanged live state must emit nothing after the first
+// settle.
+func TestSupervisor_UpdateSnapshot_NoSpuriousEventsWhenNothingChanged(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "test-server", Enabled: true},
+		},
+	}
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	_ = supervisor.reconcile(configSvc.Current())
+	time.Sleep(50 * time.Millisecond)
+	supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates()) // settle
+
+	eventCh := supervisor.Subscribe()
+	defer supervisor.Unsubscribe(eventCh)
+
+	for i := 0; i < 5; i++ {
+		supervisor.updateSnapshot(configSvc.Current(), mockUpstream.GetAllStates())
+	}
+
+	select {
+	case ev := <-eventCh:
+		t.Fatalf("expected no events when nothing changed across 5 resyncs, got %+v", ev)
+	case <-time.After(200 * time.Millisecond):
+		// Correct: no spurious events.
 	}
 }
