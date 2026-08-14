@@ -45,7 +45,9 @@ type EffectiveStatusInput struct {
 // or a running runtime -- see docs/reports/mcpproxy-status-staleness-design.md
 // R3 for the table this implements verbatim:
 //
-//	not connected                                              -> today's state, unchanged (unless it claims ready/connected -- see below)
+//	not connected, last_auth_failure_at > last_success_at      -> auth_expired
+//	not connected, token expiry known and in the past          -> auth_expired
+//	not connected (otherwise)                                  -> today's state, unchanged (unless it claims ready/connected -- see below)
 //	connected, last_auth_failure_at > last_success_at          -> auth_expired
 //	connected, token expiry known and in the past              -> auth_expired
 //	connected, last_success_at older than the freshness window -> unknown
@@ -55,6 +57,23 @@ type EffectiveStatusInput struct {
 // so it falls into "unknown", never "ready".
 func DeriveEffectiveStatus(in EffectiveStatusInput, now time.Time) string {
 	if !in.Connected {
+		// 2026-08-14 bug fix: a fully disconnected client with a dead/expired
+		// token was falling through to `return in.State` verbatim (almost
+		// always "error"), never "auth_expired" -- even though the exact
+		// same auth-failure/expiry signal is checked two branches down for
+		// the Connected==true case. Since mcp-reauth.sh's flush-skip is
+		// gated on seeing auth_expired, and disconnected-with-dead-token is
+		// the most common daily-triage failure mode, the skip never
+		// engaged. Check this first, before the ready/connected-lie
+		// handling below: a stale token is a stronger, more specific signal
+		// than "State claims a live connection with nothing to back it."
+		if in.LastAuthFailureAt.After(in.LastSuccessAt) {
+			return "auth_expired"
+		}
+		if in.TokenExpiresAt != nil && !in.TokenExpiresAt.IsZero() && in.TokenExpiresAt.Before(now) {
+			return "auth_expired"
+		}
+
 		// dxgusto, the design doc's opening example: status="ready",
 		// connected=false, in the same record (D1/D7 -- two writers, never
 		// reconciled). Passing State through verbatim here would reproduce
