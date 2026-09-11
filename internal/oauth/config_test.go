@@ -568,7 +568,132 @@ func TestCallbackServer_RoutesByState(t *testing.T) {
 		// expected: B still waiting, unpoisoned
 	}
 
+	cb.Unregister("state-A")
 	cb.Unregister("state-B")
+}
+
+// TestStopCallbackServer_SurvivesWithRemainingWaiter is the regression test
+// for the bug where one OAuth flow completing (state-A) tore the shared
+// callback server down out from under a SIBLING flow (state-B) still waiting
+// on it - closing state-B's channel and producing a spurious "callback
+// channel closed (server shutdown or superseded)" error even though state-B's
+// own browser callback hadn't arrived yet. StopCallbackServer must only tear
+// the server down once NO flow is still waiting on it.
+func TestStopCallbackServer_SurvivesWithRemainingWaiter(t *testing.T) {
+	manager := GetGlobalCallbackManager()
+	serverName := "test-survives-with-remaining-waiter"
+	cb, err := manager.StartCallbackServer(serverName, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = manager.StopCallbackServer(serverName) })
+
+	chA := cb.Register("state-A")
+	chB := cb.Register("state-B")
+
+	// Flow A completes: it unregisters its OWN state first (as the real
+	// markOAuthComplete call site does) and then asks the manager to tear
+	// the server down.
+	cb.Unregister("state-A")
+	err = manager.StopCallbackServer(serverName)
+	require.NoError(t, err)
+
+	select {
+	case p, ok := <-chA:
+		assert.False(t, ok, "state-A channel should be closed (by its own Unregister), not deliver a value: %v", p)
+	default:
+		t.Fatal("state-A channel should already be closed, not still blocking")
+	}
+
+	// Flow B's registration must have survived - and the HTTP listener
+	// itself must still be serving, not just the bookkeeping map entry. A
+	// stale map entry pointing at a shut-down listener would still fail
+	// flow B's real callback.
+	resp, err := http.Get(fmt.Sprintf("%s?state=state-B&code=code-B", cb.RedirectURI))
+	require.NoError(t, err, "callback server should still be listening for flow B")
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	select {
+	case params := <-chB:
+		assert.Equal(t, "state-B", params["state"])
+		assert.Equal(t, "code-B", params["code"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter B did not receive its callback after StopCallbackServer ran with a sibling waiter still registered")
+	}
+
+	_, exists := manager.GetCallbackServer(serverName)
+	assert.True(t, exists, "callback server should still be registered while a waiter remains")
+
+	cb.Unregister("state-B")
+}
+
+// TestStopCallbackServer_TearsDownWhenLastWaiterGone verifies the other half
+// of the contract: once the LAST flow has unregistered its state,
+// StopCallbackServer must actually tear the server down (otherwise a naive
+// "never shut down while anyone's waiting" fix would just leak the listener
+// forever).
+func TestStopCallbackServer_TearsDownWhenLastWaiterGone(t *testing.T) {
+	manager := GetGlobalCallbackManager()
+	serverName := "test-tears-down-when-last-waiter-gone"
+	cb, err := manager.StartCallbackServer(serverName, 0)
+	require.NoError(t, err)
+
+	cb.Register("state-A")
+	cb.Unregister("state-A") // last (only) flow releases its own state
+
+	err = manager.StopCallbackServer(serverName)
+	require.NoError(t, err)
+
+	_, exists := manager.GetCallbackServer(serverName)
+	assert.False(t, exists, "callback server should be removed once no waiters remain")
+
+	// The listener itself should be gone too, not just the map entry.
+	_, getErr := http.Get(fmt.Sprintf("%s?state=state-A&code=code-A", cb.RedirectURI))
+	assert.Error(t, getErr, "listener should no longer be accepting connections")
+}
+
+// TestStopCallbackServer_NoWaitersEverRegistered covers the common case (no
+// concurrent flows at all) to guard against a nil-map or off-by-one in the
+// idle check.
+func TestStopCallbackServer_NoWaitersEverRegistered(t *testing.T) {
+	manager := GetGlobalCallbackManager()
+	serverName := "test-no-waiters-ever-registered"
+	_, err := manager.StartCallbackServer(serverName, 0)
+	require.NoError(t, err)
+
+	err = manager.StopCallbackServer(serverName)
+	require.NoError(t, err)
+
+	_, exists := manager.GetCallbackServer(serverName)
+	assert.False(t, exists, "callback server with zero waiters should tear down immediately")
+}
+
+// TestStopCallbackServerForce_TearsDownDespiteRemainingWaiters verifies the
+// escape hatch for daemon shutdown / test cleanup: it must tear down and
+// close every outstanding waiter regardless of how many flows are still in
+// flight.
+func TestStopCallbackServerForce_TearsDownDespiteRemainingWaiters(t *testing.T) {
+	manager := GetGlobalCallbackManager()
+	serverName := "test-force-tears-down-despite-waiters"
+	cb, err := manager.StartCallbackServer(serverName, 0)
+	require.NoError(t, err)
+
+	chA := cb.Register("state-A")
+	chB := cb.Register("state-B")
+
+	err = manager.StopCallbackServerForce(serverName)
+	require.NoError(t, err)
+
+	_, exists := manager.GetCallbackServer(serverName)
+	assert.False(t, exists, "force variant must remove the server even with live waiters")
+
+	for name, ch := range map[string]<-chan map[string]string{"A": chA, "B": chB} {
+		select {
+		case _, ok := <-ch:
+			assert.False(t, ok, "waiter %s's channel should be closed by the force teardown", name)
+		case <-time.After(1 * time.Second):
+			t.Fatalf("waiter %s's channel was never closed by the force teardown", name)
+		}
+	}
 }
 
 // T008: Test CreateOAuthConfig falls back to server URL when metadata lacks resource field
