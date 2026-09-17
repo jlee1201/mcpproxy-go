@@ -40,6 +40,14 @@ type OAuthFlowCoordinator struct {
 	flowLocks map[string]*sync.Mutex
 	// waiters tracks goroutines waiting for a flow to complete.
 	waiters map[string][]*flowWaiter
+	// expiryTimers fires expireFlow for a server's active flow at flowTimeout,
+	// so an abandoned flow is reaped exactly when it goes stale instead of waiting
+	// on a periodic sweep (or on the next StartFlow call, which may never come).
+	expiryTimers map[string]*time.Timer
+	// flowTimeout is the staleness threshold used by StartFlow/IsFlowActive/the
+	// expiry timer. Defaults to StaleFlowTimeout; overridable in tests so the
+	// real time.AfterFunc path can be exercised without a 10-minute wait.
+	flowTimeout time.Duration
 	// mu protects all map operations.
 	mu sync.RWMutex
 	// logger for coordinator operations.
@@ -61,10 +69,21 @@ func GetGlobalCoordinator() *OAuthFlowCoordinator {
 // NewOAuthFlowCoordinator creates a new OAuth flow coordinator.
 func NewOAuthFlowCoordinator() *OAuthFlowCoordinator {
 	return &OAuthFlowCoordinator{
-		activeFlows: make(map[string]*OAuthFlowContext),
-		flowLocks:   make(map[string]*sync.Mutex),
-		waiters:     make(map[string][]*flowWaiter),
-		logger:      zap.L().Named("oauth-coordinator"),
+		activeFlows:  make(map[string]*OAuthFlowContext),
+		flowLocks:    make(map[string]*sync.Mutex),
+		waiters:      make(map[string][]*flowWaiter),
+		expiryTimers: make(map[string]*time.Timer),
+		flowTimeout:  StaleFlowTimeout,
+		logger:       zap.L().Named("oauth-coordinator"),
+	}
+}
+
+// stopExpiryTimerLocked stops and removes the expiry timer for serverName, if any.
+// Callers must hold c.mu.
+func (c *OAuthFlowCoordinator) stopExpiryTimerLocked(serverName string) {
+	if t, exists := c.expiryTimers[serverName]; exists {
+		t.Stop()
+		delete(c.expiryTimers, serverName)
 	}
 }
 
@@ -95,15 +114,28 @@ func (c *OAuthFlowCoordinator) StartFlow(serverName string) (*OAuthFlowContext, 
 
 	// Check if a flow is already active
 	if existingFlow, exists := c.activeFlows[serverName]; exists {
-		// Check if the flow is stale
-		if time.Since(existingFlow.StartTime) > StaleFlowTimeout {
+		// Check if the flow is stale. This duplicates the expiry timer below as
+		// a deliberate backstop for the scheduling-jitter window between a flow
+		// going stale and its own time.AfterFunc actually firing — do not delete
+		// this as "now-redundant dead code" without keeping some such backstop.
+		if time.Since(existingFlow.StartTime) > c.flowTimeout {
 			c.logger.Warn("Clearing stale OAuth flow",
 				zap.String("server", serverName),
 				zap.String("correlation_id", existingFlow.CorrelationID),
 				zap.Duration("age", time.Since(existingFlow.StartTime)),
 			)
-			// Clear stale flow and proceed
+			// Clear stale flow and proceed. Notify its waiters with a timeout
+			// error first (mirroring expireFlow) so a goroutine still parked in
+			// WaitForFlow for THIS flow isn't later resolved with the new flow's
+			// unrelated result.
+			staleWaiters := c.waiters[serverName]
 			delete(c.activeFlows, serverName)
+			delete(c.waiters, serverName)
+			c.stopExpiryTimerLocked(serverName)
+			for _, waiter := range staleWaiters {
+				waiter.result = ErrFlowTimeout
+				close(waiter.done)
+			}
 		} else {
 			c.logger.Info("OAuth flow already in progress",
 				zap.String("server", serverName),
@@ -118,6 +150,15 @@ func (c *OAuthFlowCoordinator) StartFlow(serverName string) (*OAuthFlowContext, 
 	flowCtx := NewOAuthFlowContext(serverName)
 	c.activeFlows[serverName] = flowCtx
 
+	// Schedule this flow's own expiry: if nothing ends it (EndFlow) or replaces
+	// it (a later StartFlow) before flowTimeout elapses, reap it exactly then
+	// rather than relying on a periodic sweep or the next StartFlow call.
+	correlationID := flowCtx.CorrelationID
+	c.stopExpiryTimerLocked(serverName) // defensive; should already be clear
+	c.expiryTimers[serverName] = time.AfterFunc(c.flowTimeout, func() {
+		c.expireFlow(serverName, correlationID)
+	})
+
 	c.logger.Info("Started new OAuth flow",
 		zap.String("server", serverName),
 		zap.String("correlation_id", flowCtx.CorrelationID),
@@ -128,13 +169,29 @@ func (c *OAuthFlowCoordinator) StartFlow(serverName string) (*OAuthFlowContext, 
 
 // EndFlow marks an OAuth flow as completed (success or failure).
 // This notifies any waiting goroutines and cleans up the flow state.
-func (c *OAuthFlowCoordinator) EndFlow(serverName string, success bool, err error) {
+// correlationID must match the flow's own CorrelationID (from the
+// *OAuthFlowContext StartFlow returned); if the active flow for serverName is
+// a *different* flow (StartFlow's stale-clear branch or expireFlow already
+// superseded this one), EndFlow is a no-op — mirroring expireFlow's guard —
+// so a slow, superseded caller can never clobber a newer flow's state,
+// waiters, or expiry timer out from under it.
+func (c *OAuthFlowCoordinator) EndFlow(serverName, correlationID string, success bool, err error) {
 	lock := c.getOrCreateLock(serverName)
 	lock.Lock()
 	defer lock.Unlock()
 
 	c.mu.Lock()
-	flowCtx := c.activeFlows[serverName]
+	flowCtx, exists := c.activeFlows[serverName]
+	if exists && flowCtx.CorrelationID != correlationID {
+		c.logger.Warn("EndFlow called for a superseded flow; ignoring",
+			zap.String("server", serverName),
+			zap.String("ending_correlation_id", correlationID),
+			zap.String("active_correlation_id", flowCtx.CorrelationID),
+		)
+		c.mu.Unlock()
+		return
+	}
+
 	waiters := c.waiters[serverName]
 
 	// Update flow state
@@ -151,6 +208,7 @@ func (c *OAuthFlowCoordinator) EndFlow(serverName string, success bool, err erro
 	// Clean up
 	delete(c.activeFlows, serverName)
 	delete(c.waiters, serverName)
+	c.stopExpiryTimerLocked(serverName)
 	c.mu.Unlock()
 
 	// Notify all waiters
@@ -170,8 +228,9 @@ func (c *OAuthFlowCoordinator) IsFlowActive(serverName string) bool {
 		return false
 	}
 
-	// Check if the flow is stale
-	if time.Since(flow.StartTime) > StaleFlowTimeout {
+	// Check if the flow is stale. Deliberate backstop, same rationale as the
+	// duplicate check in StartFlow above — do not remove without keeping one.
+	if time.Since(flow.StartTime) > c.flowTimeout {
 		return false
 	}
 
@@ -245,34 +304,51 @@ func (c *OAuthFlowCoordinator) UpdateFlowState(serverName string, state OAuthFlo
 	}
 }
 
-// CleanupStaleFlows removes any OAuth flows that have been running longer than StaleFlowTimeout.
-// This should be called periodically to prevent memory leaks from abandoned flows.
-func (c *OAuthFlowCoordinator) CleanupStaleFlows() int {
+// expireFlow reaps the active flow for serverName if it is still the one
+// identified by correlationID (i.e. no EndFlow and no newer StartFlow beat the
+// timer to it). Scheduled by StartFlow via time.AfterFunc(c.flowTimeout, ...)
+// so an abandoned flow is cleaned up exactly at its expiry instead of via a
+// periodic sweep — StartFlow's own inline staleness check already gave every
+// flow a hard deadline, so a one-shot timer per flow just enforces that
+// deadline proactively rather than lazily on the next StartFlow call (which,
+// for a server nobody retries, might never come).
+//
+// Lock ordering: the per-server flowLock is always acquired before c.mu, and
+// held for this call's whole body — matching StartFlow/EndFlow, which do the
+// same — so there is no deadlock risk between these three methods.
+func (c *OAuthFlowCoordinator) expireFlow(serverName, correlationID string) {
+	lock := c.getOrCreateLock(serverName)
+	lock.Lock()
+	defer lock.Unlock()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	cleaned := 0
-	now := time.Now()
-
-	for serverName, flow := range c.activeFlows {
-		if now.Sub(flow.StartTime) > StaleFlowTimeout {
-			c.logger.Warn("Cleaning up stale OAuth flow",
-				zap.String("server", serverName),
-				zap.String("correlation_id", flow.CorrelationID),
-				zap.Duration("age", now.Sub(flow.StartTime)),
-			)
-
-			// Notify any waiters with timeout error
-			for _, waiter := range c.waiters[serverName] {
-				waiter.result = ErrFlowTimeout
-				close(waiter.done)
-			}
-
-			delete(c.activeFlows, serverName)
-			delete(c.waiters, serverName)
-			cleaned++
-		}
+	flow, exists := c.activeFlows[serverName]
+	if !exists || flow.CorrelationID != correlationID {
+		// Already ended (EndFlow) or superseded by a newer flow; nothing to do.
+		c.mu.Unlock()
+		return
 	}
 
-	return cleaned
+	c.logger.Warn("OAuth flow expired without completion, cleaning up",
+		zap.String("server", serverName),
+		zap.String("correlation_id", correlationID),
+		zap.Duration("age", time.Since(flow.StartTime)),
+	)
+
+	waiters := c.waiters[serverName]
+	delete(c.activeFlows, serverName)
+	delete(c.waiters, serverName)
+	// Stop() is safe (and a correct no-op) even though this timer is the one
+	// currently invoking us — it only prevents a future fire, which there
+	// won't be since AfterFunc timers are one-shot. Using the shared helper
+	// here (instead of a bare delete) also makes direct expireFlow calls, like
+	// the ones in tests, behave the same as the real timer-fired path.
+	c.stopExpiryTimerLocked(serverName)
+	c.mu.Unlock()
+
+	// Notify any waiters with timeout error
+	for _, waiter := range waiters {
+		waiter.result = ErrFlowTimeout
+		close(waiter.done)
+	}
 }
