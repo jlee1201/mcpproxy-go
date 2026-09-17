@@ -264,6 +264,161 @@ func TestMaybeCompactOnStartup_NoOpBelowThreshold(t *testing.T) {
 	assert.Equal(t, before.ModTime(), after.ModTime(), "file must be untouched below threshold")
 }
 
+// seedOversizedDBWithReclaimableSpace creates a bbolt file at dbPath that is
+// over compactionThresholdBytes in size AND has meaningful reclaimable free
+// space: it writes well past the threshold, then deletes most of what it
+// wrote (bbolt keeps freed pages for reuse rather than shrinking the file,
+// so size stays high while free pages appear -- same technique as
+// TestCompactDBFile_ReclaimsSpaceAfterDeletes).
+func seedOversizedDBWithReclaimableSpace(t *testing.T, dbPath string) {
+	t.Helper()
+
+	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 2 * time.Second})
+	require.NoError(t, err)
+
+	const bucketName = "bloated"
+	const numRecords = 400
+	payload := []byte(strings.Repeat("v", 64*1024)) // 64KB per record, ~25MB total
+
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < numRecords; i++ {
+			key := fmt.Sprintf("%05d", i)
+			if err := b.Put([]byte(key), payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		for i := 0; i < numRecords-5; i++ {
+			key := fmt.Sprintf("%05d", i)
+			if err := b.Delete([]byte(key)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, info.Size(), int64(compactionThresholdBytes),
+		"sanity check: seeded file must actually be over the compaction size threshold")
+}
+
+// TestNewBoltDB_DoesNotAutoCompact is the regression test for round-4's
+// Finding 2: NewBoltDB is shared by the real daemon AND several CLI
+// "standalone mode" helpers (tools_cmd.go, upstream/cli/client.go,
+// call_cmd.go, code_cmd.go, auth_cmd.go), so a startup compaction that used
+// to run unconditionally inside it could make any of those short-lived CLI
+// invocations block for seconds racing the daemon's own flock. Compaction
+// must now only happen via the separate, explicitly-called
+// CompactConfigDBIfNeeded -- NewBoltDB itself must leave an oversized file
+// completely alone.
+func TestNewBoltDB_DoesNotAutoCompact(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "no_auto_compact_test_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, configDBFilename)
+	seedOversizedDBWithReclaimableSpace(t, dbPath)
+
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err)
+
+	boltDB, err := NewBoltDB(tmpDir, testLogger(t))
+	require.NoError(t, err)
+	defer boltDB.Close()
+
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before.Size(), after.Size(),
+		"NewBoltDB must not compact an oversized file on its own -- only CompactConfigDBIfNeeded may")
+}
+
+// TestCompactConfigDBIfNeeded_CompactsWhenReclaimable verifies the other
+// half of the Finding 2 fix: called explicitly (as internal/runtime.New
+// does), CompactConfigDBIfNeeded must still actually compact an oversized
+// file that has real reclaimable space.
+func TestCompactConfigDBIfNeeded_CompactsWhenReclaimable(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "compact_if_needed_test_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, configDBFilename)
+	seedOversizedDBWithReclaimableSpace(t, dbPath)
+
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err)
+
+	CompactConfigDBIfNeeded(tmpDir, testLogger(t))
+
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	assert.Less(t, after.Size(), before.Size(),
+		"CompactConfigDBIfNeeded must shrink an oversized file with reclaimable free space")
+}
+
+// TestMaybeCompactOnStartup_SkipsWhenLittleReclaimableSpace is the
+// regression test for round-4's Finding 3: a file over
+// compactionThresholdBytes purely from live data (no deletes, so
+// essentially no free pages) must NOT trigger a compaction attempt --
+// otherwise a config with even one actively-used server sitting at or
+// above the size threshold as its steady-state floor would re-attempt (and
+// mostly no-op) compaction on every single restart, contradicting the
+// "one-time reclaim" doc comment on maybeCompactOnStartup.
+func TestMaybeCompactOnStartup_SkipsWhenLittleReclaimableSpace(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "compact_skip_live_data_test_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, configDBFilename)
+
+	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 2 * time.Second})
+	require.NoError(t, err)
+
+	const bucketName = "live_data"
+	const numRecords = 400
+	payload := []byte(strings.Repeat("v", 64*1024)) // 64KB per record, ~25MB total, all live
+
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < numRecords; i++ {
+			key := fmt.Sprintf("%05d", i)
+			if err := b.Put([]byte(key), payload); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	require.NoError(t, db.Close())
+
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, before.Size(), int64(compactionThresholdBytes),
+		"sanity check: seeded file must be over the compaction size threshold")
+
+	maybeCompactOnStartup(dbPath, testLogger(t))
+
+	stale, globErr := filepath.Glob(dbPath + ".compact-tmp*")
+	require.NoError(t, globErr)
+	assert.Empty(t, stale, "no compaction attempt should have started against a file with little reclaimable space")
+
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before.Size(), after.Size(),
+		"a file over threshold purely from live data (little reclaimable space) must be left untouched")
+}
+
 // TestOpenBoltDBAtStablePath_DetectsRenameDuringBlockedOpen is the round-3
 // regression test for the flock-vs-rename race: flock binds to the fd's
 // inode at open() time, not to the path, so an ordinary bbolt.Open(dbPath)

@@ -37,6 +37,17 @@ type BoltDB struct {
 // compaction pass is attempted. Below this, compaction isn't worth the I/O.
 const compactionThresholdBytes = 20 * 1024 * 1024 // 20MB
 
+// configDBFilename is the on-disk filename for the daemon's primary bbolt
+// database (OAuth tokens plus all storage.Manager state: tool_calls,
+// diagnostics, identities, activity records, etc). Constructing it via
+// configDBPath keeps this the one place the literal is defined, so
+// CompactConfigDBIfNeeded and NewBoltDB can never disagree on the path.
+const configDBFilename = "config.db"
+
+func configDBPath(dataDir string) string {
+	return filepath.Join(dataDir, configDBFilename)
+}
+
 // openBoltDBAtStablePath opens path with bbolt, guarding against a narrow
 // race with compactDBFile's atomic rename: flock binds to the fd's inode at
 // open() time, not to the path, so if this call's internal open() happens
@@ -90,11 +101,13 @@ func openBoltDBAtStablePath(path string, mode os.FileMode, options *bbolt.Option
 	return nil, fmt.Errorf("failed to open a stable handle for %s after %d attempts: %w", path, maxAttempts, lastErr)
 }
 
-// NewBoltDB creates a new BoltDB instance
+// NewBoltDB creates a new BoltDB instance. It does NOT attempt startup
+// compaction itself -- callers that own the daemon's long-lived database
+// (currently only internal/runtime.New) must call CompactConfigDBIfNeeded
+// first. See CompactConfigDBIfNeeded's doc comment for why this is a
+// caller's responsibility rather than automatic here.
 func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
-	dbPath := filepath.Join(dataDir, "config.db")
-
-	maybeCompactOnStartup(dbPath, logger)
+	dbPath := configDBPath(dataDir)
 
 	// Try to open with timeout, if it fails, immediately return database locked error
 	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
@@ -561,6 +574,42 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	return records, err
 }
 
+// compactionMinReclaimableBytes is the minimum estimated free-page space
+// (see estimateReclaimableBytes) worth reclaiming via a full-file
+// compaction. A file can sit above compactionThresholdBytes purely from
+// live data -- no free pages at all -- in which case bbolt.Compact would
+// just be an expensive copy that reclaims nothing (see this function's doc
+// comment on the two-restart limitation). Gating on this, not just raw file
+// size, keeps compaction from re-attempting (and re-logging "reclaimed
+// little space") on every single restart once a config with even one
+// actively-used server sits at or above compactionThresholdBytes as its
+// normal live-data floor.
+const compactionMinReclaimableBytes = 5 * 1024 * 1024 // 5MB
+
+// CompactConfigDBIfNeeded opportunistically compacts dataDir's config.db
+// before NewBoltDB opens it, IF it's both large and has meaningful
+// reclaimable space (see maybeCompactOnStartup).
+//
+// This must only be called from the daemon's own startup path (currently
+// internal/runtime.New, the sole caller of storage.NewManager that isn't
+// itself a short-lived CLI helper) -- never from inside NewBoltDB or
+// NewManager directly. Those are also the entry points several CLI
+// commands use in their own "standalone mode" fallback (tools_cmd.go,
+// upstream/cli/client.go, call_cmd.go, code_cmd.go, auth_cmd.go), which run
+// specifically when no live daemon was detected for the same dataDir. A
+// prior version of this code ran compaction unconditionally inside
+// NewBoltDB, so every one of those CLI invocations attempted a multi-second
+// compaction too -- and on a stale-detection race where a daemon actually
+// is running, that CLI call would block on (or lose) a flock race against
+// the daemon's own held lock, silently falling back to in-memory OAuth
+// tokens the moment NewBoltDB returned any error (see each of those files'
+// "falling back to in-memory" log lines). Restricting this to the one real
+// daemon bootstrap path removes that failure mode entirely rather than just
+// shortening its blocking window.
+func CompactConfigDBIfNeeded(dataDir string, logger *zap.SugaredLogger) {
+	maybeCompactOnStartup(configDBPath(dataDir), logger)
+}
+
 // maybeCompactOnStartup opportunistically compacts an oversized config.db
 // before it is opened for normal use. It's a one-time reclaim step for
 // files that grew large before the retention limits in RecordToolCall,
@@ -580,7 +629,10 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 // (shrinking the live-data floor on subsequent writes) does a *second*
 // restart's compaction have real free space to reclaim. compactDBFile logs
 // before/after size on every run, so a restart that reclaims little is
-// visible in the logs rather than silently assumed to have worked.
+// visible in the logs rather than silently assumed to have worked. The
+// estimateReclaimableBytes gate below means that "little to reclaim" case
+// mostly just skips the attempt outright instead of paying for a no-op
+// compaction on every subsequent restart too.
 //
 // This must never block startup on a corrupt, locked, or otherwise
 // unreadable file: any failure is logged and the normal (uncompacted)
@@ -594,12 +646,52 @@ func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
 		return
 	}
 
-	logger.Infow("config.db exceeds compaction threshold, attempting one-time startup compaction",
-		"path", dbPath, "size_bytes", info.Size(), "threshold_bytes", compactionThresholdBytes)
+	reclaimable, err := estimateReclaimableBytes(dbPath)
+	if err != nil {
+		logger.Warnw("Failed to estimate reclaimable space before startup compaction, skipping",
+			"path", dbPath, "error", err)
+		return
+	}
+	if reclaimable < compactionMinReclaimableBytes {
+		logger.Debugw("config.db exceeds size threshold but has little reclaimable free space, skipping startup compaction",
+			"path", dbPath, "size_bytes", info.Size(), "reclaimable_bytes", reclaimable,
+			"min_reclaimable_bytes", compactionMinReclaimableBytes)
+		return
+	}
+
+	logger.Infow("config.db exceeds compaction threshold with reclaimable space, attempting one-time startup compaction",
+		"path", dbPath, "size_bytes", info.Size(), "reclaimable_bytes", reclaimable,
+		"threshold_bytes", compactionThresholdBytes)
 
 	if err := compactDBFile(dbPath, logger); err != nil {
 		logger.Warnw("Startup compaction failed, continuing with uncompacted database", "error", err)
 	}
+}
+
+// estimateReclaimableBytes opens dbPath just long enough to read bbolt's
+// free-page stats, then closes it, to gate startup compaction on actual
+// reclaimable space rather than raw file size (see
+// compactionMinReclaimableBytes). It deliberately does NOT open read-only:
+// bbolt only populates FreePageN eagerly at Open() when PreLoadFreelist is
+// set, which bbolt itself forces true only in writable mode ("always load
+// free pages in write mode") -- a read-only open would leave FreePageN at
+// its zero value until some transaction ran, silently making this always
+// report zero reclaimable space and disabling compaction forever. Opening
+// writable briefly costs the same flock a real compactDBFile call would
+// take anyway; this function returns and closes before that ever runs, so
+// there is no meaningful added lock contention (this whole path is now
+// daemon-startup-only -- see CompactConfigDBIfNeeded's doc comment).
+func estimateReclaimableBytes(dbPath string) (int64, error) {
+	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+
+	stats := db.Stats()
+	return int64(stats.FreePageN) * int64(db.Info().PageSize), nil
 }
 
 // compactDBFile compacts dbPath into a temp file and swaps it into place.

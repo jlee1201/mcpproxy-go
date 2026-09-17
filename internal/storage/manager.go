@@ -913,6 +913,72 @@ func (m *Manager) GetServerDiagnostics(serverID string, limit int) ([]*Diagnosti
 	return records, nil
 }
 
+// TrimAllServerBuckets applies the tool_calls/diagnostics byte-budget trim
+// (trimBucketToByteBudget, same as RecordToolCall/RecordServerDiagnostic use
+// on their own write path) to every known server's buckets, regardless of
+// whether that server has written anything recently.
+//
+// RecordToolCall/RecordServerDiagnostic only trim on their OWN write: a
+// server that stays configured but goes quiet (no new tool calls, no new
+// diagnostics -- e.g. it's idle, or degraded but still connected) never
+// triggers a trim of whatever already-bloated bucket it left behind from
+// before this fix existed. CleanupStaleServerData intentionally leaves that
+// server's data alone too, since "still configured" means it isn't stale.
+// This periodic sweep is what actually closes that gap: a server that never
+// writes again still gets its existing backlog trimmed down to budget the
+// next time this runs.
+//
+// protectedKey is passed as nil here (unlike the write path's own call):
+// there is no "record just written in this transaction" to protect, and
+// trimBucketToByteBudget already exempts the single newest key
+// unconditionally.
+//
+// Returns the number of buckets that had at least one record evicted.
+func (m *Manager) TrimAllServerBuckets() (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Must use the lock-free helper here for the same reason
+	// CleanupStaleServerData does: we're already holding m.mu.Lock().
+	identities, err := m.listServerIdentitiesLocked()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list server identities: %w", err)
+	}
+
+	trimmedBuckets := 0
+	err = m.db.db.Update(func(tx *bbolt.Tx) error {
+		for _, identity := range identities {
+			toolCallsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_tool_calls", identity.ID)))
+			if toolCallsBucket != nil {
+				n, trimErr := trimBucketToByteBudget(toolCallsBucket, DefaultToolCallsBucketMaxBytes, nil)
+				if trimErr != nil {
+					return trimErr
+				}
+				if n > 0 {
+					trimmedBuckets++
+				}
+			}
+
+			diagnosticsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_diagnostics", identity.ID)))
+			if diagnosticsBucket != nil {
+				n, trimErr := trimBucketToByteBudget(diagnosticsBucket, DefaultDiagnosticsBucketMaxBytes, nil)
+				if trimErr != nil {
+					return trimErr
+				}
+				if n > 0 {
+					trimmedBuckets++
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return trimmedBuckets, nil
+}
+
 // UpdateServerStatistics updates server statistics
 func (m *Manager) UpdateServerStatistics(stats *ServerStatistics) error {
 	m.mu.Lock()

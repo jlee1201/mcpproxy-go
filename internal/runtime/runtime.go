@@ -94,6 +94,13 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
+	// This is the one real daemon bootstrap path (see
+	// storage.CompactConfigDBIfNeeded's doc comment for why this must NOT
+	// also happen inside storage.NewBoltDB/NewManager themselves: several
+	// CLI "standalone mode" commands call those same constructors and must
+	// never attempt startup compaction on their own).
+	storage.CompactConfigDBIfNeeded(cfg.DataDir, logger.Sugar())
+
 	storageManager, err := storage.NewManager(cfg.DataDir, logger.Sugar())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage manager: %w", err)

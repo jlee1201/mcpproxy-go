@@ -203,15 +203,27 @@ func (s *ActivityService) runRetentionCleanup() {
 		}
 	}
 
+	// Trim every known server's tool_calls/diagnostics buckets, independent
+	// of recent writes or configured/stale status. RecordToolCall/
+	// RecordServerDiagnostic only trim on their OWN write path, so a server
+	// that stays configured but goes quiet (no new tool calls, no new
+	// diagnostics) never gets its already-bloated bucket trimmed otherwise
+	// -- CleanupStaleServerData below intentionally leaves it alone too,
+	// since "still configured" means it isn't stale. See
+	// TrimAllServerBuckets's doc comment.
+	if trimmed, err := s.storage.TrimAllServerBuckets(); err != nil {
+		s.logger.Error("Failed to trim server tool_calls/diagnostics buckets", zap.Error(err))
+	} else if trimmed > 0 {
+		s.logger.Info("Trimmed server tool_calls/diagnostics buckets", zap.Int("buckets_trimmed", trimmed))
+	}
+
 	// Remove all data for servers not seen in a long time AND no longer
-	// configured. tool_calls and diagnostics buckets are now self-trimming
-	// on every write (see RecordToolCall/RecordServerDiagnostic), but a
-	// server dropped from config entirely still leaves behind its
-	// identity/statistics rows and whatever tool_calls/diagnostics history
-	// it had accumulated; this removes that residue outright rather than
-	// leaving it to trim down slowly (or not at all, since a removed server
-	// never writes again). Requiring "no longer configured" in addition to
-	// "stale by time" keeps a merely-disconnected-but-still-configured
+	// configured. A server dropped from config entirely still leaves behind
+	// its identity/statistics rows and whatever tool_calls/diagnostics
+	// history it had accumulated (even after the sweep above trims that
+	// history down to budget, the rows themselves remain); this removes
+	// that residue outright. Requiring "no longer configured" in addition
+	// to "stale by time" keeps a merely-disconnected-but-still-configured
 	// server's history intact -- see CleanupStaleServerData's doc comment.
 	if s.staleThreshold > 0 {
 		var configuredIDs map[string]bool
