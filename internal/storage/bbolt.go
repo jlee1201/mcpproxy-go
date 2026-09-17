@@ -33,9 +33,15 @@ type BoltDB struct {
 	logger *zap.SugaredLogger
 }
 
+// compactionThresholdBytes is the minimum config.db size before a startup
+// compaction pass is attempted. Below this, compaction isn't worth the I/O.
+const compactionThresholdBytes = 20 * 1024 * 1024 // 20MB
+
 // NewBoltDB creates a new BoltDB instance
 func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
 	dbPath := filepath.Join(dataDir, "config.db")
+
+	maybeCompactOnStartup(dbPath, logger)
 
 	// Try to open with timeout, if it fails, immediately return database locked error
 	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{
@@ -500,4 +506,133 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	})
 
 	return records, err
+}
+
+// maybeCompactOnStartup opportunistically compacts an oversized config.db
+// before it is opened for normal use. It's a one-time reclaim step for
+// files that grew large before the retention limits in RecordToolCall,
+// RecordServerDiagnostic, and PruneActivitiesByBudget existed: bbolt.Compact
+// only returns freed space to the OS, it doesn't shrink live data, so it's
+// not a substitute for those limits, only a way to reclaim what they would
+// have prevented. Once those limits keep the live-data floor low, bbolt
+// reuses freed pages internally and this should rarely fire again.
+//
+// This must never block startup on a corrupt, locked, or otherwise
+// unreadable file: any failure is logged and the normal (uncompacted)
+// database is opened afterwards by the caller.
+func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		return // no existing file yet, nothing to compact
+	}
+	if info.Size() < compactionThresholdBytes {
+		return
+	}
+
+	logger.Infow("config.db exceeds compaction threshold, attempting one-time startup compaction",
+		"path", dbPath, "size_bytes", info.Size(), "threshold_bytes", compactionThresholdBytes)
+
+	if err := compactDBFile(dbPath, logger); err != nil {
+		logger.Warnw("Startup compaction failed, continuing with uncompacted database", "error", err)
+	}
+}
+
+// compactDBFile compacts dbPath into a temp file and swaps it into place.
+// Safety properties, since this replaces the file holding OAuth tokens:
+//   - any stale temp file from a prior crashed attempt is removed before
+//     use, so reopening it can't fail with ErrBucketExists
+//   - per-bucket key counts are verified equal between source and compacted
+//     output before swapping; any mismatch aborts without touching dbPath
+//   - the swap itself is a single atomic os.Rename, never a two-step
+//     rename that leaves a window with no config.db on disk
+func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
+	tmpPath := dbPath + ".compact-tmp"
+	_ = os.Remove(tmpPath)
+
+	srcDB, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open source for compaction: %w", err)
+	}
+
+	dstDB, err := bbolt.Open(tmpPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		_ = srcDB.Close()
+		return fmt.Errorf("open compaction temp file: %w", err)
+	}
+
+	if err := bbolt.Compact(dstDB, srcDB, 64*1024*1024); err != nil {
+		_ = dstDB.Close()
+		_ = srcDB.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("compact: %w", err)
+	}
+
+	if err := verifyBucketCounts(srcDB, dstDB); err != nil {
+		_ = dstDB.Close()
+		_ = srcDB.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("post-compaction verification failed: %w", err)
+	}
+
+	beforeInfo, _ := os.Stat(dbPath)
+
+	if err := dstDB.Close(); err != nil {
+		_ = srcDB.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close compacted temp file: %w", err)
+	}
+	if err := srcDB.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close source before swap: %w", err)
+	}
+
+	afterInfo, statErr := os.Stat(tmpPath)
+
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		return fmt.Errorf("swap compacted file into place: %w", err)
+	}
+
+	if beforeInfo != nil && statErr == nil {
+		logger.Infow("Startup compaction complete",
+			"before_bytes", beforeInfo.Size(), "after_bytes", afterInfo.Size())
+	}
+	return nil
+}
+
+// verifyBucketCounts confirms src and dst have the same set of top-level
+// buckets with identical key counts, so a compaction bug can never silently
+// drop data (e.g. OAuth tokens) during the swap.
+func verifyBucketCounts(src, dst *bbolt.DB) error {
+	counts := map[string]int{}
+	if err := src.View(func(tx *bbolt.Tx) error {
+		return tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+			counts[string(name)] = b.Stats().KeyN
+			return nil
+		})
+	}); err != nil {
+		return fmt.Errorf("read source bucket counts: %w", err)
+	}
+
+	return dst.View(func(tx *bbolt.Tx) error {
+		seen := make(map[string]bool, len(counts))
+		if err := tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+			seen[string(name)] = true
+			want, ok := counts[string(name)]
+			if !ok {
+				return fmt.Errorf("unexpected bucket %q in compacted output", string(name))
+			}
+			if got := b.Stats().KeyN; got != want {
+				return fmt.Errorf("bucket %q key count mismatch: src=%d dst=%d", string(name), want, got)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for name := range counts {
+			if !seen[name] {
+				return fmt.Errorf("bucket %q missing from compacted output", name)
+			}
+		}
+		return nil
+	})
 }

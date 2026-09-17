@@ -394,6 +394,59 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 	return deleted, nil
 }
 
+// PruneActivitiesByBudget deletes the oldest activity records once the
+// bucket's total value bytes exceed maxBytes. It walks newest-first,
+// keeping records while the running byte total stays under budget, then
+// deletes everything older. This complements PruneOldActivities/
+// PruneExcessActivities: a 7-day/10,000-record cap still permits ~100MB of
+// legitimate stored bytes at ~10KB/record, so a byte budget is the cap that
+// actually bounds config.db size.
+func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var deleted int
+
+	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil
+		}
+
+		var cumulative int64
+		var keysToDelete [][]byte
+		cursor := bucket.Cursor()
+
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			cumulative += int64(len(v))
+			if cumulative > maxBytes {
+				keysToDelete = append(keysToDelete, append([]byte{}, k...))
+			}
+		}
+
+		for _, key := range keysToDelete {
+			if err := bucket.Delete(key); err != nil {
+				return fmt.Errorf("failed to delete over-budget activity: %w", err)
+			}
+			deleted++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return deleted, err
+	}
+
+	if deleted > 0 {
+		m.logger.Infow("Pruned activity records over byte budget",
+			"deleted", deleted,
+			"max_bytes", maxBytes)
+	}
+
+	return deleted, nil
+}
+
 // SaveActivityAsync saves an activity record asynchronously.
 // This is non-blocking and suitable for recording tool calls without impacting latency.
 func (m *Manager) SaveActivityAsync(record *ActivityRecord) {

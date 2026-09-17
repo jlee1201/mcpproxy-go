@@ -615,7 +615,21 @@ func (m *Manager) ListServerIdentities() ([]*ServerIdentity, error) {
 	return identities, nil
 }
 
-// RecordToolCall records a tool call for a server
+// DefaultToolCallsBucketMaxBytes bounds how much data each per-server
+// tool_calls bucket may retain. Without this, RecordToolCall grew every
+// bucket forever for actively-used servers (see config.db bloat
+// investigation): the only cleanup path, CleanupStaleServerData, only ran
+// for servers that had gone stale, so a server used every day never had its
+// tool_calls bucket pruned.
+const DefaultToolCallsBucketMaxBytes = 5 * 1024 * 1024
+
+// DefaultDiagnosticsBucketMaxBytes bounds each per-server diagnostics bucket.
+// Same unbounded-growth shape as tool_calls, just not yet observed to have
+// fired in practice.
+const DefaultDiagnosticsBucketMaxBytes = 2 * 1024 * 1024
+
+// RecordToolCall records a tool call for a server, then trims the bucket
+// back to DefaultToolCallsBucketMaxBytes if the new record pushed it over.
 func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -634,8 +648,39 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 			return err
 		}
 
-		return bucket.Put([]byte(key), data)
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return err
+		}
+
+		return trimBucketToByteBudget(bucket, DefaultToolCallsBucketMaxBytes)
 	})
+}
+
+// trimBucketToByteBudget deletes the oldest entries in bucket (keys must
+// sort chronologically, as tool_calls/diagnostics keys do) once the bucket's
+// total value bytes exceed maxBytes. It walks newest-first via the cursor,
+// keeping records while the running byte total stays under budget, then
+// deletes everything older. Cost is bounded by the bucket's own size, which
+// this function keeps capped, so it stays cheap on every write.
+func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64) error {
+	var cumulative int64
+	var keysToDelete [][]byte
+
+	cursor := bucket.Cursor()
+	for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+		cumulative += int64(len(v))
+		if cumulative > maxBytes {
+			keysToDelete = append(keysToDelete, append([]byte{}, k...))
+		}
+	}
+
+	for _, key := range keysToDelete {
+		if err := bucket.Delete(key); err != nil {
+			return fmt.Errorf("failed to trim bucket over byte budget: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GetServerToolCalls gets tool calls for a server
@@ -675,7 +720,9 @@ func (m *Manager) GetServerToolCalls(serverID string, limit int) ([]*ToolCallRec
 	return records, nil
 }
 
-// RecordServerDiagnostic records a diagnostic event for a server
+// RecordServerDiagnostic records a diagnostic event for a server, then
+// trims the bucket back to DefaultDiagnosticsBucketMaxBytes if the new
+// record pushed it over. Same unbounded-growth shape as RecordToolCall.
 func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -694,7 +741,11 @@ func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 			return err
 		}
 
-		return bucket.Put([]byte(key), data)
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return err
+		}
+
+		return trimBucketToByteBudget(bucket, DefaultDiagnosticsBucketMaxBytes)
 	})
 }
 

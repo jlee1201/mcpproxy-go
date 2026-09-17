@@ -16,8 +16,16 @@ const (
 	DefaultRetentionMaxAge = 7 * 24 * time.Hour
 	// DefaultRetentionMaxRecords is the default max number of records (10000)
 	DefaultRetentionMaxRecords = 10000
+	// DefaultRetentionMaxBytes is the default byte budget for activity_records
+	// (20MB). The age/count caps above permit up to ~100MB of legitimate
+	// stored bytes at typical record sizes; this is the cap that actually
+	// bounds config.db size.
+	DefaultRetentionMaxBytes = 20 * 1024 * 1024
 	// DefaultRetentionCheckInterval is the default interval between retention checks (1 hour)
 	DefaultRetentionCheckInterval = 1 * time.Hour
+	// DefaultStaleServerThreshold is how long a server must be unseen before
+	// its identity/statistics/tool_calls/diagnostics data is fully removed.
+	DefaultStaleServerThreshold = 30 * 24 * time.Hour
 )
 
 // ActivityService subscribes to activity events and persists them to storage.
@@ -32,34 +40,42 @@ type ActivityService struct {
 	done chan struct{}
 
 	// Retention configuration
-	maxAge        time.Duration
-	maxRecords    int
-	checkInterval time.Duration
+	maxAge         time.Duration
+	maxRecords     int
+	maxBytes       int64
+	staleThreshold time.Duration
+	checkInterval  time.Duration
 }
 
 // NewActivityService creates a new activity service.
 func NewActivityService(storage *storage.Manager, logger *zap.Logger) *ActivityService {
 	return &ActivityService{
-		storage:       storage,
-		logger:        logger,
-		eventCh:       make(chan Event, 100), // Buffer for non-blocking event delivery
-		done:          make(chan struct{}),
-		maxAge:        DefaultRetentionMaxAge,
-		maxRecords:    DefaultRetentionMaxRecords,
-		checkInterval: DefaultRetentionCheckInterval,
+		storage:        storage,
+		logger:         logger,
+		eventCh:        make(chan Event, 100), // Buffer for non-blocking event delivery
+		done:           make(chan struct{}),
+		maxAge:         DefaultRetentionMaxAge,
+		maxRecords:     DefaultRetentionMaxRecords,
+		maxBytes:       DefaultRetentionMaxBytes,
+		staleThreshold: DefaultStaleServerThreshold,
+		checkInterval:  DefaultRetentionCheckInterval,
 	}
 }
 
 // SetRetentionConfig updates the retention configuration.
 // maxAge: maximum age for records (0 = no age limit)
 // maxRecords: maximum number of records (0 = no count limit)
+// maxBytes: byte budget for the activity_records bucket (0 = no byte limit)
 // checkInterval: how often to run retention cleanup
-func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, checkInterval time.Duration) {
+func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, maxBytes int64, checkInterval time.Duration) {
 	if maxAge > 0 {
 		s.maxAge = maxAge
 	}
 	if maxRecords > 0 {
 		s.maxRecords = maxRecords
+	}
+	if maxBytes > 0 {
+		s.maxBytes = maxBytes
 	}
 	if checkInterval > 0 {
 		s.checkInterval = checkInterval
@@ -141,6 +157,33 @@ func (s *ActivityService) runRetentionCleanup() {
 			s.logger.Info("Pruned excess activity records",
 				zap.Int("deleted", deleted),
 				zap.Int("max_records", s.maxRecords))
+		}
+	}
+
+	// Prune by byte budget. The age/count caps above still permit a large
+	// number of bytes at real-world record sizes, so this is the cap that
+	// actually bounds config.db size for activity_records.
+	if s.maxBytes > 0 {
+		deleted, err := s.storage.PruneActivitiesByBudget(s.maxBytes)
+		if err != nil {
+			s.logger.Error("Failed to prune activities over byte budget", zap.Error(err))
+		} else if deleted > 0 {
+			s.logger.Info("Pruned activity records over byte budget",
+				zap.Int("deleted", deleted),
+				zap.Int64("max_bytes", s.maxBytes))
+		}
+	}
+
+	// Remove all data for servers not seen in a long time. tool_calls and
+	// diagnostics buckets are now self-trimming on every write (see
+	// RecordToolCall/RecordServerDiagnostic), but a server dropped from
+	// config entirely still leaves behind its identity/statistics rows and
+	// whatever tool_calls/diagnostics history it had accumulated; this
+	// removes that residue outright rather than leaving it to trim down
+	// slowly (or not at all, since a removed server never writes again).
+	if s.staleThreshold > 0 {
+		if err := s.storage.CleanupStaleServerData(s.staleThreshold); err != nil {
+			s.logger.Error("Failed to clean up stale server data", zap.Error(err))
 		}
 	}
 }
@@ -317,10 +360,10 @@ func (s *ActivityService) handleSystemStart(evt Event) {
 		Source: storage.ActivitySourceAPI, // System events come from the API server
 		Status: "success",
 		Metadata: map[string]interface{}{
-			"version":            version,
-			"listen_address":     listenAddress,
+			"version":             version,
+			"listen_address":      listenAddress,
 			"startup_duration_ms": startupDurationMs,
-			"config_path":        configPath,
+			"config_path":         configPath,
 		},
 		Timestamp: evt.Timestamp,
 	}
@@ -572,4 +615,3 @@ func getSlicePayload(payload map[string]any, key string) []string {
 	}
 	return nil
 }
-
