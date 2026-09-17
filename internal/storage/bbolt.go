@@ -37,6 +37,59 @@ type BoltDB struct {
 // compaction pass is attempted. Below this, compaction isn't worth the I/O.
 const compactionThresholdBytes = 20 * 1024 * 1024 // 20MB
 
+// openBoltDBAtStablePath opens path with bbolt, guarding against a narrow
+// race with compactDBFile's atomic rename: flock binds to the fd's inode at
+// open() time, not to the path, so if this call's internal open() happens
+// just before a concurrent compaction's os.Rename swaps a new file onto
+// path, and this call's flock then blocks until that compaction's srcDB
+// releases its own flock on the (now-orphaned, unlinked-but-still-open)
+// pre-rename inode, this call can succeed while bound to that orphaned
+// inode -- silently writing every subsequent operation on this handle into
+// a file nothing else will ever open again. This is not limited to two
+// concurrent compactions racing each other (compactDBFile's own srcDB flock
+// already serializes those): it's any ordinary bbolt.Open(path) call,
+// including this one from NewBoltDB, racing a compaction it never knows is
+// running.
+//
+// Detect it by comparing path's identity (device+inode) immediately before
+// and immediately after Open. A mismatch means path was renamed onto while
+// Open was in flight, so this handle's identity is not provably the current
+// file -- close it and retry against the now-stable path. This can also
+// false-positive (retry a perfectly good handle) if the rename happened to
+// land between our "before" stat and bbolt's internal open(), which is
+// harmless: the retry's own before/after stats will then agree and return
+// immediately.
+func openBoltDBAtStablePath(path string, mode os.FileMode, options *bbolt.Options) (*bbolt.DB, error) {
+	const maxAttempts = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		before, beforeErr := os.Stat(path)
+
+		db, err := bbolt.Open(path, mode, options)
+		if err != nil {
+			return nil, err
+		}
+
+		after, afterErr := os.Stat(path)
+
+		// Nothing to compare against (e.g. first-ever creation of path) --
+		// accept the open as-is.
+		if beforeErr != nil || afterErr != nil {
+			return db, nil
+		}
+
+		if os.SameFile(before, after) {
+			return db, nil
+		}
+
+		_ = db.Close()
+		lastErr = fmt.Errorf("file at %s changed identity during open (concurrent compaction swap), retrying", path)
+	}
+
+	return nil, fmt.Errorf("failed to open a stable handle for %s after %d attempts: %w", path, maxAttempts, lastErr)
+}
+
 // NewBoltDB creates a new BoltDB instance
 func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
 	dbPath := filepath.Join(dataDir, "config.db")
@@ -44,7 +97,7 @@ func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
 	maybeCompactOnStartup(dbPath, logger)
 
 	// Try to open with timeout, if it fails, immediately return database locked error
-	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{
+	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -517,6 +570,18 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 // have prevented. Once those limits keep the live-data floor low, bbolt
 // reuses freed pages internally and this should rarely fire again.
 //
+// Known limitation: this runs here, before NewBoltDB's caller has ever
+// opened the database, which means it runs before the per-record caps and
+// trimBucketToByteBudget have ever executed against this file. On a file
+// that was already bloated with LIVE (uncapped) data -- the exact scenario
+// this PR exists for -- there are no free pages yet for bbolt.Compact to
+// reclaim, so the first restart after upgrading to this fix compacts very
+// little; only after the daemon has run once under the new write-time caps
+// (shrinking the live-data floor on subsequent writes) does a *second*
+// restart's compaction have real free space to reclaim. compactDBFile logs
+// before/after size on every run, so a restart that reclaims little is
+// visible in the logs rather than silently assumed to have worked.
+//
 // This must never block startup on a corrupt, locked, or otherwise
 // unreadable file: any failure is logged and the normal (uncompacted)
 // database is opened afterwards by the caller.
@@ -555,10 +620,19 @@ func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
 //     tmp file: any match found once we hold the lock is provably left by a
 //     dead process, not a running one (a running one would have blocked
 //     above before reaching the glob).
+//   - the flock guarantees above only serialize this attempt against another
+//     compactDBFile call blocked on the *same* open (same inode). They do
+//     NOT by themselves protect an ordinary, unrelated bbolt.Open(dbPath)
+//     call (e.g. NewBoltDB's own open) whose open() happened just before
+//     this rename and whose flock only unblocks after it: that caller would
+//     be bound to the pre-rename inode this rename just orphaned. srcDB
+//     itself is opened via openBoltDBAtStablePath for exactly this reason;
+//     see its doc comment for the detect-and-retry mechanism, which callers
+//     of dbPath (NewBoltDB included) must also use.
 func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid())
 
-	srcDB, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
+	srcDB, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
 		return fmt.Errorf("open source for compaction: %w", err)
 	}
@@ -622,8 +696,21 @@ func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 	}
 
 	if beforeInfo != nil && statErr == nil {
-		logger.Infow("Startup compaction complete",
-			"before_bytes", beforeInfo.Size(), "after_bytes", afterInfo.Size())
+		before, after := beforeInfo.Size(), afterInfo.Size()
+		logger.Infow("Startup compaction complete", "before_bytes", before, "after_bytes", after)
+
+		// Compaction only reclaims free pages, not live data (see
+		// maybeCompactOnStartup's doc comment). A file still over the
+		// threshold after compacting means it was full of live data at
+		// compaction time, not free space -- expected on the first restart
+		// after upgrading to the write-time retention caps, before they've
+		// had a chance to shrink the live-data floor. Surface it so this
+		// isn't mistaken for compaction not working.
+		if after >= compactionThresholdBytes {
+			logger.Infow("Startup compaction reclaimed little space; database is still mostly live data",
+				"after_bytes", after, "threshold_bytes", compactionThresholdBytes,
+				"note", "expect a second restart to reclaim more once write-time retention caps have shrunk live data")
+		}
 	}
 	return nil
 }

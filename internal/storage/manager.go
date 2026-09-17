@@ -647,6 +647,90 @@ const MaxToolCallRecordBytes = DefaultToolCallsBucketMaxBytes / 5 // 1MB
 // MaxDiagnosticRecordBytes mirrors MaxToolCallRecordBytes for diagnostics.
 const MaxDiagnosticRecordBytes = DefaultDiagnosticsBucketMaxBytes / 5
 
+// truncateToolCallRecordToFit marshals record, and if it exceeds maxBytes,
+// clears its variable-size fields one at a time -- Response and Arguments
+// first, then Error -- re-measuring after each, until the result fits.
+// Clearing only Response/Arguments is not enough on its own: Error is an
+// unbounded string too (an adversarial or verbose upstream error can be
+// megabytes on its own with a tiny Response), and a single unchecked clear
+// doesn't prove the result actually fits. If every known field is cleared
+// and it's still over cap, falls back to a minimal fixed-shape record that
+// is guaranteed to fit, so this function can never itself return a value
+// over maxBytes.
+func truncateToolCallRecordToFit(record *ToolCallRecord, maxBytes int) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+	originalBytes := len(data)
+
+	truncated := *record
+	truncated.Response = fmt.Sprintf("[response omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	truncated.Arguments = nil
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.Error = fmt.Sprintf("[error omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	minimal := &ToolCallRecord{
+		ID:         record.ID,
+		ServerID:   record.ServerID,
+		ServerName: record.ServerName,
+		ToolName:   record.ToolName,
+		Error:      fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
+		Timestamp:  record.Timestamp,
+		Duration:   record.Duration,
+	}
+	return json.Marshal(minimal)
+}
+
+// truncateDiagnosticRecordToFit mirrors truncateToolCallRecordToFit for
+// DiagnosticRecord: clears Message and Details, re-measures, and falls back
+// to a minimal fixed-shape record if still over cap.
+func truncateDiagnosticRecordToFit(record *DiagnosticRecord, maxBytes int) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+	originalBytes := len(data)
+
+	truncated := *record
+	truncated.Message = fmt.Sprintf("[message omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	truncated.Details = nil
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	minimal := &DiagnosticRecord{
+		ServerID:   record.ServerID,
+		ServerName: record.ServerName,
+		Type:       record.Type,
+		Category:   record.Category,
+		Message:    fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
+		Timestamp:  record.Timestamp,
+	}
+	return json.Marshal(minimal)
+}
+
 // RecordToolCall records a tool call for a server, then trims the bucket
 // back to DefaultToolCallsBucketMaxBytes if the new record pushed it over.
 func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
@@ -662,19 +746,9 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 			return err
 		}
 
-		data, err := json.Marshal(record)
+		data, err := truncateToolCallRecordToFit(record, MaxToolCallRecordBytes)
 		if err != nil {
 			return err
-		}
-
-		if len(data) > MaxToolCallRecordBytes {
-			truncated := *record
-			truncated.Response = fmt.Sprintf("[response omitted: %d bytes exceeds %d byte per-record cap]", len(data), MaxToolCallRecordBytes)
-			truncated.Arguments = nil
-			data, err = json.Marshal(&truncated)
-			if err != nil {
-				return err
-			}
 		}
 
 		if err := bucket.Put([]byte(key), data); err != nil {
@@ -704,10 +778,11 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 // complementary per-record cap that keeps a protected record from growing
 // unbounded as a result.
 //
-// Cost is bounded by the bucket's own size: at the tool_calls/diagnostics
-// budgets and typical record sizes, that's on the order of hundreds of
-// entries, so the full cursor walk stays cheap in practice, not because it
-// skips work proportional to bucket size.
+// Cost: this always walks every key in the bucket (O(n), not just the keys
+// it deletes). That's fine at the tool_calls/diagnostics budgets and typical
+// record sizes -- on the order of hundreds of entries per write -- but it is
+// proportional to bucket size, not free; a much larger per-server bucket
+// would make this walk proportionally more expensive on every write.
 func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64, protectedKey []byte) (int, error) {
 	var cumulative int64
 	var keysToDelete [][]byte
@@ -787,19 +862,9 @@ func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 			return err
 		}
 
-		data, err := json.Marshal(record)
+		data, err := truncateDiagnosticRecordToFit(record, MaxDiagnosticRecordBytes)
 		if err != nil {
 			return err
-		}
-
-		if len(data) > MaxDiagnosticRecordBytes {
-			truncated := *record
-			truncated.Message = fmt.Sprintf("[message omitted: %d bytes exceeds %d byte per-record cap]", len(data), MaxDiagnosticRecordBytes)
-			truncated.Details = nil
-			data, err = json.Marshal(&truncated)
-			if err != nil {
-				return err
-			}
 		}
 
 		if err := bucket.Put([]byte(key), data); err != nil {

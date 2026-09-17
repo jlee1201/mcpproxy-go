@@ -283,6 +283,60 @@ func TestRecordToolCall_OversizedResponseIsTruncatedBeforeWrite(t *testing.T) {
 	assert.Contains(t, responseStr, "omitted")
 }
 
+// TestRecordToolCall_OversizedErrorIsTruncatedBeforeWrite is the round-3
+// regression test: the per-record cap originally only cleared
+// Response/Arguments, never Error, so a record with a small Response but a
+// huge Error string sailed through untouched. On a later write, once that
+// record was no longer the protected/newest key, its outsized bytes alone
+// could cascade-evict every older (individually small) record in the
+// bucket. truncateToolCallRecordToFit must catch Error too, and a
+// subsequent unrelated small write must not wipe the bucket.
+func TestRecordToolCall_OversizedErrorIsTruncatedBeforeWrite(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	serverID := "test-server-id"
+	oversizedError := strings.Repeat("e", MaxToolCallRecordBytes+1024)
+
+	huge := &ToolCallRecord{
+		ID:        "call-huge-error",
+		ServerID:  serverID,
+		ToolName:  "some_tool",
+		Response:  "small response",
+		Error:     oversizedError,
+		Timestamp: time.Unix(1_700_000_000, 0),
+		RequestID: "req-huge-error",
+	}
+	require.NoError(t, manager.RecordToolCall(huge))
+
+	// A second, unrelated, small write -- the huge-error record is no
+	// longer the protected/newest key at this point.
+	small := &ToolCallRecord{
+		ID:        "call-small",
+		ServerID:  serverID,
+		ToolName:  "some_tool",
+		Response:  "ok",
+		Timestamp: time.Unix(1_700_000_001, 0),
+		RequestID: "req-small",
+	}
+	require.NoError(t, manager.RecordToolCall(small))
+
+	survivors, err := manager.GetServerToolCalls(serverID, 10)
+	require.NoError(t, err)
+	require.Len(t, survivors, 2, "the oversized-Error record must not have cascade-wiped the bucket")
+
+	var hugeSurvivor *ToolCallRecord
+	for _, r := range survivors {
+		if r.ID == "call-huge-error" {
+			hugeSurvivor = r
+		}
+	}
+	require.NotNil(t, hugeSurvivor, "the huge-error record itself must survive (truncated, not deleted)")
+	assert.Less(t, len(hugeSurvivor.Error), MaxToolCallRecordBytes,
+		"oversized Error must have been truncated before write, not stored at full size")
+	assert.Contains(t, hugeSurvivor.Error, "omitted")
+}
+
 // TestRecordServerDiagnostic_TrimsToByteBudget mirrors the tool_calls trim
 // test for diagnostics, which has the identical unbounded-growth shape.
 func TestRecordServerDiagnostic_TrimsToByteBudget(t *testing.T) {
