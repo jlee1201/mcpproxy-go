@@ -547,21 +547,16 @@ func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
 //     rename that leaves a window with no config.db on disk
 //   - the tmp file name is unique per attempt (PID-suffixed), and srcDB's
 //     flock on dbPath is held open until AFTER the rename succeeds, so a
-//     second process racing its own concurrent maybeCompactOnStartup either
-//     blocks on the same flock (same inode, same path, same time window) or
-//     -- if it opens dbPath only after this rename lands -- opens the
-//     already-compacted result rather than clobbering it mid-swap.
+//     second process racing its own concurrent maybeCompactOnStartup blocks
+//     on that same flock (same inode, same path) until this attempt either
+//     finishes or errors out -- it can never observe a half-swapped dbPath.
+//   - the stale-tmp-file cleanup only runs AFTER this process holds that
+//     flock, so it can never delete a live concurrent attempt's in-flight
+//     tmp file: any match found once we hold the lock is provably left by a
+//     dead process, not a running one (a running one would have blocked
+//     above before reaching the glob).
 func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid())
-
-	// Remove stale temp files from prior crashed attempts: this process's
-	// own PID-suffixed name (recycled PID) plus any leftovers from other
-	// attempts, matched by glob since the suffix varies per attempt.
-	if stale, globErr := filepath.Glob(dbPath + ".compact-tmp*"); globErr == nil {
-		for _, path := range stale {
-			_ = os.Remove(path)
-		}
-	}
 
 	srcDB, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
@@ -576,6 +571,16 @@ func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 			_ = srcDB.Close()
 		}
 	}()
+
+	// Remove stale temp files from prior crashed attempts: this process's
+	// own PID-suffixed name (recycled PID) plus any leftovers from other
+	// attempts, matched by glob since the suffix varies per attempt. Safe to
+	// do only now that srcDB's flock is held -- see doc comment above.
+	if stale, globErr := filepath.Glob(dbPath + ".compact-tmp*"); globErr == nil {
+		for _, path := range stale {
+			_ = os.Remove(path)
+		}
+	}
 
 	dstDB, err := bbolt.Open(tmpPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {

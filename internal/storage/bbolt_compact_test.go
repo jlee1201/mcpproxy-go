@@ -186,8 +186,9 @@ func TestMaybeCompactOnStartup_NoOpBelowThreshold(t *testing.T) {
 
 	maybeCompactOnStartup(dbPath, testLogger(t))
 
-	_, statErr := os.Stat(dbPath + ".compact-tmp")
-	assert.True(t, os.IsNotExist(statErr), "no compaction attempt should have started below threshold")
+	stale, globErr := filepath.Glob(dbPath + ".compact-tmp*")
+	require.NoError(t, globErr)
+	assert.Empty(t, stale, "no compaction attempt should have started below threshold")
 
 	after, err := os.Stat(dbPath)
 	require.NoError(t, err)

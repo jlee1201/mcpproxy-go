@@ -60,15 +60,18 @@ func TestPruneActivitiesByBudget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 5, count)
 
-	// Budget for ~2.5 records: expect the 2 newest to survive.
+	// Budget for ~2.5 records: expect the 3 newest to survive. The single
+	// most-recent record is always protected regardless of the budget (see
+	// trimBucketToByteBudget), so one more record survives than the raw
+	// budget math alone would suggest.
 	budget := oneSize*2 + oneSize/2
 	deleted, err := manager.PruneActivitiesByBudget(budget)
 	require.NoError(t, err)
-	assert.Equal(t, 3, deleted)
+	assert.Equal(t, 2, deleted)
 
 	count, err = manager.CountActivities()
 	require.NoError(t, err)
-	assert.Equal(t, 2, count)
+	assert.Equal(t, 3, count)
 }
 
 // TestPruneActivitiesByBudget_NoOpUnderBudget verifies nothing is deleted
@@ -96,6 +99,9 @@ func TestPruneActivitiesByBudget_NoOpUnderBudget(t *testing.T) {
 // TestTrimBucketToByteBudget exercises the shared trim primitive directly
 // against a real bbolt bucket: oldest keys (by lexicographic/chronological
 // order) must be the ones removed once total value bytes exceed the budget.
+// The single newest key (009) is always protected and uncounted, so the
+// survivor set is one entry larger than a naive 300-byte/100-byte-each
+// budget would suggest.
 func TestTrimBucketToByteBudget(t *testing.T) {
 	manager, cleanup := setupTestStorageForActivity(t)
 	defer cleanup()
@@ -114,9 +120,10 @@ func TestTrimBucketToByteBudget(t *testing.T) {
 				return err
 			}
 		}
-		// Budget for 3 entries (300 bytes): entries 000-006 should be
-		// removed, leaving 007, 008, 009.
-		return trimBucketToByteBudget(bucket, 300)
+		// Budget for 3 entries (300 bytes) plus the always-protected
+		// newest: entries 000-005 should be removed, leaving 006-009.
+		_, err = trimBucketToByteBudget(bucket, 300, nil)
+		return err
 	})
 	require.NoError(t, err)
 
@@ -129,7 +136,65 @@ func TestTrimBucketToByteBudget(t *testing.T) {
 		for k, _ := c.First(); k != nil; k, _ = c.Next() {
 			remaining = append(remaining, string(k))
 		}
-		assert.Equal(t, []string{"007", "008", "009"}, remaining)
+		assert.Equal(t, []string{"006", "007", "008", "009"}, remaining)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
+// TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe is the
+// regression test for the self-deletion/cascade-wipe bug: before the
+// protectedKey exemption, a single record whose own size exceeded the
+// budget would inflate the running cumulative total, causing every older
+// (and much smaller, individually-within-budget) record to be deleted too
+// -- a single oversized write could silently wipe an entire bucket's
+// history. The just-written key must survive, and the well-behaved older
+// records must not be collaterally evicted just because of it.
+func TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	const bucketName = "trim_oversized_test_bucket"
+	const budget = 300
+
+	normalValue := strings.Repeat("n", 100) // 3 of these exactly fill the budget
+	hugeValue := strings.Repeat("h", 10_000) // dwarfs the budget by itself
+
+	err := manager.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return err
+		}
+		// Pre-existing, normal-sized, already-within-budget records.
+		for i := 0; i < 3; i++ {
+			key := fmt.Sprintf("%03d", i)
+			if err := bucket.Put([]byte(key), []byte(normalValue)); err != nil {
+				return err
+			}
+		}
+		// The just-written record, far larger than the whole budget.
+		hugeKey := "999"
+		if err := bucket.Put([]byte(hugeKey), []byte(hugeValue)); err != nil {
+			return err
+		}
+		_, err = trimBucketToByteBudget(bucket, budget, []byte(hugeKey))
+		return err
+	})
+	require.NoError(t, err)
+
+	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(bucketName))
+		require.NotNil(t, bucket)
+
+		var remaining []string
+		c := bucket.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			remaining = append(remaining, string(k))
+		}
+		// The huge just-written record survives, and none of the
+		// older, individually-within-budget records were collaterally
+		// wiped just because the new record's own size dwarfs the budget.
+		assert.Equal(t, []string{"000", "001", "002", "999"}, remaining)
 		return nil
 	})
 	require.NoError(t, err)
@@ -183,6 +248,39 @@ func TestRecordToolCall_UnboundedGrowthIsNowCapped(t *testing.T) {
 		total += len(r.Response.(string))
 	}
 	assert.LessOrEqual(t, int64(total), int64(2*DefaultToolCallsBucketMaxBytes))
+}
+
+// TestRecordToolCall_OversizedResponseIsTruncatedBeforeWrite verifies the
+// per-record cap (MaxToolCallRecordBytes): a single response larger than
+// the cap must be truncated before it's written, rather than persisted at
+// full size and relying solely on trimBucketToByteBudget's protectedKey
+// exemption to keep it around indefinitely at an unbounded size.
+func TestRecordToolCall_OversizedResponseIsTruncatedBeforeWrite(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	serverID := "test-server-id"
+	oversized := strings.Repeat("r", MaxToolCallRecordBytes+1024)
+
+	record := &ToolCallRecord{
+		ID:        "call-huge",
+		ServerID:  serverID,
+		ToolName:  "some_tool",
+		Response:  oversized,
+		Timestamp: time.Unix(1_700_000_000, 0),
+		RequestID: "req-huge",
+	}
+	require.NoError(t, manager.RecordToolCall(record))
+
+	survivors, err := manager.GetServerToolCalls(serverID, 10)
+	require.NoError(t, err)
+	require.Len(t, survivors, 1)
+
+	responseStr, ok := survivors[0].Response.(string)
+	require.True(t, ok)
+	assert.Less(t, len(responseStr), MaxToolCallRecordBytes,
+		"oversized response must have been truncated before write, not stored at full size")
+	assert.Contains(t, responseStr, "omitted")
 }
 
 // TestRecordServerDiagnostic_TrimsToByteBudget mirrors the tool_calls trim

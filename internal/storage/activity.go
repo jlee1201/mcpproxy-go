@@ -395,12 +395,14 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 }
 
 // PruneActivitiesByBudget deletes the oldest activity records once the
-// bucket's total value bytes exceed maxBytes. It walks newest-first,
-// keeping records while the running byte total stays under budget, then
-// deletes everything older. This complements PruneOldActivities/
-// PruneExcessActivities: a 7-day/10,000-record cap still permits ~100MB of
-// legitimate stored bytes at ~10KB/record, so a byte budget is the cap that
-// actually bounds config.db size.
+// bucket's total value bytes exceed maxBytes, via the same trim primitive
+// RecordToolCall/RecordServerDiagnostic use (see trimBucketToByteBudget):
+// the single most-recent record is always kept regardless of its own size,
+// so one oversized activity can't cascade into wiping the whole bucket.
+// This complements PruneOldActivities/PruneExcessActivities: a
+// 7-day/10,000-record cap still permits ~100MB of legitimate stored bytes
+// at ~10KB/record, so a byte budget is the cap that actually bounds
+// config.db size.
 func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -413,24 +415,11 @@ func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
 			return nil
 		}
 
-		var cumulative int64
-		var keysToDelete [][]byte
-		cursor := bucket.Cursor()
-
-		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
-			cumulative += int64(len(v))
-			if cumulative > maxBytes {
-				keysToDelete = append(keysToDelete, append([]byte{}, k...))
-			}
+		var err error
+		deleted, err = trimBucketToByteBudget(bucket, maxBytes, nil)
+		if err != nil {
+			return fmt.Errorf("failed to delete over-budget activity: %w", err)
 		}
-
-		for _, key := range keysToDelete {
-			if err := bucket.Delete(key); err != nil {
-				return fmt.Errorf("failed to delete over-budget activity: %w", err)
-			}
-			deleted++
-		}
-
 		return nil
 	})
 

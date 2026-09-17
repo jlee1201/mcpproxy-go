@@ -637,6 +637,16 @@ const DefaultToolCallsBucketMaxBytes = 5 * 1024 * 1024
 // fired in practice.
 const DefaultDiagnosticsBucketMaxBytes = 2 * 1024 * 1024
 
+// MaxToolCallRecordBytes caps the marshaled size of a single tool call
+// record before it's written. trimBucketToByteBudget never evicts the
+// just-written record (see its doc comment), so without this cap one
+// oversized response could alone exceed the whole bucket budget and stay
+// there forever, defeating the eviction the budget is meant to guarantee.
+const MaxToolCallRecordBytes = DefaultToolCallsBucketMaxBytes / 5 // 1MB
+
+// MaxDiagnosticRecordBytes mirrors MaxToolCallRecordBytes for diagnostics.
+const MaxDiagnosticRecordBytes = DefaultDiagnosticsBucketMaxBytes / 5
+
 // RecordToolCall records a tool call for a server, then trims the bucket
 // back to DefaultToolCallsBucketMaxBytes if the new record pushed it over.
 func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
@@ -657,26 +667,58 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 			return err
 		}
 
+		if len(data) > MaxToolCallRecordBytes {
+			truncated := *record
+			truncated.Response = fmt.Sprintf("[response omitted: %d bytes exceeds %d byte per-record cap]", len(data), MaxToolCallRecordBytes)
+			truncated.Arguments = nil
+			data, err = json.Marshal(&truncated)
+			if err != nil {
+				return err
+			}
+		}
+
 		if err := bucket.Put([]byte(key), data); err != nil {
 			return err
 		}
 
-		return trimBucketToByteBudget(bucket, DefaultToolCallsBucketMaxBytes)
+		_, err = trimBucketToByteBudget(bucket, DefaultToolCallsBucketMaxBytes, []byte(key))
+		return err
 	})
 }
 
 // trimBucketToByteBudget deletes the oldest entries in bucket (keys must
-// sort chronologically, as tool_calls/diagnostics keys do) once the bucket's
-// total value bytes exceed maxBytes. It walks newest-first via the cursor,
-// keeping records while the running byte total stays under budget, then
-// deletes everything older. Cost is bounded by the bucket's own size, which
-// this function keeps capped, so it stays cheap on every write.
-func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64) error {
+// sort chronologically, as tool_calls/diagnostics/activity keys do) once the
+// bucket's total value bytes exceed maxBytes. It walks newest-first via the
+// cursor, keeping records while the running byte total stays under budget,
+// then deletes everything older, returning how many keys it removed.
+//
+// The single most-recent key (whatever the cursor visits first) is always
+// exempt: it is never counted toward the running total and never deleted.
+// protectedKey, if non-nil, is exempt too -- callers on the write path pass
+// the key they just wrote in the same transaction, in case clock skew or
+// concurrent writers mean it isn't actually the lexicographically last key.
+// Without this, a single oversized record could delete itself in the same
+// transaction that wrote it, and -- because the running total never resets
+// -- cascade into evicting every older record too, based purely on its own
+// size. See MaxToolCallRecordBytes/MaxDiagnosticRecordBytes for the
+// complementary per-record cap that keeps a protected record from growing
+// unbounded as a result.
+//
+// Cost is bounded by the bucket's own size: at the tool_calls/diagnostics
+// budgets and typical record sizes, that's on the order of hundreds of
+// entries, so the full cursor walk stays cheap in practice, not because it
+// skips work proportional to bucket size.
+func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64, protectedKey []byte) (int, error) {
 	var cumulative int64
 	var keysToDelete [][]byte
 
 	cursor := bucket.Cursor()
+	first := true
 	for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+		if first || bytes.Equal(k, protectedKey) {
+			first = false
+			continue
+		}
 		cumulative += int64(len(v))
 		if cumulative > maxBytes {
 			keysToDelete = append(keysToDelete, append([]byte{}, k...))
@@ -685,11 +727,11 @@ func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64) error {
 
 	for _, key := range keysToDelete {
 		if err := bucket.Delete(key); err != nil {
-			return fmt.Errorf("failed to trim bucket over byte budget: %w", err)
+			return 0, fmt.Errorf("failed to trim bucket over byte budget: %w", err)
 		}
 	}
 
-	return nil
+	return len(keysToDelete), nil
 }
 
 // GetServerToolCalls gets tool calls for a server
@@ -750,11 +792,22 @@ func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 			return err
 		}
 
+		if len(data) > MaxDiagnosticRecordBytes {
+			truncated := *record
+			truncated.Message = fmt.Sprintf("[message omitted: %d bytes exceeds %d byte per-record cap]", len(data), MaxDiagnosticRecordBytes)
+			truncated.Details = nil
+			data, err = json.Marshal(&truncated)
+			if err != nil {
+				return err
+			}
+		}
+
 		if err := bucket.Put([]byte(key), data); err != nil {
 			return err
 		}
 
-		return trimBucketToByteBudget(bucket, DefaultDiagnosticsBucketMaxBytes)
+		_, err = trimBucketToByteBudget(bucket, DefaultDiagnosticsBucketMaxBytes, []byte(key))
+		return err
 	})
 }
 
