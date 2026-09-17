@@ -45,6 +45,14 @@ type ActivityService struct {
 	maxBytes       int64
 	staleThreshold time.Duration
 	checkInterval  time.Duration
+
+	// configuredServerIDs returns the set of server IDs currently present in
+	// config, so stale-server cleanup never deletes history for a server
+	// that's still configured but simply can't connect (expired OAuth, an
+	// outage) -- see CleanupStaleServerData's doc comment. Set by Start()
+	// from the live Runtime config; nil until then, and tests may inject
+	// their own to exercise runRetentionCleanup without a full Runtime.
+	configuredServerIDs func() map[string]bool
 }
 
 // NewActivityService creates a new activity service.
@@ -82,9 +90,30 @@ func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords in
 	}
 }
 
+// SetConfiguredServerIDsFunc overrides how runRetentionCleanup determines
+// which server IDs are still configured. Primarily for tests; Start() wires
+// a default backed by the live Runtime config.
+func (s *ActivityService) SetConfiguredServerIDsFunc(fn func() map[string]bool) {
+	s.configuredServerIDs = fn
+}
+
 // Start begins listening for activity events and persisting them.
 // It should be called as a goroutine: go svc.Start(ctx, runtime)
 func (s *ActivityService) Start(ctx context.Context, rt *Runtime) {
+	if s.configuredServerIDs == nil {
+		s.configuredServerIDs = func() map[string]bool {
+			cfg := rt.Config()
+			if cfg == nil {
+				return nil
+			}
+			ids := make(map[string]bool, len(cfg.Servers))
+			for _, serverCfg := range cfg.Servers {
+				ids[storage.GenerateServerID(serverCfg)] = true
+			}
+			return ids
+		}
+	}
+
 	// Subscribe to runtime events
 	eventCh := rt.SubscribeEvents()
 	defer rt.UnsubscribeEvents(eventCh)
@@ -174,16 +203,27 @@ func (s *ActivityService) runRetentionCleanup() {
 		}
 	}
 
-	// Remove all data for servers not seen in a long time. tool_calls and
-	// diagnostics buckets are now self-trimming on every write (see
-	// RecordToolCall/RecordServerDiagnostic), but a server dropped from
-	// config entirely still leaves behind its identity/statistics rows and
-	// whatever tool_calls/diagnostics history it had accumulated; this
-	// removes that residue outright rather than leaving it to trim down
-	// slowly (or not at all, since a removed server never writes again).
+	// Remove all data for servers not seen in a long time AND no longer
+	// configured. tool_calls and diagnostics buckets are now self-trimming
+	// on every write (see RecordToolCall/RecordServerDiagnostic), but a
+	// server dropped from config entirely still leaves behind its
+	// identity/statistics rows and whatever tool_calls/diagnostics history
+	// it had accumulated; this removes that residue outright rather than
+	// leaving it to trim down slowly (or not at all, since a removed server
+	// never writes again). Requiring "no longer configured" in addition to
+	// "stale by time" keeps a merely-disconnected-but-still-configured
+	// server's history intact -- see CleanupStaleServerData's doc comment.
 	if s.staleThreshold > 0 {
-		if err := s.storage.CleanupStaleServerData(s.staleThreshold); err != nil {
+		var configuredIDs map[string]bool
+		if s.configuredServerIDs != nil {
+			configuredIDs = s.configuredServerIDs()
+		}
+		if configuredIDs == nil {
+			s.logger.Debug("Skipping stale server cleanup: current config set unavailable")
+		} else if deleted, err := s.storage.CleanupStaleServerData(s.staleThreshold, configuredIDs); err != nil {
 			s.logger.Error("Failed to clean up stale server data", zap.Error(err))
+		} else if deleted > 0 {
+			s.logger.Info("Cleaned up stale server data", zap.Int("servers_removed", deleted))
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,16 +85,18 @@ func TestCompactDBFile_PreservesData(t *testing.T) {
 	require.NoError(t, err)
 
 	// No leftover temp file after a successful swap.
-	_, statErr := os.Stat(dbPath + ".compact-tmp")
-	assert.True(t, os.IsNotExist(statErr), "compaction temp file must not survive a successful swap")
+	stale, globErr := filepath.Glob(dbPath + ".compact-tmp*")
+	require.NoError(t, globErr)
+	assert.Empty(t, stale, "compaction temp file must not survive a successful swap")
 
 	// dbPath must exist and be openable (the atomic rename landed).
 	after := bucketKeyCounts(t, dbPath)
 	assert.Equal(t, before, after, "bucket key counts must be identical after compaction")
 }
 
-// TestCompactDBFile_RemovesStaleTmpFile verifies a leftover .compact-tmp
-// file from a prior crashed attempt doesn't break the next compaction.
+// TestCompactDBFile_RemovesStaleTmpFile verifies leftover .compact-tmp.*
+// files from prior crashed attempts (including this run's own PID-suffixed
+// name, e.g. a recycled PID) don't break the next compaction.
 func TestCompactDBFile_RemovesStaleTmpFile(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "compact_test_*")
 	require.NoError(t, err)
@@ -102,14 +105,20 @@ func TestCompactDBFile_RemovesStaleTmpFile(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "config.db")
 	seedTestDB(t, dbPath, map[string]int{"upstreams": 2})
 
-	// Simulate a stale tmp file left behind by a crashed prior attempt.
-	require.NoError(t, os.WriteFile(dbPath+".compact-tmp", []byte("garbage"), 0644))
+	// Simulate stale tmp files left behind by crashed prior attempts: one
+	// matching this run's own PID-suffixed name, and one from a legacy/other
+	// attempt with a different suffix -- both must be cleared by the glob.
+	require.NoError(t, os.WriteFile(fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid()), []byte("garbage"), 0644))
+	require.NoError(t, os.WriteFile(dbPath+".compact-tmp.99999999", []byte("garbage"), 0644))
 
 	err = compactDBFile(dbPath, testLogger(t))
 	require.NoError(t, err, "a stale tmp file must not break compaction")
 
 	counts := bucketKeyCounts(t, dbPath)
 	assert.Equal(t, 2, counts["upstreams"])
+
+	stale, _ := filepath.Glob(dbPath + ".compact-tmp*")
+	assert.Empty(t, stale, "no compaction temp files should survive a successful swap")
 }
 
 // TestVerifyBucketCounts_DetectsMismatch confirms the safety check that

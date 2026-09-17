@@ -9,7 +9,23 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/bbolt"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
+
+// registerStaleIdentity creates and saves a ServerIdentity whose LastSeen is
+// old enough to be stale under the given threshold, bypassing the normal
+// RegisterServerIdentity path (which always stamps LastSeen = time.Now()) so
+// tests can set up a server that hasn't connected in a long time.
+func registerStaleIdentity(t *testing.T, manager *Manager, name string, staleBy time.Duration) *ServerIdentity {
+	t.Helper()
+
+	identity := NewServerIdentity(&config.ServerConfig{Name: name, URL: "https://example.com/" + name}, "/tmp/mcp_config.json")
+	identity.LastSeen = time.Now().Add(-staleBy)
+
+	require.NoError(t, manager.saveServerIdentity(identity))
+	return identity
+}
 
 // TestPruneActivitiesByBudget verifies that PruneActivitiesByBudget keeps the
 // newest records and deletes the oldest once the bucket exceeds the byte
@@ -197,4 +213,80 @@ func TestRecordServerDiagnostic_TrimsToByteBudget(t *testing.T) {
 	require.Less(t, len(survivors), numRecords,
 		"diagnostics bucket should have been trimmed well below the full write count")
 	require.NotEmpty(t, survivors)
+}
+
+// TestCleanupStaleServerData_DoesNotDeadlock is the regression test for the
+// deadlock this function shipped with: it acquires m.mu.Lock() and then
+// used to call the public ListServerIdentities, which re-acquires m.mu via
+// RLock() -- sync.RWMutex is not reentrant, so that call never returned.
+// Guarded with a timeout so a regression hangs the test instead of the
+// whole suite.
+func TestCleanupStaleServerData_DoesNotDeadlock(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	registerStaleIdentity(t, manager, "stale-server", 48*time.Hour)
+
+	done := make(chan struct{})
+	var deleted int
+	var err error
+	go func() {
+		deleted, err = manager.CleanupStaleServerData(24*time.Hour, map[string]bool{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		require.NoError(t, err)
+		assert.Equal(t, 1, deleted)
+	case <-time.After(5 * time.Second):
+		t.Fatal("CleanupStaleServerData deadlocked (did not return within 5s)")
+	}
+}
+
+// TestCleanupStaleServerData_KeepsConfiguredButStaleServer verifies the
+// double-gate: a server that's stale by LastSeen but still present in
+// configuredServerIDs (merely disconnected -- expired OAuth, an outage,
+// etc.) must survive, while one that's stale AND no longer configured gets
+// removed.
+func TestCleanupStaleServerData_KeepsConfiguredButStaleServer(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	stillConfigured := registerStaleIdentity(t, manager, "still-configured-but-disconnected", 48*time.Hour)
+	removed := registerStaleIdentity(t, manager, "dropped-from-config", 48*time.Hour)
+
+	deleted, err := manager.CleanupStaleServerData(24*time.Hour, map[string]bool{
+		stillConfigured.ID: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	remaining, err := manager.ListServerIdentities()
+	require.NoError(t, err)
+
+	var remainingIDs []string
+	for _, id := range remaining {
+		remainingIDs = append(remainingIDs, id.ID)
+	}
+	assert.Contains(t, remainingIDs, stillConfigured.ID, "still-configured server's data must survive despite being stale")
+	assert.NotContains(t, remainingIDs, removed.ID, "server dropped from config and stale must be cleaned up")
+}
+
+// TestCleanupStaleServerData_NilMapIsNoOp verifies the safety net: a nil
+// configuredServerIDs (caller could not determine current config) must be
+// treated as "do nothing", never as "everything is eligible for deletion".
+func TestCleanupStaleServerData_NilMapIsNoOp(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	registerStaleIdentity(t, manager, "stale-server", 48*time.Hour)
+
+	deleted, err := manager.CleanupStaleServerData(24*time.Hour, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, deleted)
+
+	remaining, err := manager.ListServerIdentities()
+	require.NoError(t, err)
+	assert.Len(t, remaining, 1, "a nil configuredServerIDs map must not delete anything")
 }

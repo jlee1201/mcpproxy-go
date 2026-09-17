@@ -589,6 +589,15 @@ func (m *Manager) ListServerIdentities() ([]*ServerIdentity, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	return m.listServerIdentitiesLocked()
+}
+
+// listServerIdentitiesLocked is the lock-free body of ListServerIdentities.
+// Callers that already hold m.mu (e.g. CleanupStaleServerData, under
+// m.mu.Lock()) must use this instead of ListServerIdentities -- sync.RWMutex
+// is not reentrant, so re-acquiring even RLock() from the same goroutine
+// while holding Lock() deadlocks.
+func (m *Manager) listServerIdentitiesLocked() ([]*ServerIdentity, error) {
 	var identities []*ServerIdentity
 
 	err := m.db.db.View(func(tx *bbolt.Tx) error {
@@ -839,32 +848,61 @@ func (m *Manager) GetServerStatistics(serverID string) (*ServerStatistics, error
 	return &stats, nil
 }
 
-// CleanupStaleServerData removes data for servers that haven't been seen for a threshold period
-func (m *Manager) CleanupStaleServerData(threshold time.Duration) error {
+// CleanupStaleServerData removes identity/statistics/tool_calls/diagnostics
+// data for servers that are BOTH (a) unseen for at least threshold and
+// (b) absent from configuredServerIDs. Requiring both, rather than staleness
+// by time alone, matters because LastSeen only advances on a successful
+// upstream connection (see RegisterServerIdentity's only call site in
+// internal/runtime/lifecycle.go): a server that stays enabled in config but
+// simply can't connect (expired OAuth, an outage) would otherwise look
+// "stale" and have its own diagnostics -- the exact data needed to debug
+// that very outage -- deleted out from under it.
+//
+// configuredServerIDs must be non-nil; a nil map is treated as "caller could
+// not determine current config" and this is a no-op, rather than silently
+// falling back to time-only staleness (which is how a prior version of this
+// wiring could delete a merely-disconnected server's history).
+//
+// Returns the number of servers cleaned up.
+func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServerIDs map[string]bool) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	identities, err := m.ListServerIdentities()
+	if configuredServerIDs == nil {
+		m.logger.Warnw("Skipping stale server cleanup: configuredServerIDs is nil")
+		return 0, nil
+	}
+
+	// Must use the lock-free helper here: we're already holding m.mu.Lock()
+	// above, and sync.RWMutex is not reentrant -- calling the public
+	// ListServerIdentities (which takes m.mu.RLock()) from here deadlocks
+	// every storage call in the process on the very first cleanup pass.
+	identities, err := m.listServerIdentitiesLocked()
 	if err != nil {
-		return fmt.Errorf("failed to list server identities: %w", err)
+		return 0, fmt.Errorf("failed to list server identities: %w", err)
 	}
 
 	var staleServers []string
 	for _, identity := range identities {
-		if identity.IsStale(threshold) {
-			staleServers = append(staleServers, identity.ID)
-			m.logger.Infow("Found stale server for cleanup",
-				"server_name", identity.ServerName,
-				"server_id", identity.ID,
-				"last_seen", identity.LastSeen)
+		if !identity.IsStale(threshold) {
+			continue
 		}
+		if configuredServerIDs[identity.ID] {
+			// Still configured -- merely disconnected, not abandoned.
+			continue
+		}
+		staleServers = append(staleServers, identity.ID)
+		m.logger.Infow("Found stale server for cleanup",
+			"server_name", identity.ServerName,
+			"server_id", identity.ID,
+			"last_seen", identity.LastSeen)
 	}
 
 	if len(staleServers) == 0 {
-		return nil
+		return 0, nil
 	}
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	err = m.db.db.Update(func(tx *bbolt.Tx) error {
 		for _, serverID := range staleServers {
 			// Remove server identity
 			if bucket := tx.Bucket([]byte("server_identities")); bucket != nil {
@@ -888,6 +926,11 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+
+	return len(staleServers), nil
 }
 
 // Private helper methods

@@ -545,31 +545,51 @@ func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
 //     output before swapping; any mismatch aborts without touching dbPath
 //   - the swap itself is a single atomic os.Rename, never a two-step
 //     rename that leaves a window with no config.db on disk
+//   - the tmp file name is unique per attempt (PID-suffixed), and srcDB's
+//     flock on dbPath is held open until AFTER the rename succeeds, so a
+//     second process racing its own concurrent maybeCompactOnStartup either
+//     blocks on the same flock (same inode, same path, same time window) or
+//     -- if it opens dbPath only after this rename lands -- opens the
+//     already-compacted result rather than clobbering it mid-swap.
 func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
-	tmpPath := dbPath + ".compact-tmp"
-	_ = os.Remove(tmpPath)
+	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid())
+
+	// Remove stale temp files from prior crashed attempts: this process's
+	// own PID-suffixed name (recycled PID) plus any leftovers from other
+	// attempts, matched by glob since the suffix varies per attempt.
+	if stale, globErr := filepath.Glob(dbPath + ".compact-tmp*"); globErr == nil {
+		for _, path := range stale {
+			_ = os.Remove(path)
+		}
+	}
 
 	srcDB, err := bbolt.Open(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
 		return fmt.Errorf("open source for compaction: %w", err)
 	}
+	// Keep srcDB (and its flock on dbPath) open past compaction and
+	// verification -- only release it after a successful rename below, or
+	// immediately on any error path via this defer.
+	closeSrc := true
+	defer func() {
+		if closeSrc {
+			_ = srcDB.Close()
+		}
+	}()
 
 	dstDB, err := bbolt.Open(tmpPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
 	if err != nil {
-		_ = srcDB.Close()
 		return fmt.Errorf("open compaction temp file: %w", err)
 	}
 
 	if err := bbolt.Compact(dstDB, srcDB, 64*1024*1024); err != nil {
 		_ = dstDB.Close()
-		_ = srcDB.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("compact: %w", err)
 	}
 
 	if err := verifyBucketCounts(srcDB, dstDB); err != nil {
 		_ = dstDB.Close()
-		_ = srcDB.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("post-compaction verification failed: %w", err)
 	}
@@ -577,19 +597,23 @@ func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 	beforeInfo, _ := os.Stat(dbPath)
 
 	if err := dstDB.Close(); err != nil {
-		_ = srcDB.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close compacted temp file: %w", err)
-	}
-	if err := srcDB.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close source before swap: %w", err)
 	}
 
 	afterInfo, statErr := os.Stat(tmpPath)
 
 	if err := os.Rename(tmpPath, dbPath); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("swap compacted file into place: %w", err)
+	}
+
+	// Only now release srcDB's flock -- the rename already succeeded, so
+	// there's no remaining window for a second process to race a redundant
+	// compaction against this one's in-flight swap.
+	closeSrc = false
+	if err := srcDB.Close(); err != nil {
+		logger.Warnw("Failed to close source db handle after successful compaction swap", "error", err)
 	}
 
 	if beforeInfo != nil && statErr == nil {
