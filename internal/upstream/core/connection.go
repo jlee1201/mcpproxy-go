@@ -1081,7 +1081,7 @@ func (c *Client) tryOAuthAuth(ctx context.Context) error {
 	var oauthErr error
 	defer func() {
 		success := oauthErr == nil
-		coordinator.EndFlow(c.config.Name, success, oauthErr)
+		coordinator.EndFlow(c.config.Name, flowCtx.CorrelationID, success, oauthErr)
 	}()
 
 	// Update the flow context with the one from the coordinator
@@ -1559,7 +1559,7 @@ func (c *Client) trySSEOAuthAuth(ctx context.Context) error {
 	var oauthErr error
 	defer func() {
 		success := oauthErr == nil
-		coordinator.EndFlow(c.config.Name, success, oauthErr)
+		coordinator.EndFlow(c.config.Name, flowCtx.CorrelationID, success, oauthErr)
 	}()
 
 	// Update the flow context with the one from the coordinator

@@ -320,7 +320,7 @@ func TestRefreshManager_CoordinationWithFlowCoordinator(t *testing.T) {
 	defer manager.Stop()
 
 	// Start a manual OAuth flow for the server
-	_, err = coordinator.StartFlow("test-server")
+	flowCtx, err := coordinator.StartFlow("test-server")
 	require.NoError(t, err)
 
 	// Schedule a refresh with longer expiration (10 seconds)
@@ -340,7 +340,7 @@ func TestRefreshManager_CoordinationWithFlowCoordinator(t *testing.T) {
 	assert.Empty(t, calls, "Refresh should be skipped when OAuth flow is active")
 
 	// End the flow
-	coordinator.EndFlow("test-server", true, nil)
+	coordinator.EndFlow("test-server", flowCtx.CorrelationID, true, nil)
 
 	// Now refresh should proceed on next attempt
 	manager.executeRefresh("test-server")
