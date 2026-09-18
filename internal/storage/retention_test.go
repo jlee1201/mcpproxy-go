@@ -855,17 +855,23 @@ func TestCleanupStaleServerData_NilMapIsNoOp(t *testing.T) {
 }
 
 // TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup is the
-// regression test for round-5 medium finding #2: PersistentTokenStore.SaveToken
-// writes OAuth tokens via *storage.BoltDB directly, bypassing Manager.mu
-// entirely, so a concurrent save has no lock-based coordination with
-// CleanupStaleServerData's delete. The fix re-reads the token from inside the
-// delete's own transaction and skips deleting if its Updated timestamp is
-// after staleDecisionTime (computed before the transaction began) -- i.e. a
-// save that landed after staleness was decided. This test writes directly
-// into the oauth_tokens bucket (bypassing SaveOAuthToken, which always
-// stamps Updated=time.Now() and so can't produce a deterministic future
-// timestamp) to simulate that race window without depending on real
-// goroutine timing.
+// regression test for round-5 medium finding #2 and round-6 high finding #1:
+// PersistentTokenStore.SaveToken writes OAuth tokens via *storage.BoltDB
+// directly, bypassing Manager.mu entirely, so a concurrent save has no
+// lock-based coordination with CleanupStaleServerData's delete. The fix
+// re-reads the token from inside the delete's own transaction, BEFORE any
+// deletes run, and skips the entire identity's cleanup cascade (identity,
+// tool_calls, diagnostics, statistics, and the OAuth token itself) if the
+// token's Updated timestamp is after staleDecisionTime (computed before the
+// transaction began) -- i.e. a save that landed after staleness was decided.
+// Round 6 found the original round-5 fix only guarded the token delete
+// itself, while identity/statistics/tool_calls/diagnostics for that same
+// server were already deleted earlier in the loop body -- a live server
+// whose token was just refreshed would keep its token but lose everything
+// else. This test writes directly into the oauth_tokens bucket (bypassing
+// SaveOAuthToken, which always stamps Updated=time.Now() and so can't
+// produce a deterministic future timestamp) to simulate that race window
+// without depending on real goroutine timing.
 func TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup(t *testing.T) {
 	manager, cleanup := setupTestStorageForActivity(t)
 	defer cleanup()
@@ -891,15 +897,21 @@ func TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup(t *tes
 
 	deleted, err := manager.CleanupStaleServerData(30*24*time.Hour, map[string]bool{})
 	require.NoError(t, err)
-	assert.Equal(t, 1, deleted, "identity itself must still be cleaned up")
+	assert.Equal(t, 0, deleted, "identity must NOT be cleaned up: a fresh token means the server is alive again, so the whole cascade must be skipped, not just the token delete")
 
-	// The OAuth token must survive: staleDecisionTime (computed at the top
-	// of CleanupStaleServerData, before this update transaction) is before
-	// futureUpdated, so the guard must have skipped the delete.
+	// The identity, and everything else, must survive too -- not just the
+	// OAuth token. staleDecisionTime (computed at the top of
+	// CleanupStaleServerData, before this update transaction) is before
+	// futureUpdated, so the guard must have skipped the entire identity's
+	// cleanup, atomically.
 	err = manager.db.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(OAuthTokenBucket))
-		require.NotNil(t, bucket)
-		assert.NotNil(t, bucket.Get([]byte(hashedKey)), "token saved after staleness was decided must survive this cleanup pass")
+		identitiesBucket := tx.Bucket([]byte("server_identities"))
+		require.NotNil(t, identitiesBucket)
+		assert.NotNil(t, identitiesBucket.Get([]byte(identity.ID)), "server identity must survive when its token was saved after staleness was decided")
+
+		oauthBucket := tx.Bucket([]byte(OAuthTokenBucket))
+		require.NotNil(t, oauthBucket)
+		assert.NotNil(t, oauthBucket.Get([]byte(hashedKey)), "token saved after staleness was decided must survive this cleanup pass")
 		return nil
 	})
 	require.NoError(t, err)

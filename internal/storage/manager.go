@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -1047,6 +1048,14 @@ func (m *Manager) GetServerDiagnostics(serverID string, limit int) ([]*Diagnosti
 // larger redesign intentionally deferred -- see trimBucketToByteBudget's
 // doc comment.
 //
+// Errors (round-6 fix-round): a per-server trim error is collected via
+// errors.Join and iteration continues, rather than returning immediately.
+// Each server's transaction is already independent (see above), so one
+// server's failure is no reason to skip every later-iterated server too --
+// an early return here previously meant a single failing server
+// permanently starved every server sorted after it of budget enforcement,
+// on every hourly pass, not just this one.
+//
 // Returns the number of buckets that had at least one record evicted.
 func (m *Manager) TrimAllServerBuckets() (int, error) {
 	m.mu.Lock()
@@ -1059,15 +1068,24 @@ func (m *Manager) TrimAllServerBuckets() (int, error) {
 	}
 
 	trimmedBuckets := 0
+	var errs []error
 	for _, identity := range identities {
 		n, err := m.trimServerBucketsToBudget(identity.ID)
 		if err != nil {
-			return trimmedBuckets, err
+			// Collect and continue (round-6 fix-round): each server's trim
+			// is already its own independent transaction (see doc comment
+			// above), so one server's error carries no reason to skip every
+			// later-iterated server too. An early return here previously
+			// meant a single failing server permanently starved every
+			// server sorted after it, on every hourly pass, of budget
+			// enforcement.
+			errs = append(errs, fmt.Errorf("server %s: %w", identity.ID, err))
+			continue
 		}
 		trimmedBuckets += n
 	}
 
-	return trimmedBuckets, nil
+	return trimmedBuckets, errors.Join(errs...)
 }
 
 // trimServerBucketsToBudget trims one server's tool_calls/diagnostics
@@ -1260,9 +1278,46 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 	// below for why that's the race this timestamp closes.
 	staleDecisionTime := time.Now()
 
+	cleanedCount := 0
 	err = m.db.db.Update(func(tx *bbolt.Tx) error {
 		for _, identity := range staleIdentities {
 			serverID := identity.ID
+
+			// Race guard (round-5 finding, concurrency; hoisted to the top
+			// of the loop in round-6 fix-round): PersistentTokenStore writes
+			// tokens via *storage.BoltDB directly, bypassing Manager.mu
+			// entirely, so a concurrent SaveToken (e.g. a just-completed
+			// reconnect/refresh) has no lock-based coordination with this
+			// transaction's deletes. bbolt still serializes the two Update
+			// transactions against each other, but nothing otherwise stops a
+			// fresh save from landing, then being wiped by this delete
+			// moments later, if that save's Update commits before this one.
+			// Re-reading the record from INSIDE this same transaction is
+			// atomic against any concurrent Update (bbolt never runs two
+			// Update closures concurrently), so checking its Updated
+			// timestamp here reliably detects "a save happened after we
+			// decided this identity was stale".
+			//
+			// This check must run BEFORE any deletes below, not just before
+			// the OAuth token delete: a fresh token means the server is
+			// actually alive again, so identity/statistics/tool_calls/
+			// diagnostics must all survive too, not just the token. Checking
+			// it first and skipping the whole identity keeps the cascade
+			// atomic -- either everything for this identity is deleted, or
+			// nothing is, deferring to the next cleanup pass to reconsider
+			// with fresh data.
+			hashedKey := GenerateOAuthServerKey(identity.ServerName, identity.Attributes.URL)
+			if bucket := tx.Bucket([]byte(OAuthTokenBucket)); bucket != nil {
+				if existing := bucket.Get([]byte(hashedKey)); existing != nil {
+					var tokenRecord OAuthTokenRecord
+					if unmarshalErr := json.Unmarshal(existing, &tokenRecord); unmarshalErr == nil &&
+						tokenRecord.Updated.After(staleDecisionTime) {
+						m.logger.Infow("Skipping stale server cleanup: OAuth token was saved after staleness was decided, deferring to next cleanup pass",
+							"server_name", identity.ServerName, "server_id", serverID)
+						continue
+					}
+				}
+			}
 
 			// Remove server identity
 			if bucket := tx.Bucket([]byte("server_identities")); bucket != nil {
@@ -1296,35 +1351,6 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 			// bare name (matches ClearOAuthState's rationale for the
 			// prefix-scan it does, applied here to a single known key).
 			if bucket := tx.Bucket([]byte(OAuthTokenBucket)); bucket != nil {
-				hashedKey := GenerateOAuthServerKey(identity.ServerName, identity.Attributes.URL)
-
-				// Race guard (round-5 finding, concurrency): PersistentTokenStore
-				// writes tokens via *storage.BoltDB directly, bypassing
-				// Manager.mu entirely, so a concurrent SaveToken (e.g. a
-				// just-completed reconnect/refresh) has no lock-based
-				// coordination with this delete. bbolt still serializes the
-				// two Update transactions against each other, but nothing
-				// otherwise stops a fresh save from landing, then being wiped
-				// by this delete moments later, if that save's Update commits
-				// before this one. Re-reading the record from INSIDE this same
-				// transaction is atomic against any concurrent Update (bbolt
-				// never runs two Update closures concurrently), so checking its
-				// Updated timestamp here reliably detects "a save happened
-				// after we decided this identity was stale" and skips deleting
-				// in that case, leaving it for the next cleanup pass to
-				// reconsider with fresh data instead of destroying a token that
-				// may just have been (re)issued for a server that's actually
-				// alive again.
-				if existing := bucket.Get([]byte(hashedKey)); existing != nil {
-					var tokenRecord OAuthTokenRecord
-					if unmarshalErr := json.Unmarshal(existing, &tokenRecord); unmarshalErr == nil &&
-						tokenRecord.Updated.After(staleDecisionTime) {
-						m.logger.Infow("Skipping OAuth token deletion: token was saved after staleness was decided, deferring to next cleanup pass",
-							"server_name", identity.ServerName, "server_id", serverID)
-						continue
-					}
-				}
-
 				if err := bucket.Delete([]byte(hashedKey)); err != nil {
 					return fmt.Errorf("failed to delete oauth token for %s: %w", identity.ServerName, err)
 				}
@@ -1335,15 +1361,16 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 				}
 			}
 
+			cleanedCount++
 			m.logger.Infow("Cleaned up stale server data", "server_id", serverID)
 		}
 		return nil
 	})
 	if err != nil {
-		return 0, err
+		return cleanedCount, err
 	}
 
-	return len(staleIdentities), nil
+	return cleanedCount, nil
 }
 
 // Private helper methods
