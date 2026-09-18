@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -33,12 +34,84 @@ type BoltDB struct {
 	logger *zap.SugaredLogger
 }
 
-// NewBoltDB creates a new BoltDB instance
+// compactionThresholdBytes is the minimum config.db size before a startup
+// compaction pass is attempted. Below this, compaction isn't worth the I/O.
+const compactionThresholdBytes = 20 * 1024 * 1024 // 20MB
+
+// configDBFilename is the on-disk filename for the daemon's primary bbolt
+// database (OAuth tokens plus all storage.Manager state: tool_calls,
+// diagnostics, identities, activity records, etc). Constructing it via
+// configDBPath keeps this the one place the literal is defined, so
+// CompactConfigDBIfNeeded and NewBoltDB can never disagree on the path.
+const configDBFilename = "config.db"
+
+func configDBPath(dataDir string) string {
+	return filepath.Join(dataDir, configDBFilename)
+}
+
+// openBoltDBAtStablePath opens path with bbolt, guarding against a narrow
+// race with compactDBFile's atomic rename: flock binds to the fd's inode at
+// open() time, not to the path, so if this call's internal open() happens
+// just before a concurrent compaction's os.Rename swaps a new file onto
+// path, and this call's flock then blocks until that compaction's srcDB
+// releases its own flock on the (now-orphaned, unlinked-but-still-open)
+// pre-rename inode, this call can succeed while bound to that orphaned
+// inode -- silently writing every subsequent operation on this handle into
+// a file nothing else will ever open again. This is not limited to two
+// concurrent compactions racing each other (compactDBFile's own srcDB flock
+// already serializes those): it's any ordinary bbolt.Open(path) call,
+// including this one from NewBoltDB, racing a compaction it never knows is
+// running.
+//
+// Detect it by comparing path's identity (device+inode) immediately before
+// and immediately after Open. A mismatch means path was renamed onto while
+// Open was in flight, so this handle's identity is not provably the current
+// file -- close it and retry against the now-stable path. This can also
+// false-positive (retry a perfectly good handle) if the rename happened to
+// land between our "before" stat and bbolt's internal open(), which is
+// harmless: the retry's own before/after stats will then agree and return
+// immediately.
+func openBoltDBAtStablePath(path string, mode os.FileMode, options *bbolt.Options) (*bbolt.DB, error) {
+	const maxAttempts = 3
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		before, beforeErr := os.Stat(path)
+
+		db, err := bbolt.Open(path, mode, options)
+		if err != nil {
+			return nil, err
+		}
+
+		after, afterErr := os.Stat(path)
+
+		// Nothing to compare against (e.g. first-ever creation of path) --
+		// accept the open as-is.
+		if beforeErr != nil || afterErr != nil {
+			return db, nil
+		}
+
+		if os.SameFile(before, after) {
+			return db, nil
+		}
+
+		_ = db.Close()
+		lastErr = fmt.Errorf("file at %s changed identity during open (concurrent compaction swap), retrying", path)
+	}
+
+	return nil, fmt.Errorf("failed to open a stable handle for %s after %d attempts: %w", path, maxAttempts, lastErr)
+}
+
+// NewBoltDB creates a new BoltDB instance. It does NOT attempt startup
+// compaction itself -- callers that own the daemon's long-lived database
+// (currently only internal/runtime.New) must call CompactConfigDBIfNeeded
+// first. See CompactConfigDBIfNeeded's doc comment for why this is a
+// caller's responsibility rather than automatic here.
 func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
-	dbPath := filepath.Join(dataDir, "config.db")
+	dbPath := configDBPath(dataDir)
 
 	// Try to open with timeout, if it fails, immediately return database locked error
-	db, err := bbolt.Open(dbPath, 0644, &bbolt.Options{
+	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
 		Timeout: 10 * time.Second,
 	})
 	if err != nil {
@@ -500,4 +573,328 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	})
 
 	return records, err
+}
+
+// compactionMinReclaimableBytes is the minimum estimated free-page space
+// (see estimateReclaimableBytes) worth reclaiming via a full-file
+// compaction. A file can sit above compactionThresholdBytes purely from
+// live data -- no free pages at all -- in which case bbolt.Compact would
+// just be an expensive copy that reclaims nothing (see this function's doc
+// comment on the two-restart limitation). Gating on this, not just raw file
+// size, keeps compaction from re-attempting (and re-logging "reclaimed
+// little space") on every single restart once a config with even one
+// actively-used server sits at or above compactionThresholdBytes as its
+// normal live-data floor.
+const compactionMinReclaimableBytes = 5 * 1024 * 1024 // 5MB
+
+// CompactConfigDBIfNeeded opportunistically compacts dataDir's config.db
+// before NewBoltDB opens it, IF it's both large and has meaningful
+// reclaimable space (see maybeCompactOnStartup).
+//
+// This must only be called from the daemon's own startup path (currently
+// internal/runtime.New, the sole caller of storage.NewManager that isn't
+// itself a short-lived CLI helper) -- never from inside NewBoltDB or
+// NewManager directly. Those are also the entry points several CLI
+// commands use in their own "standalone mode" fallback (tools_cmd.go,
+// upstream/cli/client.go, call_cmd.go, code_cmd.go, auth_cmd.go), which run
+// specifically when no live daemon was detected for the same dataDir. A
+// prior version of this code ran compaction unconditionally inside
+// NewBoltDB, so every one of those CLI invocations attempted a multi-second
+// compaction too -- and on a stale-detection race where a daemon actually
+// is running, that CLI call would block on (or lose) a flock race against
+// the daemon's own held lock, silently falling back to in-memory OAuth
+// tokens the moment NewBoltDB returned any error (see each of those files'
+// "falling back to in-memory" log lines). Restricting this to the one real
+// daemon bootstrap path removes that failure mode entirely rather than just
+// shortening its blocking window.
+func CompactConfigDBIfNeeded(dataDir string, logger *zap.SugaredLogger) {
+	maybeCompactOnStartup(configDBPath(dataDir), logger)
+}
+
+// maybeCompactOnStartup opportunistically compacts an oversized config.db
+// before it is opened for normal use. It's a one-time reclaim step for
+// files that grew large before the retention limits in RecordToolCall,
+// RecordServerDiagnostic, and PruneActivitiesByBudget existed: bbolt.Compact
+// only returns freed space to the OS, it doesn't shrink live data, so it's
+// not a substitute for those limits, only a way to reclaim what they would
+// have prevented. Once those limits keep the live-data floor low, bbolt
+// reuses freed pages internally and this should rarely fire again.
+//
+// Known limitation: this runs here, before NewBoltDB's caller has ever
+// opened the database, which means it runs before the per-record caps and
+// trimBucketToByteBudget have ever executed against this file. On a file
+// that was already bloated with LIVE (uncapped) data -- the exact scenario
+// this PR exists for -- there are no free pages yet for bbolt.Compact to
+// reclaim, so the first restart after upgrading to this fix compacts very
+// little; only after the daemon has run once under the new write-time caps
+// (shrinking the live-data floor on subsequent writes) does a *second*
+// restart's compaction have real free space to reclaim. compactDBFile logs
+// before/after size on every run, so a restart that reclaims little is
+// visible in the logs rather than silently assumed to have worked. The
+// estimateReclaimableBytes gate below means that "little to reclaim" case
+// mostly just skips the attempt outright instead of paying for a no-op
+// compaction on every subsequent restart too.
+//
+// This must never block startup on a corrupt, locked, or otherwise
+// unreadable file: any failure is logged and the normal (uncompacted)
+// database is opened afterwards by the caller.
+//
+// Skipped entirely on Windows (round-5 finding #1): compactDBFile's final
+// os.Rename(tmpPath, dbPath) swaps the compacted file over dbPath while
+// srcDB still holds dbPath open -- intentionally, so a second process's
+// concurrent compaction attempt blocks on that same flock rather than ever
+// observing a half-swapped file (see compactDBFile's doc comment). On Unix,
+// rename-over-an-open-file is fine. On Windows, MoveFileEx (what os.Rename
+// uses there) fails with a sharing violation when the destination has an
+// open handle that wasn't granted delete-sharing, which os.OpenFile's
+// default share mode does not grant -- so this would fail on every single
+// attempt, unconditionally, on Windows: not a crash (the error is only
+// logged and the caller falls back to the uncompacted database), but a
+// startup-time compaction attempt that can never succeed there, wasting a
+// multi-second compact-and-verify pass on every restart of a large
+// database for no benefit. Rather than guess at a close-rename-reopen
+// sequence with retry logic that reintroduces the concurrent-compaction
+// race the current design deliberately avoids -- unverifiable here since
+// this repo has no Windows test environment -- startup compaction is
+// disabled on Windows until someone can implement and verify a
+// Windows-safe swap on real Windows. bbolt.Compact itself, and the
+// per-record/per-bucket write-time caps this PR adds, are unaffected: this
+// only skips the one-time startup reclaim of already-freed pages.
+func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
+	maybeCompactOnStartupForGOOS(dbPath, logger, goruntime.GOOS)
+}
+
+// maybeCompactOnStartupForGOOS is maybeCompactOnStartup with the OS name
+// passed in explicitly, so a test can exercise the Windows-skip branch
+// without depending on which OS actually runs the test.
+func maybeCompactOnStartupForGOOS(dbPath string, logger *zap.SugaredLogger, goos string) {
+	if goos == "windows" {
+		logger.Debugw("Skipping startup config.db compaction on Windows: rename-over-open-file is not supported there, see maybeCompactOnStartup's doc comment", "path", dbPath)
+		return
+	}
+
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		return // no existing file yet, nothing to compact
+	}
+	if info.Size() < compactionThresholdBytes {
+		return
+	}
+
+	reclaimable, err := estimateReclaimableBytes(dbPath)
+	if err != nil {
+		logger.Warnw("Failed to estimate reclaimable space before startup compaction, skipping",
+			"path", dbPath, "error", err)
+		return
+	}
+	if reclaimable < compactionMinReclaimableBytes {
+		logger.Debugw("config.db exceeds size threshold but has little reclaimable free space, skipping startup compaction",
+			"path", dbPath, "size_bytes", info.Size(), "reclaimable_bytes", reclaimable,
+			"min_reclaimable_bytes", compactionMinReclaimableBytes)
+		return
+	}
+
+	logger.Infow("config.db exceeds compaction threshold with reclaimable space, attempting one-time startup compaction",
+		"path", dbPath, "size_bytes", info.Size(), "reclaimable_bytes", reclaimable,
+		"threshold_bytes", compactionThresholdBytes)
+
+	if err := compactDBFile(dbPath, logger); err != nil {
+		logger.Warnw("Startup compaction failed, continuing with uncompacted database", "error", err)
+	}
+}
+
+// estimateReclaimableBytes opens dbPath just long enough to read bbolt's
+// free-page stats, then closes it, to gate startup compaction on actual
+// reclaimable space rather than raw file size (see
+// compactionMinReclaimableBytes). It deliberately does NOT open read-only:
+// bbolt only populates FreePageN eagerly at Open() when PreLoadFreelist is
+// set, which bbolt itself forces true only in writable mode ("always load
+// free pages in write mode") -- a read-only open would leave FreePageN at
+// its zero value until some transaction ran, silently making this always
+// report zero reclaimable space and disabling compaction forever. Opening
+// writable briefly costs the same flock a real compactDBFile call would
+// take anyway; this function returns and closes before that ever runs, so
+// there is no meaningful added lock contention (this whole path is now
+// daemon-startup-only -- see CompactConfigDBIfNeeded's doc comment).
+func estimateReclaimableBytes(dbPath string) (int64, error) {
+	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+
+	stats := db.Stats()
+	return int64(stats.FreePageN) * int64(db.Info().PageSize), nil
+}
+
+// compactDBFile compacts dbPath into a temp file and swaps it into place.
+// Safety properties, since this replaces the file holding OAuth tokens:
+//   - any stale temp file from a prior crashed attempt is removed before
+//     use, so reopening it can't fail with ErrBucketExists
+//   - per-bucket key counts are verified equal between source and compacted
+//     output before swapping; any mismatch aborts without touching dbPath
+//   - the swap itself is a single atomic os.Rename, never a two-step
+//     rename that leaves a window with no config.db on disk
+//   - the tmp file name is unique per attempt (PID-suffixed), and srcDB's
+//     flock on dbPath is held open until AFTER the rename succeeds, so a
+//     second process racing its own concurrent maybeCompactOnStartup blocks
+//     on that same flock (same inode, same path) until this attempt either
+//     finishes or errors out -- it can never observe a half-swapped dbPath.
+//   - the stale-tmp-file cleanup only runs AFTER this process holds that
+//     flock, so it can never delete a live concurrent attempt's in-flight
+//     tmp file: any match found once we hold the lock is provably left by a
+//     dead process, not a running one (a running one would have blocked
+//     above before reaching the glob).
+//   - the flock guarantees above only serialize this attempt against another
+//     compactDBFile call blocked on the *same* open (same inode). They do
+//     NOT by themselves protect an ordinary, unrelated bbolt.Open(dbPath)
+//     call (e.g. NewBoltDB's own open) whose open() happened just before
+//     this rename and whose flock only unblocks after it: that caller would
+//     be bound to the pre-rename inode this rename just orphaned. srcDB
+//     itself is opened via openBoltDBAtStablePath for exactly this reason;
+//     see its doc comment for the detect-and-retry mechanism, which callers
+//     of dbPath (NewBoltDB included) must also use.
+//
+// Known limitation, deliberately out of scope for this PR: this function has
+// no wall-clock deadline, and neither does anything in its caller chain
+// (maybeCompactOnStartup -> maybeCompactOnStartupForGOOS -> here). The only
+// timeout in play, bbolt.Options{Timeout: 5 * time.Second} above, bounds file
+// *lock acquisition*, not the compaction-and-verification work itself, which
+// scales with config.db size and could in principle block startup for a long
+// time on a very large database. A real deadline can't be layered on
+// cleanly: bbolt.Compact takes no context and isn't cancellable mid-call, so
+// "abort on timeout" can only mean racing it in a goroutine and proceeding
+// with the uncompacted DB while the orphaned goroutine keeps running
+// unbounded in the background -- which reintroduces exactly the
+// concurrent-compaction/swap risk this whole design (see the flock and
+// stable-path comments above) exists to avoid. A safe fix needs either an
+// upstream bbolt API change or moving compaction off the startup path
+// entirely; tracked as follow-up, not folded into this PR. The one cheap,
+// low-risk mitigation left on the table is an *upper* size gate mirroring
+// compactionThresholdBytes's lower gate (skip compaction and log "run
+// manually" above some size) -- also not implemented here.
+func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
+	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid())
+
+	srcDB, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open source for compaction: %w", err)
+	}
+	// Keep srcDB (and its flock on dbPath) open past compaction and
+	// verification -- only release it after a successful rename below, or
+	// immediately on any error path via this defer.
+	closeSrc := true
+	defer func() {
+		if closeSrc {
+			_ = srcDB.Close()
+		}
+	}()
+
+	// Remove stale temp files from prior crashed attempts: this process's
+	// own PID-suffixed name (recycled PID) plus any leftovers from other
+	// attempts, matched by glob since the suffix varies per attempt. Safe to
+	// do only now that srcDB's flock is held -- see doc comment above.
+	if stale, globErr := filepath.Glob(dbPath + ".compact-tmp*"); globErr == nil {
+		for _, path := range stale {
+			_ = os.Remove(path)
+		}
+	}
+
+	dstDB, err := bbolt.Open(tmpPath, 0644, &bbolt.Options{Timeout: 5 * time.Second})
+	if err != nil {
+		return fmt.Errorf("open compaction temp file: %w", err)
+	}
+
+	if err := bbolt.Compact(dstDB, srcDB, 64*1024*1024); err != nil {
+		_ = dstDB.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("compact: %w", err)
+	}
+
+	if err := verifyBucketCounts(srcDB, dstDB); err != nil {
+		_ = dstDB.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("post-compaction verification failed: %w", err)
+	}
+
+	beforeInfo, _ := os.Stat(dbPath)
+
+	if err := dstDB.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close compacted temp file: %w", err)
+	}
+
+	afterInfo, statErr := os.Stat(tmpPath)
+
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("swap compacted file into place: %w", err)
+	}
+
+	// Only now release srcDB's flock -- the rename already succeeded, so
+	// there's no remaining window for a second process to race a redundant
+	// compaction against this one's in-flight swap.
+	closeSrc = false
+	if err := srcDB.Close(); err != nil {
+		logger.Warnw("Failed to close source db handle after successful compaction swap", "error", err)
+	}
+
+	if beforeInfo != nil && statErr == nil {
+		before, after := beforeInfo.Size(), afterInfo.Size()
+		logger.Infow("Startup compaction complete", "before_bytes", before, "after_bytes", after)
+
+		// Compaction only reclaims free pages, not live data (see
+		// maybeCompactOnStartup's doc comment). A file still over the
+		// threshold after compacting means it was full of live data at
+		// compaction time, not free space -- expected on the first restart
+		// after upgrading to the write-time retention caps, before they've
+		// had a chance to shrink the live-data floor. Surface it so this
+		// isn't mistaken for compaction not working.
+		if after >= compactionThresholdBytes {
+			logger.Infow("Startup compaction reclaimed little space; database is still mostly live data",
+				"after_bytes", after, "threshold_bytes", compactionThresholdBytes,
+				"note", "expect a second restart to reclaim more once write-time retention caps have shrunk live data")
+		}
+	}
+	return nil
+}
+
+// verifyBucketCounts confirms src and dst have the same set of top-level
+// buckets with identical key counts, so a compaction bug can never silently
+// drop data (e.g. OAuth tokens) during the swap.
+func verifyBucketCounts(src, dst *bbolt.DB) error {
+	counts := map[string]int{}
+	if err := src.View(func(tx *bbolt.Tx) error {
+		return tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+			counts[string(name)] = b.Stats().KeyN
+			return nil
+		})
+	}); err != nil {
+		return fmt.Errorf("read source bucket counts: %w", err)
+	}
+
+	return dst.View(func(tx *bbolt.Tx) error {
+		seen := make(map[string]bool, len(counts))
+		if err := tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+			seen[string(name)] = true
+			want, ok := counts[string(name)]
+			if !ok {
+				return fmt.Errorf("unexpected bucket %q in compacted output", string(name))
+			}
+			if got := b.Stats().KeyN; got != want {
+				return fmt.Errorf("bucket %q key count mismatch: src=%d dst=%d", string(name), want, got)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for name := range counts {
+			if !seen[name] {
+				return fmt.Errorf("bucket %q missing from compacted output", name)
+			}
+		}
+		return nil
+	})
 }

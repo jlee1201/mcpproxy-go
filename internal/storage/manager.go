@@ -2,7 +2,10 @@ package storage
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -14,6 +17,19 @@ import (
 	bboltErrors "go.etcd.io/bbolt/errors"
 	"go.uber.org/zap"
 )
+
+// GenerateOAuthServerKey derives the bucket key PersistentTokenStore uses to
+// persist a server's OAuth token: name + "_" + first 16 hex chars of
+// sha256(name|url). This lives in storage (not oauth) because internal/oauth
+// imports internal/storage -- storage importing oauth back would cycle.
+// internal/oauth.GenerateServerKey delegates to this function so there is
+// exactly one implementation.
+func GenerateOAuthServerKey(serverName, serverURL string) string {
+	combined := fmt.Sprintf("%s|%s", serverName, serverURL)
+	hash := sha256.Sum256([]byte(combined))
+	hashStr := hex.EncodeToString(hash[:])
+	return fmt.Sprintf("%s_%s", serverName, hashStr[:16])
+}
 
 // Manager provides a unified interface for storage operations
 type Manager struct {
@@ -589,6 +605,15 @@ func (m *Manager) ListServerIdentities() ([]*ServerIdentity, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	return m.listServerIdentitiesLocked()
+}
+
+// listServerIdentitiesLocked is the lock-free body of ListServerIdentities.
+// Callers that already hold m.mu (e.g. CleanupStaleServerData, under
+// m.mu.Lock()) must use this instead of ListServerIdentities -- sync.RWMutex
+// is not reentrant, so re-acquiring even RLock() from the same goroutine
+// while holding Lock() deadlocks.
+func (m *Manager) listServerIdentitiesLocked() ([]*ServerIdentity, error) {
 	var identities []*ServerIdentity
 
 	err := m.db.db.View(func(tx *bbolt.Tx) error {
@@ -615,7 +640,198 @@ func (m *Manager) ListServerIdentities() ([]*ServerIdentity, error) {
 	return identities, nil
 }
 
-// RecordToolCall records a tool call for a server
+// DefaultToolCallsBucketMaxBytes bounds how much data each per-server
+// tool_calls bucket may retain. Without this, RecordToolCall grew every
+// bucket forever for actively-used servers (see config.db bloat
+// investigation): the only cleanup path, CleanupStaleServerData, only ran
+// for servers that had gone stale, so a server used every day never had its
+// tool_calls bucket pruned.
+//
+// Known limitation, deliberately out of scope for this PR: this budget is
+// per-server, not aggregate. N configured servers can each legitimately sit
+// at DefaultToolCallsBucketMaxBytes, so config.db's tool-calls footprint has
+// no cross-server ceiling and scales with server count (N * 5MB, plus N *
+// MaxDiagnosticRecordBytes for diagnostics). Capping the aggregate would need
+// a new cross-server LRU-eviction invariant layered on top of the existing
+// per-bucket trim, which is a meaningfully larger and riskier change than
+// this PR's bounded-retention fix -- tracked as follow-up, not folded in here.
+const DefaultToolCallsBucketMaxBytes = 5 * 1024 * 1024
+
+// DefaultDiagnosticsBucketMaxBytes bounds each per-server diagnostics bucket.
+// Same unbounded-growth shape as tool_calls, just not yet observed to have
+// fired in practice. Same aggregate-budget limitation as
+// DefaultToolCallsBucketMaxBytes above applies here too.
+const DefaultDiagnosticsBucketMaxBytes = 2 * 1024 * 1024
+
+// MaxToolCallRecordBytes caps the marshaled size of a single tool call
+// record before it's written. trimBucketToByteBudget never evicts the
+// just-written record (see its doc comment), so without this cap one
+// oversized response could alone exceed the whole bucket budget and stay
+// there forever, defeating the eviction the budget is meant to guarantee.
+const MaxToolCallRecordBytes = DefaultToolCallsBucketMaxBytes / 5 // 1MB
+
+// MaxDiagnosticRecordBytes mirrors MaxToolCallRecordBytes for diagnostics.
+const MaxDiagnosticRecordBytes = DefaultDiagnosticsBucketMaxBytes / 5
+
+// truncateToolCallRecordToFit marshals record, and if it exceeds maxBytes,
+// clears its variable-size fields one at a time -- Response, then
+// Arguments, then Error -- re-measuring after each, until the result fits.
+// Response is cleared and re-measured BEFORE Arguments is touched (rather
+// than clearing both in one step) because Arguments is what ReplayToolCall
+// falls back to when no explicit override is given: clearing it destroys
+// replay ability for this record, so it should only happen when clearing
+// Response alone wasn't enough, not unconditionally alongside it. When
+// Arguments is actually cleared, ArgumentsTruncated is set so ReplayToolCall
+// can refuse to replay with a silently-substituted nil instead of the real
+// (lost) arguments. Clearing only Response/Arguments is not enough on its
+// own: Error is an unbounded string too (an adversarial or verbose upstream
+// error can be megabytes on its own with a tiny Response), and a single
+// unchecked clear doesn't prove the result actually fits. If every known
+// field is cleared and it's still over cap, falls back to a minimal
+// fixed-shape record that is guaranteed to fit, so this function can never
+// itself return a value over maxBytes.
+func truncateToolCallRecordToFit(record *ToolCallRecord, maxBytes int) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+	originalBytes := len(data)
+
+	truncated := *record
+	// Response is documented as an object in the OAS contract
+	// (contracts.ToolCallRecord.Response has swaggertype:"object", and
+	// oas/swagger.yaml's ToolCallRecord schema declares response: type object)
+	// even though the Go field is interface{} -- unlike ActivityRecord.Response,
+	// which really is string-typed end-to-end. Assigning a bare string here would
+	// silently violate that contract for any strict typed API consumer, so the
+	// placeholder stays a JSON object.
+	truncated.Response = map[string]interface{}{
+		"truncated":      true,
+		"original_bytes": originalBytes,
+		"max_bytes":      maxBytes,
+	}
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.Arguments = nil
+	truncated.ArgumentsTruncated = true
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.Error = fmt.Sprintf("[error omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	minimal := &ToolCallRecord{
+		ID:                 truncateFallbackField(record.ID),
+		ServerID:           truncateFallbackField(record.ServerID),
+		ServerName:         truncateFallbackField(record.ServerName),
+		ToolName:           truncateFallbackField(record.ToolName),
+		Error:              fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
+		Timestamp:          record.Timestamp,
+		Duration:           record.Duration,
+		ArgumentsTruncated: true,
+	}
+	data, err = json.Marshal(minimal)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBytes {
+		// Should be unreachable given maxFallbackFieldBytes leaves ample
+		// headroom under any real maxBytes budget -- but this is the last
+		// resort, so refuse to write rather than silently persist an
+		// oversized record. trimBucketToByteBudget's protectedKey exemption
+		// keeps the just-written key forever regardless of size, so an
+		// oversized fallback record here would be the exact cascade-wipe
+		// class this truncation logic exists to prevent (see
+		// TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe),
+		// just reached through this fallback path instead of the normal one.
+		return nil, fmt.Errorf("minimal fallback record still exceeds %d byte cap (%d bytes), refusing to write", maxBytes, len(data))
+	}
+	return data, nil
+}
+
+// maxFallbackFieldBytes caps each string field copied verbatim into the
+// last-resort minimal record built by truncateToolCallRecordToFit and
+// truncateDiagnosticRecordToFit. Those fields (ID/ServerID/ServerName/
+// ToolName/Type/Category) come from upstream config or an upstream MCP
+// server's own responses -- not bounded by anything upstream of this
+// package -- so without this cap a pathologically long value (e.g. a
+// misconfigured or malicious server name) could make even the "minimal"
+// fallback exceed maxBytes.
+const maxFallbackFieldBytes = 256
+
+// truncateFallbackField bounds s to maxFallbackFieldBytes, preserving
+// enough of the original to still be useful for debugging which
+// server/tool triggered the omission.
+func truncateFallbackField(s string) string {
+	if len(s) <= maxFallbackFieldBytes {
+		return s
+	}
+	return s[:maxFallbackFieldBytes] + "...(truncated)"
+}
+
+// truncateDiagnosticRecordToFit mirrors truncateToolCallRecordToFit for
+// DiagnosticRecord: clears Message and Details, re-measures, and falls back
+// to a minimal fixed-shape record if still over cap.
+func truncateDiagnosticRecordToFit(record *DiagnosticRecord, maxBytes int) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+	originalBytes := len(data)
+
+	truncated := *record
+	truncated.Message = fmt.Sprintf("[message omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	truncated.Details = nil
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	minimal := &DiagnosticRecord{
+		ServerID:   truncateFallbackField(record.ServerID),
+		ServerName: truncateFallbackField(record.ServerName),
+		Type:       truncateFallbackField(record.Type),
+		Category:   truncateFallbackField(record.Category),
+		Message:    fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
+		Timestamp:  record.Timestamp,
+	}
+	data, err = json.Marshal(minimal)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBytes {
+		// See truncateToolCallRecordToFit's identical check for why this
+		// must refuse to write rather than silently persist an oversized
+		// record.
+		return nil, fmt.Errorf("minimal fallback record still exceeds %d byte cap (%d bytes), refusing to write", maxBytes, len(data))
+	}
+	return data, nil
+}
+
+// RecordToolCall records a tool call for a server, then trims the bucket
+// back to DefaultToolCallsBucketMaxBytes if the new record pushed it over.
 func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -629,13 +845,67 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 			return err
 		}
 
-		data, err := json.Marshal(record)
+		data, err := truncateToolCallRecordToFit(record, MaxToolCallRecordBytes)
 		if err != nil {
 			return err
 		}
 
-		return bucket.Put([]byte(key), data)
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return err
+		}
+
+		_, err = trimBucketToByteBudget(bucket, DefaultToolCallsBucketMaxBytes, []byte(key))
+		return err
 	})
+}
+
+// trimBucketToByteBudget deletes the oldest entries in bucket (keys must
+// sort chronologically, as tool_calls/diagnostics/activity keys do) once the
+// bucket's total value bytes exceed maxBytes. It walks newest-first via the
+// cursor, keeping records while the running byte total stays under budget,
+// then deletes everything older, returning how many keys it removed.
+//
+// The single most-recent key (whatever the cursor visits first) is always
+// exempt: it is never counted toward the running total and never deleted.
+// protectedKey, if non-nil, is exempt too -- callers on the write path pass
+// the key they just wrote in the same transaction, in case clock skew or
+// concurrent writers mean it isn't actually the lexicographically last key.
+// Without this, a single oversized record could delete itself in the same
+// transaction that wrote it, and -- because the running total never resets
+// -- cascade into evicting every older record too, based purely on its own
+// size. See MaxToolCallRecordBytes/MaxDiagnosticRecordBytes for the
+// complementary per-record cap that keeps a protected record from growing
+// unbounded as a result.
+//
+// Cost: this always walks every key in the bucket (O(n), not just the keys
+// it deletes). That's fine at the tool_calls/diagnostics budgets and typical
+// record sizes -- on the order of hundreds of entries per write -- but it is
+// proportional to bucket size, not free; a much larger per-server bucket
+// would make this walk proportionally more expensive on every write.
+func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64, protectedKey []byte) (int, error) {
+	var cumulative int64
+	var keysToDelete [][]byte
+
+	cursor := bucket.Cursor()
+	first := true
+	for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+		if first || bytes.Equal(k, protectedKey) {
+			first = false
+			continue
+		}
+		cumulative += int64(len(v))
+		if cumulative > maxBytes {
+			keysToDelete = append(keysToDelete, append([]byte{}, k...))
+		}
+	}
+
+	for _, key := range keysToDelete {
+		if err := bucket.Delete(key); err != nil {
+			return 0, fmt.Errorf("failed to trim bucket over byte budget: %w", err)
+		}
+	}
+
+	return len(keysToDelete), nil
 }
 
 // GetServerToolCalls gets tool calls for a server
@@ -675,7 +945,9 @@ func (m *Manager) GetServerToolCalls(serverID string, limit int) ([]*ToolCallRec
 	return records, nil
 }
 
-// RecordServerDiagnostic records a diagnostic event for a server
+// RecordServerDiagnostic records a diagnostic event for a server, then
+// trims the bucket back to DefaultDiagnosticsBucketMaxBytes if the new
+// record pushed it over. Same unbounded-growth shape as RecordToolCall.
 func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -689,12 +961,17 @@ func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 			return err
 		}
 
-		data, err := json.Marshal(record)
+		data, err := truncateDiagnosticRecordToFit(record, MaxDiagnosticRecordBytes)
 		if err != nil {
 			return err
 		}
 
-		return bucket.Put([]byte(key), data)
+		if err := bucket.Put([]byte(key), data); err != nil {
+			return err
+		}
+
+		_, err = trimBucketToByteBudget(bucket, DefaultDiagnosticsBucketMaxBytes, []byte(key))
+		return err
 	})
 }
 
@@ -733,6 +1010,121 @@ func (m *Manager) GetServerDiagnostics(serverID string, limit int) ([]*Diagnosti
 	}
 
 	return records, nil
+}
+
+// TrimAllServerBuckets applies the tool_calls/diagnostics byte-budget trim
+// (trimBucketToByteBudget, same as RecordToolCall/RecordServerDiagnostic use
+// on their own write path) to every known server's buckets, regardless of
+// whether that server has written anything recently.
+//
+// RecordToolCall/RecordServerDiagnostic only trim on their OWN write: a
+// server that stays configured but goes quiet (no new tool calls, no new
+// diagnostics -- e.g. it's idle, or degraded but still connected) never
+// triggers a trim of whatever already-bloated bucket it left behind from
+// before this fix existed. CleanupStaleServerData intentionally leaves that
+// server's data alone too, since "still configured" means it isn't stale.
+// This periodic sweep is what actually closes that gap: a server that never
+// writes again still gets its existing backlog trimmed down to budget the
+// next time this runs.
+//
+// protectedKey is passed as nil here (unlike the write path's own call):
+// there is no "record just written in this transaction" to protect, and
+// trimBucketToByteBudget already exempts the single newest key
+// unconditionally.
+//
+// Locking (round-5 finding #5): each server's buckets are trimmed in their
+// own bbolt transaction, with m.mu released between servers, rather than
+// one giant transaction covering every server while m.mu is held for the
+// whole sweep. Holding the lock for the full multi-server pass would block
+// every other storage write (RecordToolCall, RecordServerDiagnostic,
+// SaveActivity, ...) on the live daemon for however long this sweep takes
+// across ALL configured servers, not just one. This does mean a trim error
+// partway through no longer rolls back servers already trimmed earlier in
+// the same call -- their trims already committed in their own transactions
+// -- but this is a periodic best-effort background sweep (see call site in
+// activity_service.go), so keeping partial progress on a later error is the
+// right tradeoff, not a regression. The O(n) walk inside
+// trimBucketToByteBudget itself (per-bucket, not per-sweep) is a separate,
+// larger redesign intentionally deferred -- see trimBucketToByteBudget's
+// doc comment.
+//
+// Errors (round-6 fix-round): a per-server trim error is collected via
+// errors.Join and iteration continues, rather than returning immediately.
+// Each server's transaction is already independent (see above), so one
+// server's failure is no reason to skip every later-iterated server too --
+// an early return here previously meant a single failing server
+// permanently starved every server sorted after it of budget enforcement,
+// on every hourly pass, not just this one.
+//
+// Returns the number of buckets that had at least one record evicted.
+func (m *Manager) TrimAllServerBuckets() (int, error) {
+	m.mu.Lock()
+	// Must use the lock-free helper here for the same reason
+	// CleanupStaleServerData does: we're already holding m.mu.Lock().
+	identities, err := m.listServerIdentitiesLocked()
+	m.mu.Unlock()
+	if err != nil {
+		return 0, fmt.Errorf("failed to list server identities: %w", err)
+	}
+
+	trimmedBuckets := 0
+	var errs []error
+	for _, identity := range identities {
+		n, err := m.trimServerBucketsToBudget(identity.ID)
+		if err != nil {
+			// Collect and continue (round-6 fix-round): each server's trim
+			// is already its own independent transaction (see doc comment
+			// above), so one server's error carries no reason to skip every
+			// later-iterated server too. An early return here previously
+			// meant a single failing server permanently starved every
+			// server sorted after it, on every hourly pass, of budget
+			// enforcement.
+			errs = append(errs, fmt.Errorf("server %s: %w", identity.ID, err))
+			continue
+		}
+		trimmedBuckets += n
+	}
+
+	return trimmedBuckets, errors.Join(errs...)
+}
+
+// trimServerBucketsToBudget trims one server's tool_calls/diagnostics
+// buckets in a single transaction, holding m.mu only for that duration. See
+// TrimAllServerBuckets's doc comment for why this is split out per-server.
+func (m *Manager) trimServerBucketsToBudget(serverID string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	trimmedBuckets := 0
+	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+		toolCallsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_tool_calls", serverID)))
+		if toolCallsBucket != nil {
+			n, trimErr := trimBucketToByteBudget(toolCallsBucket, DefaultToolCallsBucketMaxBytes, nil)
+			if trimErr != nil {
+				return trimErr
+			}
+			if n > 0 {
+				trimmedBuckets++
+			}
+		}
+
+		diagnosticsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_diagnostics", serverID)))
+		if diagnosticsBucket != nil {
+			n, trimErr := trimBucketToByteBudget(diagnosticsBucket, DefaultDiagnosticsBucketMaxBytes, nil)
+			if trimErr != nil {
+				return trimErr
+			}
+			if n > 0 {
+				trimmedBuckets++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return trimmedBuckets, nil
 }
 
 // UpdateServerStatistics updates server statistics
@@ -788,33 +1180,145 @@ func (m *Manager) GetServerStatistics(serverID string) (*ServerStatistics, error
 	return &stats, nil
 }
 
-// CleanupStaleServerData removes data for servers that haven't been seen for a threshold period
-func (m *Manager) CleanupStaleServerData(threshold time.Duration) error {
+// CleanupStaleServerData removes identity/statistics/tool_calls/diagnostics
+// data for servers that are BOTH (a) unseen for at least threshold and
+// (b) absent from configuredServerIDs. Requiring both, rather than staleness
+// by time alone, matters because LastSeen only advances on a successful
+// upstream connection (see RegisterServerIdentity's only call site in
+// internal/runtime/lifecycle.go): a server that stays enabled in config but
+// simply can't connect (expired OAuth, an outage) would otherwise look
+// "stale" and have its own diagnostics -- the exact data needed to debug
+// that very outage -- deleted out from under it.
+//
+// configuredServerIDs must be non-nil; a nil map is treated as "caller could
+// not determine current config" and this is a no-op, rather than silently
+// falling back to time-only staleness (which is how a prior version of this
+// wiring could delete a merely-disconnected server's history).
+//
+// isEligibleForCleanup reports whether identity should be treated as
+// abandoned: stale by LastSeen AND no longer present in the live config.
+// Single source of truth for that predicate -- CleanupStaleServerData
+// previously computed it twice, once directly and once via its logical
+// negation, which is easy to let drift out of sync under future edits.
+func isEligibleForCleanup(identity *ServerIdentity, configuredServerIDs map[string]bool, threshold time.Duration) bool {
+	if !identity.IsStale(threshold) {
+		return false
+	}
+	return !configuredServerIDs[identity.ID]
+}
+
+// Returns the number of servers cleaned up.
+func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServerIDs map[string]bool) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	identities, err := m.ListServerIdentities()
+	if configuredServerIDs == nil {
+		m.logger.Warnw("Skipping stale server cleanup: configuredServerIDs is nil")
+		return 0, nil
+	}
+
+	// Must use the lock-free helper here: we're already holding m.mu.Lock()
+	// above, and sync.RWMutex is not reentrant -- calling the public
+	// ListServerIdentities (which takes m.mu.RLock()) from here deadlocks
+	// every storage call in the process on the very first cleanup pass.
+	identities, err := m.listServerIdentitiesLocked()
 	if err != nil {
-		return fmt.Errorf("failed to list server identities: %w", err)
+		return 0, fmt.Errorf("failed to list server identities: %w", err)
 	}
 
-	var staleServers []string
+	// survivingServerNames tracks every identity NOT being cleaned up in this
+	// pass (still configured, or not stale). It only guards the legacy
+	// bare-name key below -- the real production key is name+hash(name|url)
+	// (see GenerateOAuthServerKey), which is already unique per identity, so
+	// it needs no such guard.
+	//
+	// Re-derived (round-5 review, medium finding): survivingServerNames is
+	// keyed by identity, so a configured server whose attributes (e.g. URL)
+	// changed since its last connection, and hasn't reconnected within the
+	// stale threshold, won't have a surviving identity under its *current*
+	// name/URL pair -- only the stale one under the old pair. Confirmed this
+	// has no functional impact: every OAuth read path that matters for
+	// authentication resolves the token via GenerateOAuthServerKey (name+URL
+	// hash) -- see upstream.Manager.RefreshOAuthToken -- never via this bare
+	// legacy name. The bare-name GetOAuthToken calls that do exist
+	// (oauth.RefreshManager's logging/event-emission side reads) already
+	// null-check gracefully on a miss. So the residual risk here is limited
+	// to prematurely deleting an already-orphaned pre-hash-keying legacy
+	// record one cleanup pass early -- not a live token an active server
+	// depends on. Left as-is rather than widening CleanupStaleServerData's
+	// signature to a names-based survival set, which would ripple across
+	// every call site for a fix with no observable behavior change.
+	survivingServerNames := make(map[string]bool)
 	for _, identity := range identities {
-		if identity.IsStale(threshold) {
-			staleServers = append(staleServers, identity.ID)
-			m.logger.Infow("Found stale server for cleanup",
-				"server_name", identity.ServerName,
-				"server_id", identity.ID,
-				"last_seen", identity.LastSeen)
+		if isEligibleForCleanup(identity, configuredServerIDs, threshold) {
+			continue
 		}
+		survivingServerNames[identity.ServerName] = true
 	}
 
-	if len(staleServers) == 0 {
-		return nil
+	var staleIdentities []*ServerIdentity
+	for _, identity := range identities {
+		if !isEligibleForCleanup(identity, configuredServerIDs, threshold) {
+			continue
+		}
+		staleIdentities = append(staleIdentities, identity)
+		m.logger.Infow("Found stale server for cleanup",
+			"server_name", identity.ServerName,
+			"server_id", identity.ID,
+			"last_seen", identity.LastSeen)
 	}
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
-		for _, serverID := range staleServers {
+	if len(staleIdentities) == 0 {
+		return 0, nil
+	}
+
+	// staleDecisionTime marks when staleness was decided, just above. OAuth
+	// token writes (PersistentTokenStore.SaveToken) go straight through
+	// *storage.BoltDB, not through Manager.mu -- see the OAuth-delete guard
+	// below for why that's the race this timestamp closes.
+	staleDecisionTime := time.Now()
+
+	cleanedCount := 0
+	err = m.db.db.Update(func(tx *bbolt.Tx) error {
+		for _, identity := range staleIdentities {
+			serverID := identity.ID
+
+			// Race guard (round-5 finding, concurrency; hoisted to the top
+			// of the loop in round-6 fix-round): PersistentTokenStore writes
+			// tokens via *storage.BoltDB directly, bypassing Manager.mu
+			// entirely, so a concurrent SaveToken (e.g. a just-completed
+			// reconnect/refresh) has no lock-based coordination with this
+			// transaction's deletes. bbolt still serializes the two Update
+			// transactions against each other, but nothing otherwise stops a
+			// fresh save from landing, then being wiped by this delete
+			// moments later, if that save's Update commits before this one.
+			// Re-reading the record from INSIDE this same transaction is
+			// atomic against any concurrent Update (bbolt never runs two
+			// Update closures concurrently), so checking its Updated
+			// timestamp here reliably detects "a save happened after we
+			// decided this identity was stale".
+			//
+			// This check must run BEFORE any deletes below, not just before
+			// the OAuth token delete: a fresh token means the server is
+			// actually alive again, so identity/statistics/tool_calls/
+			// diagnostics must all survive too, not just the token. Checking
+			// it first and skipping the whole identity keeps the cascade
+			// atomic -- either everything for this identity is deleted, or
+			// nothing is, deferring to the next cleanup pass to reconsider
+			// with fresh data.
+			hashedKey := GenerateOAuthServerKey(identity.ServerName, identity.Attributes.URL)
+			if bucket := tx.Bucket([]byte(OAuthTokenBucket)); bucket != nil {
+				if existing := bucket.Get([]byte(hashedKey)); existing != nil {
+					var tokenRecord OAuthTokenRecord
+					if unmarshalErr := json.Unmarshal(existing, &tokenRecord); unmarshalErr == nil &&
+						tokenRecord.Updated.After(staleDecisionTime) {
+						m.logger.Infow("Skipping stale server cleanup: OAuth token was saved after staleness was decided, deferring to next cleanup pass",
+							"server_name", identity.ServerName, "server_id", serverID)
+						continue
+					}
+				}
+			}
+
 			// Remove server identity
 			if bucket := tx.Bucket([]byte("server_identities")); bucket != nil {
 				bucket.Delete([]byte(serverID))
@@ -833,10 +1337,40 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration) error {
 				bucket.Delete([]byte(serverID))
 			}
 
+			// Remove the OAuth token, if any -- otherwise a server dropped
+			// from config entirely leaves its refresh/access token behind
+			// in oauth_tokens forever, the one bucket every other piece of
+			// this server's data gets removed from except this one.
+			//
+			// Real tokens are stored under GenerateOAuthServerKey(name, url)
+			// (see PersistentTokenStore), a hash of name+url -- unique per
+			// identity, so deleting it by exact key can never touch a
+			// surviving identity's token even if it shares this ServerName.
+			// A legacy bare-name key is also deleted for pre-hash-keying
+			// data, but only when no surviving identity still uses that
+			// bare name (matches ClearOAuthState's rationale for the
+			// prefix-scan it does, applied here to a single known key).
+			if bucket := tx.Bucket([]byte(OAuthTokenBucket)); bucket != nil {
+				if err := bucket.Delete([]byte(hashedKey)); err != nil {
+					return fmt.Errorf("failed to delete oauth token for %s: %w", identity.ServerName, err)
+				}
+				if !survivingServerNames[identity.ServerName] {
+					if err := bucket.Delete([]byte(identity.ServerName)); err != nil {
+						return fmt.Errorf("failed to delete legacy oauth token for %s: %w", identity.ServerName, err)
+					}
+				}
+			}
+
+			cleanedCount++
 			m.logger.Infow("Cleaned up stale server data", "server_id", serverID)
 		}
 		return nil
 	})
+	if err != nil {
+		return cleanedCount, err
+	}
+
+	return cleanedCount, nil
 }
 
 // Private helper methods

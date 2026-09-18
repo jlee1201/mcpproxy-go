@@ -42,6 +42,103 @@ func truncateResponse(response string, maxSize int) (string, bool) {
 	return response[:maxSize] + "...[truncated]", true
 }
 
+// MaxActivityRecordBytes caps the marshaled size of a single activity record
+// before it's written, mirroring MaxToolCallRecordBytes/
+// MaxDiagnosticRecordBytes for the tool_calls/diagnostics buckets.
+// PruneActivitiesByBudget's trimBucketToByteBudget never evicts the
+// just-written record (see its doc comment), so without this cap one
+// oversized activity (a large tool response or arguments blob logged
+// verbatim) could alone exceed the whole byte budget and, because the
+// running total never resets once it crosses the threshold, cascade into
+// evicting every older activity record too -- the exact bug class the
+// tool-calls/diagnostics caps exist to prevent, never applied here (round-5
+// finding). Sized independently of any caller's budget --
+// PruneActivitiesByBudget's maxBytes is caller-supplied at runtime (see
+// ActivityService.DefaultRetentionMaxBytes = 20MB), unlike the tool-calls/
+// diagnostics buckets' fixed package-level defaults -- 4MB comfortably fits
+// under the smallest sane byte budget while still capping any single record
+// far below it.
+const MaxActivityRecordBytes = 4 * 1024 * 1024
+
+// truncateActivityRecordToFit marshals record, and if it exceeds maxBytes,
+// clears its variable-size fields one at a time -- Response, then
+// Arguments, then Metadata, then ErrorMessage -- re-measuring after each,
+// until the result fits. Mirrors truncateToolCallRecordToFit's approach and
+// rationale (see that function's doc comment for why clearing fields one at
+// a time and re-measuring, rather than assuming the first clear is enough,
+// matters). Falls back to a minimal fixed-shape record if every field is
+// cleared and it's still over cap, so this function can never itself return
+// a value over maxBytes.
+func truncateActivityRecordToFit(record *ActivityRecord, maxBytes int) ([]byte, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+	originalBytes := len(data)
+
+	truncated := *record
+	truncated.Response = fmt.Sprintf("[response omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	truncated.ResponseTruncated = true
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.Arguments = nil
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.Metadata = nil
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	truncated.ErrorMessage = fmt.Sprintf("[error omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes)
+	if data, err = json.Marshal(&truncated); err != nil {
+		return nil, err
+	}
+	if len(data) <= maxBytes {
+		return data, nil
+	}
+
+	minimal := &ActivityRecord{
+		ID:                truncateFallbackField(record.ID),
+		Type:              record.Type,
+		ServerName:        truncateFallbackField(record.ServerName),
+		ToolName:          truncateFallbackField(record.ToolName),
+		Status:            truncateFallbackField(record.Status),
+		ErrorMessage:      fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
+		ResponseTruncated: true,
+		Timestamp:         record.Timestamp,
+		SessionID:         truncateFallbackField(record.SessionID),
+		RequestID:         truncateFallbackField(record.RequestID),
+	}
+	data, err = json.Marshal(minimal)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBytes {
+		// Last resort: refuse to write rather than silently persist an
+		// oversized record. See truncateToolCallRecordToFit's identical
+		// check for why (trimBucketToByteBudget's protectedKey exemption
+		// keeps the just-written key forever regardless of size).
+		return nil, fmt.Errorf("minimal fallback activity record still exceeds %d byte cap (%d bytes), refusing to write", maxBytes, len(data))
+	}
+	return data, nil
+}
+
 // SaveActivity stores an activity record in BBolt.
 // The record is stored with a composite key for efficient time-based queries.
 func (m *Manager) SaveActivity(record *ActivityRecord) error {
@@ -68,7 +165,7 @@ func (m *Manager) SaveActivity(record *ActivityRecord) error {
 			return fmt.Errorf("failed to create activity bucket: %w", err)
 		}
 
-		data, err := record.MarshalBinary()
+		data, err := truncateActivityRecordToFit(record, MaxActivityRecordBytes)
 		if err != nil {
 			return fmt.Errorf("failed to marshal activity record: %w", err)
 		}
@@ -389,6 +486,48 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 		m.logger.Infow("Pruned excess activity records",
 			"deleted", deleted,
 			"max_records", maxRecords)
+	}
+
+	return deleted, nil
+}
+
+// PruneActivitiesByBudget deletes the oldest activity records once the
+// bucket's total value bytes exceed maxBytes, via the same trim primitive
+// RecordToolCall/RecordServerDiagnostic use (see trimBucketToByteBudget):
+// the single most-recent record is always kept regardless of its own size,
+// so one oversized activity can't cascade into wiping the whole bucket.
+// This complements PruneOldActivities/PruneExcessActivities: a
+// 7-day/10,000-record cap still permits ~100MB of legitimate stored bytes
+// at ~10KB/record, so a byte budget is the cap that actually bounds
+// config.db size.
+func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var deleted int
+
+	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
+		if bucket == nil {
+			return nil
+		}
+
+		var err error
+		deleted, err = trimBucketToByteBudget(bucket, maxBytes, nil)
+		if err != nil {
+			return fmt.Errorf("failed to delete over-budget activity: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return deleted, err
+	}
+
+	if deleted > 0 {
+		m.logger.Infow("Pruned activity records over byte budget",
+			"deleted", deleted,
+			"max_bytes", maxBytes)
 	}
 
 	return deleted, nil

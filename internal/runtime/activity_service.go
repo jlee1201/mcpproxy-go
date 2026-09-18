@@ -16,8 +16,16 @@ const (
 	DefaultRetentionMaxAge = 7 * 24 * time.Hour
 	// DefaultRetentionMaxRecords is the default max number of records (10000)
 	DefaultRetentionMaxRecords = 10000
+	// DefaultRetentionMaxBytes is the default byte budget for activity_records
+	// (20MB). The age/count caps above permit up to ~100MB of legitimate
+	// stored bytes at typical record sizes; this is the cap that actually
+	// bounds config.db size.
+	DefaultRetentionMaxBytes = 20 * 1024 * 1024
 	// DefaultRetentionCheckInterval is the default interval between retention checks (1 hour)
 	DefaultRetentionCheckInterval = 1 * time.Hour
+	// DefaultStaleServerThreshold is how long a server must be unseen before
+	// its identity/statistics/tool_calls/diagnostics data is fully removed.
+	DefaultStaleServerThreshold = 30 * 24 * time.Hour
 )
 
 // ActivityService subscribes to activity events and persists them to storage.
@@ -32,43 +40,80 @@ type ActivityService struct {
 	done chan struct{}
 
 	// Retention configuration
-	maxAge        time.Duration
-	maxRecords    int
-	checkInterval time.Duration
+	maxAge         time.Duration
+	maxRecords     int
+	maxBytes       int64
+	staleThreshold time.Duration
+	checkInterval  time.Duration
+
+	// configuredServerIDs returns the set of server IDs currently present in
+	// config, so stale-server cleanup never deletes history for a server
+	// that's still configured but simply can't connect (expired OAuth, an
+	// outage) -- see CleanupStaleServerData's doc comment. Set by Start()
+	// from the live Runtime config; nil until then, and tests may inject
+	// their own to exercise runRetentionCleanup without a full Runtime.
+	configuredServerIDs func() map[string]bool
 }
 
 // NewActivityService creates a new activity service.
 func NewActivityService(storage *storage.Manager, logger *zap.Logger) *ActivityService {
 	return &ActivityService{
-		storage:       storage,
-		logger:        logger,
-		eventCh:       make(chan Event, 100), // Buffer for non-blocking event delivery
-		done:          make(chan struct{}),
-		maxAge:        DefaultRetentionMaxAge,
-		maxRecords:    DefaultRetentionMaxRecords,
-		checkInterval: DefaultRetentionCheckInterval,
+		storage:        storage,
+		logger:         logger,
+		eventCh:        make(chan Event, 100), // Buffer for non-blocking event delivery
+		done:           make(chan struct{}),
+		maxAge:         DefaultRetentionMaxAge,
+		maxRecords:     DefaultRetentionMaxRecords,
+		maxBytes:       DefaultRetentionMaxBytes,
+		staleThreshold: DefaultStaleServerThreshold,
+		checkInterval:  DefaultRetentionCheckInterval,
 	}
 }
 
 // SetRetentionConfig updates the retention configuration.
 // maxAge: maximum age for records (0 = no age limit)
 // maxRecords: maximum number of records (0 = no count limit)
+// maxBytes: byte budget for the activity_records bucket (0 = no byte limit)
 // checkInterval: how often to run retention cleanup
-func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, checkInterval time.Duration) {
+func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords int, maxBytes int64, checkInterval time.Duration) {
 	if maxAge > 0 {
 		s.maxAge = maxAge
 	}
 	if maxRecords > 0 {
 		s.maxRecords = maxRecords
 	}
+	if maxBytes > 0 {
+		s.maxBytes = maxBytes
+	}
 	if checkInterval > 0 {
 		s.checkInterval = checkInterval
 	}
 }
 
+// SetConfiguredServerIDsFunc overrides how runRetentionCleanup determines
+// which server IDs are still configured. Primarily for tests; Start() wires
+// a default backed by the live Runtime config.
+func (s *ActivityService) SetConfiguredServerIDsFunc(fn func() map[string]bool) {
+	s.configuredServerIDs = fn
+}
+
 // Start begins listening for activity events and persisting them.
 // It should be called as a goroutine: go svc.Start(ctx, runtime)
 func (s *ActivityService) Start(ctx context.Context, rt *Runtime) {
+	if s.configuredServerIDs == nil {
+		s.configuredServerIDs = func() map[string]bool {
+			cfg := rt.Config()
+			if cfg == nil {
+				return nil
+			}
+			ids := make(map[string]bool, len(cfg.Servers))
+			for _, serverCfg := range cfg.Servers {
+				ids[storage.GenerateServerID(serverCfg)] = true
+			}
+			return ids
+		}
+	}
+
 	// Subscribe to runtime events
 	eventCh := rt.SubscribeEvents()
 	defer rt.UnsubscribeEvents(eventCh)
@@ -141,6 +186,56 @@ func (s *ActivityService) runRetentionCleanup() {
 			s.logger.Info("Pruned excess activity records",
 				zap.Int("deleted", deleted),
 				zap.Int("max_records", s.maxRecords))
+		}
+	}
+
+	// Prune by byte budget. The age/count caps above still permit a large
+	// number of bytes at real-world record sizes, so this is the cap that
+	// actually bounds config.db size for activity_records.
+	if s.maxBytes > 0 {
+		deleted, err := s.storage.PruneActivitiesByBudget(s.maxBytes)
+		if err != nil {
+			s.logger.Error("Failed to prune activities over byte budget", zap.Error(err))
+		} else if deleted > 0 {
+			s.logger.Info("Pruned activity records over byte budget",
+				zap.Int("deleted", deleted),
+				zap.Int64("max_bytes", s.maxBytes))
+		}
+	}
+
+	// Trim every known server's tool_calls/diagnostics buckets, independent
+	// of recent writes or configured/stale status. RecordToolCall/
+	// RecordServerDiagnostic only trim on their OWN write path, so a server
+	// that stays configured but goes quiet (no new tool calls, no new
+	// diagnostics) never gets its already-bloated bucket trimmed otherwise
+	// -- CleanupStaleServerData below intentionally leaves it alone too,
+	// since "still configured" means it isn't stale. See
+	// TrimAllServerBuckets's doc comment.
+	if trimmed, err := s.storage.TrimAllServerBuckets(); err != nil {
+		s.logger.Error("Failed to trim server tool_calls/diagnostics buckets", zap.Error(err))
+	} else if trimmed > 0 {
+		s.logger.Info("Trimmed server tool_calls/diagnostics buckets", zap.Int("buckets_trimmed", trimmed))
+	}
+
+	// Remove all data for servers not seen in a long time AND no longer
+	// configured. A server dropped from config entirely still leaves behind
+	// its identity/statistics rows and whatever tool_calls/diagnostics
+	// history it had accumulated (even after the sweep above trims that
+	// history down to budget, the rows themselves remain); this removes
+	// that residue outright. Requiring "no longer configured" in addition
+	// to "stale by time" keeps a merely-disconnected-but-still-configured
+	// server's history intact -- see CleanupStaleServerData's doc comment.
+	if s.staleThreshold > 0 {
+		var configuredIDs map[string]bool
+		if s.configuredServerIDs != nil {
+			configuredIDs = s.configuredServerIDs()
+		}
+		if configuredIDs == nil {
+			s.logger.Debug("Skipping stale server cleanup: current config set unavailable")
+		} else if deleted, err := s.storage.CleanupStaleServerData(s.staleThreshold, configuredIDs); err != nil {
+			s.logger.Error("Failed to clean up stale server data", zap.Error(err))
+		} else if deleted > 0 {
+			s.logger.Info("Cleaned up stale server data", zap.Int("servers_removed", deleted))
 		}
 	}
 }
@@ -317,10 +412,10 @@ func (s *ActivityService) handleSystemStart(evt Event) {
 		Source: storage.ActivitySourceAPI, // System events come from the API server
 		Status: "success",
 		Metadata: map[string]interface{}{
-			"version":            version,
-			"listen_address":     listenAddress,
+			"version":             version,
+			"listen_address":      listenAddress,
 			"startup_duration_ms": startupDurationMs,
-			"config_path":        configPath,
+			"config_path":         configPath,
 		},
 		Timestamp: evt.Timestamp,
 	}
@@ -572,4 +667,3 @@ func getSlicePayload(payload map[string]any, key string) []string {
 	}
 	return nil
 }
-

@@ -1,12 +1,18 @@
 package storage_test
 
 import (
+	"context"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/oauth"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
@@ -40,6 +46,92 @@ func TestManager_ClearOAuthState_RemovesHashedToken(t *testing.T) {
 
 	_, err = mgr.GetBoltDB().GetOAuthToken(serverKey)
 	require.Error(t, err)
+}
+
+// TestManager_CleanupStaleServerData_DeletesRealOAuthToken is the regression
+// test for round-5's finding that round-4's CleanupStaleServerData OAuth fix
+// was a silent no-op: it deleted by plain ServerName, but production tokens
+// are stored under oauth.GenerateServerKey(name, url) via
+// PersistentTokenStore, so the delete call always succeeded while deleting
+// nothing. This test goes through the real PersistentTokenStore.SaveToken
+// path (not a hand-written bucket entry under an assumed key) so it can't
+// pass on a false key-shape assumption the way the original test did.
+func TestManager_CleanupStaleServerData_DeletesRealOAuthToken(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "storage-cleanup-oauth-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+
+	mgr, err := storage.NewManager(tmpDir, zap.NewNop().Sugar())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = mgr.Close() })
+
+	serverName := "dropped-from-config"
+	serverURL := "https://example.com/dropped-from-config"
+
+	_, err = mgr.RegisterServerIdentity(&config.ServerConfig{Name: serverName, URL: serverURL}, "/tmp/mcp_config.json")
+	require.NoError(t, err)
+
+	tokenStore := oauth.NewPersistentTokenStore(serverName, serverURL, mgr.GetBoltDB())
+	require.NoError(t, tokenStore.SaveToken(context.Background(), &client.Token{AccessToken: "some-access-token"}))
+
+	// A negative threshold makes even a just-registered (LastSeen=now)
+	// identity count as stale (time.Since(now) > -1s), so this doesn't need
+	// to fake LastSeen the way retention_test.go's registerStaleIdentity
+	// does -- it can use only the public Manager API.
+	deleted, err := mgr.CleanupStaleServerData(-1*time.Second, map[string]bool{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	_, err = tokenStore.GetToken(context.Background())
+	assert.ErrorIs(t, err, transport.ErrNoToken, "oauth token for a removed-and-cleaned-up server must be deleted, not left behind forever")
+}
+
+// TestManager_CleanupStaleServerData_PreservesRealOAuthTokenForLiveServerSharingName
+// covers the exact-key-delete guarantee: if a still-live identity happens to
+// share its ServerName with the stale identity being cleaned up (e.g. the
+// same name re-added with a new URL, which changes the hashed OAuth key and
+// the content-hashed identity ID but not the name), deleting the stale
+// identity's OAuth token must NOT touch the live identity's token, even
+// though they share a ServerName.
+func TestManager_CleanupStaleServerData_PreservesRealOAuthTokenForLiveServerSharingName(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "storage-cleanup-oauth-shared-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+
+	mgr, err := storage.NewManager(tmpDir, zap.NewNop().Sugar())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = mgr.Close() })
+
+	sharedName := "shared-server-name"
+	staleURL := "https://example.com/" + sharedName + "-v1"
+	liveURL := "https://example.com/" + sharedName + "-v2"
+
+	staleIdentity, err := mgr.RegisterServerIdentity(&config.ServerConfig{Name: sharedName, URL: staleURL}, "/tmp/mcp_config.json")
+	require.NoError(t, err)
+	liveIdentity, err := mgr.RegisterServerIdentity(&config.ServerConfig{Name: sharedName, URL: liveURL}, "/tmp/mcp_config.json")
+	require.NoError(t, err)
+	require.NotEqual(t, staleIdentity.ID, liveIdentity.ID, "test setup requires two distinct identities sharing one ServerName")
+
+	staleStore := oauth.NewPersistentTokenStore(sharedName, staleURL, mgr.GetBoltDB())
+	require.NoError(t, staleStore.SaveToken(context.Background(), &client.Token{AccessToken: "stale-servers-token"}))
+
+	liveStore := oauth.NewPersistentTokenStore(sharedName, liveURL, mgr.GetBoltDB())
+	require.NoError(t, liveStore.SaveToken(context.Background(), &client.Token{AccessToken: "live-servers-token"}))
+
+	// Both identities have LastSeen=now, so the negative threshold marks
+	// both stale; liveIdentity survives only because it's still configured.
+	deleted, err := mgr.CleanupStaleServerData(-1*time.Second, map[string]bool{
+		liveIdentity.ID: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	_, err = staleStore.GetToken(context.Background())
+	assert.ErrorIs(t, err, transport.ErrNoToken, "the removed identity's own token must be deleted")
+
+	token, err := liveStore.GetToken(context.Background())
+	require.NoError(t, err, "the live identity's token must survive even though a stale identity shared its ServerName")
+	assert.Equal(t, "live-servers-token", token.AccessToken)
 }
 
 // TestBoltDB_UpdateOAuthClientCredentials_WithCallbackPort verifies that UpdateOAuthClientCredentials

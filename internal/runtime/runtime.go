@@ -94,6 +94,13 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 		return nil, fmt.Errorf("config cannot be nil")
 	}
 
+	// This is the one real daemon bootstrap path (see
+	// storage.CompactConfigDBIfNeeded's doc comment for why this must NOT
+	// also happen inside storage.NewBoltDB/NewManager themselves: several
+	// CLI "standalone mode" commands call those same constructors and must
+	// never attempt startup compaction on their own).
+	storage.CompactConfigDBIfNeeded(cfg.DataDir, logger.Sugar())
+
 	storageManager, err := storage.NewManager(cfg.DataDir, logger.Sugar())
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize storage manager: %w", err)
@@ -926,6 +933,15 @@ func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*
 	// Use modified arguments if provided, otherwise use original
 	callArgs := arguments
 	if callArgs == nil {
+		if originalCall.ArgumentsTruncated {
+			// The original record's Arguments were cleared by
+			// truncateToolCallRecordToFit because the record was too large
+			// to store (see storage.ToolCallRecord.ArgumentsTruncated).
+			// originalCall.Arguments is nil here, but that's "unknown", not
+			// "no arguments" -- silently replaying with nil would call the
+			// tool with the wrong (empty) arguments instead of refusing.
+			return nil, fmt.Errorf("cannot replay tool call %s: original arguments were truncated from storage and no replacement arguments were provided", id)
+		}
 		callArgs = originalCall.Arguments
 	}
 

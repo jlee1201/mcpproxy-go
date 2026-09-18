@@ -534,7 +534,7 @@ type ToolCallRecord struct {
 	ServerName       string                 `json:"server_name"`                             // Human-readable server name
 	ToolName         string                 `json:"tool_name"`                               // Tool name (without server prefix)
 	Arguments        map[string]interface{} `json:"arguments" swaggertype:"object"`          // Tool arguments
-	Response         interface{}            `json:"response,omitempty" swaggertype:"object"` // Tool response (success only)
+	Response         interface{}            `json:"response,omitempty" swaggertype:"object"` // Tool response (success only); may be a truncation placeholder object if it exceeded the per-record storage cap
 	Error            string                 `json:"error,omitempty"`                         // Error message (failure only)
 	Duration         int64                  `json:"duration"`                                // Duration in nanoseconds
 	Timestamp        time.Time              `json:"timestamp"`                               // When the call was made
