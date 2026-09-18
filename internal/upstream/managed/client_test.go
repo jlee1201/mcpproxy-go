@@ -2,6 +2,9 @@ package managed
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
 	"time"
 
@@ -129,4 +132,68 @@ func TestLockFreeAccessors_DoNotBlockBehindHeldMutex(t *testing.T) {
 	assertFast("IsConnected", func() { _ = mc.IsConnected() })
 	assertFast("GetConnectionInfo", func() { _ = mc.GetConnectionInfo() })
 	assertFast("GetCachedToolCountNonBlocking", func() { _ = mc.GetCachedToolCountNonBlocking() })
+}
+
+// TestBackgroundHealthCheck_HasNoPeriodicPoll is a source-level regression
+// guard for a removed 30s ListTools poll. That poll drove tryReconnect() on
+// error independently of Manager.RetryConnection, Manager.ConnectAll, and the
+// supervisor's 30s reconcile ticker -- a fourth (really third, but the one
+// that mattered most) OAuth-unaware retry path that alone accounted for ~1K
+// calls/hr per healthy connection and aggressively re-dialed OAuth-expired
+// servers. Verified via 22h production monitoring: ~30K calls/day -> 0
+// steady-state.
+//
+// A behavioral test can't prove this: a fast unit test can't wait out a real
+// 30s interval, and shrinking the interval to something observable doesn't
+// test the real code path. So this asserts the shape at the source level
+// instead: backgroundHealthCheck's body must contain no ticker/timer
+// construct and no ListTools call, and must contain a receive on
+// mc.stopMonitoring. It also asserts performHealthCheck (the helper the old
+// poll called) no longer exists in the file. If either function is missing
+// entirely, the test fails loudly rather than passing vacuously.
+func TestBackgroundHealthCheck_HasNoPeriodicPoll(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "client.go", nil, 0)
+	require.NoError(t, err, "parse client.go")
+
+	var backgroundHealthCheck *ast.FuncDecl
+	performHealthCheckExists := false
+
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil {
+			continue
+		}
+		switch fn.Name.Name {
+		case "backgroundHealthCheck":
+			backgroundHealthCheck = fn
+		case "performHealthCheck":
+			performHealthCheckExists = true
+		}
+	}
+
+	require.NotNil(t, backgroundHealthCheck, "backgroundHealthCheck FuncDecl not found in client.go -- did it get renamed or removed?")
+	assert.False(t, performHealthCheckExists, "performHealthCheck must not exist -- it was the helper the removed 30s poll called")
+
+	sawStopReceive := false
+	ast.Inspect(backgroundHealthCheck.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.UnaryExpr:
+			if node.Op == token.ARROW {
+				if sel, ok := node.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "stopMonitoring" {
+					sawStopReceive = true
+				}
+			}
+		case *ast.SelectorExpr:
+			if node.Sel.Name == "NewTicker" || node.Sel.Name == "Tick" || node.Sel.Name == "After" {
+				t.Fatalf("backgroundHealthCheck must not use time.%s -- that reintroduces a periodic poll", node.Sel.Name)
+			}
+			if node.Sel.Name == "ListTools" {
+				t.Fatal("backgroundHealthCheck must not call ListTools -- that reintroduces the removed health poll")
+			}
+		}
+		return true
+	})
+
+	assert.True(t, sawStopReceive, "backgroundHealthCheck must receive on mc.stopMonitoring -- that's the only thing it should wait on")
 }

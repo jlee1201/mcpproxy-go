@@ -459,10 +459,10 @@ func (sm *StateManager) IsOAuthError() bool {
 // initialize (design doc R1) -- it is the only source of truth for "known
 // good" versus "haven't checked lately" (see health.DeriveEffectiveStatus).
 //
-// Deliberately NOT cleared by TransitionTo, Reset, ResetPreservingRetryState,
-// or ClearOAuthError: those all fire on a reconnect attempt, and wiping this
-// timestamp there would erase the ordering against LastAuthFailureAt that
-// makes a zombie connection detectable across a fingerprint-gated retry.
+// Deliberately NOT cleared by TransitionTo or Reset: those both fire on a
+// reconnect attempt, and wiping this timestamp there would erase the
+// ordering against LastAuthFailureAt that makes a zombie connection
+// detectable across a fingerprint-gated retry.
 //
 // Process-local, not persisted to config.db: a restart zeroes this
 // deliberately. A server that reconnects on a valid token writes a fresh

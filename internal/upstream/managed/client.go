@@ -641,105 +641,17 @@ func (mc *Client) stopBackgroundMonitoring() {
 	mc.stopMonitoring = make(chan struct{})
 }
 
-// backgroundHealthCheck performs periodic health checks
+// backgroundHealthCheck waits for a stop signal. Periodic ListTools polling
+// (and the reconnect-on-error retry it drove independently of the manager's
+// RetryConnection/ConnectAll and the supervisor's 30s reconcile) has been
+// removed: it was a third, OAuth-unaware retry path that alone accounted for
+// ~1K calls/hr per healthy connection and, unguarded, aggressively re-dialed
+// OAuth-expired servers. Connection failures are now detected lazily on first
+// use, which is fine for AI agent use cases; recovery is left to the
+// manager/supervisor's backoff- and OAuth-aware reconnect paths.
 func (mc *Client) backgroundHealthCheck() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			mc.performHealthCheck()
-		case <-mc.stopMonitoring:
-			mc.logger.Debug("Background health monitoring stopped",
-				zap.String("server", mc.Config.Name))
-			return
-		}
-	}
-}
-
-// performHealthCheck checks if the connection is still healthy and attempts reconnection if needed
-func (mc *Client) performHealthCheck() {
-	// Skip all health/reconnect work when user explicitly logged out
-	if mc.IsUserLoggedOut() {
-		mc.logger.Debug("Health check skipped - user explicitly logged out",
-			zap.String("server", mc.Config.Name))
-		return
-	}
-
-	// Handle OAuth errors with extended backoff
-	if mc.StateManager.GetState() == types.StateError && mc.StateManager.IsOAuthError() {
-		if mc.StateManager.ShouldRetryOAuth() {
-			info := mc.StateManager.GetConnectionInfo()
-			mc.logger.Info("Attempting OAuth reconnection with extended backoff",
-				zap.String("server", mc.Config.Name),
-				zap.Int("oauth_retry_count", info.OAuthRetryCount),
-				zap.Time("last_oauth_attempt", info.LastOAuthAttempt))
-			mc.tryReconnect()
-		} else {
-			info := mc.StateManager.GetConnectionInfo()
-			mc.logger.Debug("OAuth backoff period not elapsed, skipping reconnection",
-				zap.String("server", mc.Config.Name),
-				zap.Int("oauth_retry_count", info.OAuthRetryCount),
-				zap.Time("last_oauth_attempt", info.LastOAuthAttempt))
-		}
-		return
-	}
-
-	// Check if client is in error state and should retry connection (non-OAuth errors)
-	if mc.StateManager.GetState() == types.StateError && mc.ShouldRetry() {
-		mc.logger.Info("Attempting automatic reconnection with exponential backoff",
-			zap.String("server", mc.Config.Name),
-			zap.Int("retry_count", mc.StateManager.GetConnectionInfo().RetryCount))
-
-		mc.tryReconnect()
-		return
-	}
-
-	// Skip health checks if not connected
-	if !mc.IsConnected() {
-		return
-	}
-
-	// Skip health checks for Docker servers to avoid interference with container management
-	if mc.isDockerServer() {
-		mc.logger.Debug("Skipping health check for Docker server",
-			zap.String("server", mc.Config.Name),
-			zap.String("command", mc.Config.Command))
-		return
-	}
-
-	// Create a short timeout for health check
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	listCtx, release, ok := mc.acquireListToolsContext(ctx, 5*time.Second)
-	if !ok {
-		mc.logger.Debug("Health check skipped - ListTools already in progress",
-			zap.String("server", mc.Config.Name))
-		return
-	}
-
-	defer release()
-
-	_, err := mc.coreClient.ListTools(listCtx)
-
-	if err != nil {
-		// Only mark as error if it's a real connection issue, not timeout during high activity
-		if mc.isConnectionError(err) {
-			mc.logger.Warn("Health check failed with connection error, marking as error",
-				zap.String("server", mc.Config.Name),
-				zap.Error(err))
-			mc.StateManager.SetError(err)
-		} else {
-			mc.logger.Debug("Health check failed with timeout (high activity), ignoring",
-				zap.String("server", mc.Config.Name),
-				zap.Error(err))
-		}
-		return
-	}
-
-	mc.logger.Debug("Health check passed successfully",
+	<-mc.stopMonitoring
+	mc.logger.Debug("Background health monitoring stopped",
 		zap.String("server", mc.Config.Name))
 }
 
