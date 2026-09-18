@@ -686,15 +686,51 @@ func truncateToolCallRecordToFit(record *ToolCallRecord, maxBytes int) ([]byte, 
 	}
 
 	minimal := &ToolCallRecord{
-		ID:         record.ID,
-		ServerID:   record.ServerID,
-		ServerName: record.ServerName,
-		ToolName:   record.ToolName,
+		ID:         truncateFallbackField(record.ID),
+		ServerID:   truncateFallbackField(record.ServerID),
+		ServerName: truncateFallbackField(record.ServerName),
+		ToolName:   truncateFallbackField(record.ToolName),
 		Error:      fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
 		Timestamp:  record.Timestamp,
 		Duration:   record.Duration,
 	}
-	return json.Marshal(minimal)
+	data, err = json.Marshal(minimal)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBytes {
+		// Should be unreachable given maxFallbackFieldBytes leaves ample
+		// headroom under any real maxBytes budget -- but this is the last
+		// resort, so refuse to write rather than silently persist an
+		// oversized record. trimBucketToByteBudget's protectedKey exemption
+		// keeps the just-written key forever regardless of size, so an
+		// oversized fallback record here would be the exact cascade-wipe
+		// class this truncation logic exists to prevent (see
+		// TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe),
+		// just reached through this fallback path instead of the normal one.
+		return nil, fmt.Errorf("minimal fallback record still exceeds %d byte cap (%d bytes), refusing to write", maxBytes, len(data))
+	}
+	return data, nil
+}
+
+// maxFallbackFieldBytes caps each string field copied verbatim into the
+// last-resort minimal record built by truncateToolCallRecordToFit and
+// truncateDiagnosticRecordToFit. Those fields (ID/ServerID/ServerName/
+// ToolName/Type/Category) come from upstream config or an upstream MCP
+// server's own responses -- not bounded by anything upstream of this
+// package -- so without this cap a pathologically long value (e.g. a
+// misconfigured or malicious server name) could make even the "minimal"
+// fallback exceed maxBytes.
+const maxFallbackFieldBytes = 256
+
+// truncateFallbackField bounds s to maxFallbackFieldBytes, preserving
+// enough of the original to still be useful for debugging which
+// server/tool triggered the omission.
+func truncateFallbackField(s string) string {
+	if len(s) <= maxFallbackFieldBytes {
+		return s
+	}
+	return s[:maxFallbackFieldBytes] + "...(truncated)"
 }
 
 // truncateDiagnosticRecordToFit mirrors truncateToolCallRecordToFit for
@@ -721,14 +757,24 @@ func truncateDiagnosticRecordToFit(record *DiagnosticRecord, maxBytes int) ([]by
 	}
 
 	minimal := &DiagnosticRecord{
-		ServerID:   record.ServerID,
-		ServerName: record.ServerName,
-		Type:       record.Type,
-		Category:   record.Category,
+		ServerID:   truncateFallbackField(record.ServerID),
+		ServerName: truncateFallbackField(record.ServerName),
+		Type:       truncateFallbackField(record.Type),
+		Category:   truncateFallbackField(record.Category),
 		Message:    fmt.Sprintf("[record omitted: %d bytes exceeds %d byte per-record cap]", originalBytes, maxBytes),
 		Timestamp:  record.Timestamp,
 	}
-	return json.Marshal(minimal)
+	data, err = json.Marshal(minimal)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBytes {
+		// See truncateToolCallRecordToFit's identical check for why this
+		// must refuse to write rather than silently persist an oversized
+		// record.
+		return nil, fmt.Errorf("minimal fallback record still exceeds %d byte cap (%d bytes), refusing to write", maxBytes, len(data))
+	}
+	return data, nil
 }
 
 // RecordToolCall records a tool call for a server, then trims the bucket
@@ -1066,7 +1112,24 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 		return 0, fmt.Errorf("failed to list server identities: %w", err)
 	}
 
-	var staleServers []string
+	// survivingServerNames tracks every identity NOT being cleaned up in this
+	// pass (still configured, or not stale). oauth_tokens is keyed by plain
+	// server name (see BoltDB.SaveOAuthToken/GetOAuthToken), not by the
+	// content-hashed identity ID used everywhere else in this function -- if
+	// a still-live identity happens to share its ServerName with the stale
+	// identity being cleaned up (e.g. the same name re-added with a new
+	// URL), deleting the oauth_tokens entry by name would wipe that live
+	// server's token too. Skip the oauth_tokens delete for any name still in
+	// use rather than risk that.
+	survivingServerNames := make(map[string]bool)
+	for _, identity := range identities {
+		if identity.IsStale(threshold) && !configuredServerIDs[identity.ID] {
+			continue
+		}
+		survivingServerNames[identity.ServerName] = true
+	}
+
+	var staleIdentities []*ServerIdentity
 	for _, identity := range identities {
 		if !identity.IsStale(threshold) {
 			continue
@@ -1075,19 +1138,21 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 			// Still configured -- merely disconnected, not abandoned.
 			continue
 		}
-		staleServers = append(staleServers, identity.ID)
+		staleIdentities = append(staleIdentities, identity)
 		m.logger.Infow("Found stale server for cleanup",
 			"server_name", identity.ServerName,
 			"server_id", identity.ID,
 			"last_seen", identity.LastSeen)
 	}
 
-	if len(staleServers) == 0 {
+	if len(staleIdentities) == 0 {
 		return 0, nil
 	}
 
 	err = m.db.db.Update(func(tx *bbolt.Tx) error {
-		for _, serverID := range staleServers {
+		for _, identity := range staleIdentities {
+			serverID := identity.ID
+
 			// Remove server identity
 			if bucket := tx.Bucket([]byte("server_identities")); bucket != nil {
 				bucket.Delete([]byte(serverID))
@@ -1106,6 +1171,19 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 				bucket.Delete([]byte(serverID))
 			}
 
+			// Remove the OAuth token, if any -- otherwise a server dropped
+			// from config entirely leaves its refresh/access token behind
+			// in oauth_tokens forever, the one bucket every other piece of
+			// this server's data gets removed from except this one.
+			if survivingServerNames[identity.ServerName] {
+				m.logger.Debugw("Skipping oauth_tokens delete: another live identity shares this server name",
+					"server_name", identity.ServerName, "server_id", serverID)
+			} else if bucket := tx.Bucket([]byte(OAuthTokenBucket)); bucket != nil {
+				if err := bucket.Delete([]byte(identity.ServerName)); err != nil {
+					return fmt.Errorf("failed to delete oauth token for %s: %w", identity.ServerName, err)
+				}
+			}
+
 			m.logger.Infow("Cleaned up stale server data", "server_id", serverID)
 		}
 		return nil
@@ -1114,7 +1192,7 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 		return 0, err
 	}
 
-	return len(staleServers), nil
+	return len(staleIdentities), nil
 }
 
 // Private helper methods

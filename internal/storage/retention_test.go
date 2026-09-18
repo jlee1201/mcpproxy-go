@@ -337,6 +337,81 @@ func TestRecordToolCall_OversizedErrorIsTruncatedBeforeWrite(t *testing.T) {
 	assert.Contains(t, hugeSurvivor.Error, "omitted")
 }
 
+// TestRecordToolCall_MinimalFallbackCapsServerName is the regression test
+// for round-4's medium-severity truncation-path finding: the minimal
+// last-resort record (built when even clearing Response/Arguments/Error
+// still exceeds maxBytes) used to copy ID/ServerID/ServerName/ToolName
+// verbatim with no cap of its own. A pathologically long ServerName (e.g. a
+// misconfigured or malicious upstream server) could make even the "minimal"
+// record exceed maxBytes -- which trimBucketToByteBudget's protected-newest-
+// key exemption would then keep forever regardless of size: the exact
+// cascade-wipe class this package's truncation logic exists to prevent,
+// just reached through the fallback path instead of the normal one.
+// truncateFallbackField now caps every such field before the minimal
+// record is built.
+func TestRecordToolCall_MinimalFallbackCapsServerName(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	serverID := "test-server-id"
+	hugeServerName := strings.Repeat("s", MaxToolCallRecordBytes+4096)
+
+	huge := &ToolCallRecord{
+		ID:         "call-huge-server-name",
+		ServerID:   serverID,
+		ServerName: hugeServerName,
+		ToolName:   "some_tool",
+		Response:   "small",
+		Timestamp:  time.Unix(1_700_000_000, 0),
+		RequestID:  "req-huge-server-name",
+	}
+	require.NoError(t, manager.RecordToolCall(huge))
+
+	small := &ToolCallRecord{
+		ID:        "call-small-2",
+		ServerID:  serverID,
+		ToolName:  "some_tool",
+		Response:  "ok",
+		Timestamp: time.Unix(1_700_000_001, 0),
+		RequestID: "req-small-2",
+	}
+	require.NoError(t, manager.RecordToolCall(small))
+
+	survivors, err := manager.GetServerToolCalls(serverID, 10)
+	require.NoError(t, err)
+	require.Len(t, survivors, 2, "the huge-ServerName record must not have cascade-wiped the bucket via an unbounded minimal fallback")
+
+	var hugeSurvivor *ToolCallRecord
+	for _, r := range survivors {
+		if r.ID == "call-huge-server-name" {
+			hugeSurvivor = r
+		}
+	}
+	require.NotNil(t, hugeSurvivor)
+	assert.Less(t, len(hugeSurvivor.ServerName), MaxToolCallRecordBytes,
+		"ServerName in the minimal fallback record must be capped, not stored at full size")
+	assert.Contains(t, hugeSurvivor.ServerName, "...(truncated)")
+}
+
+// TestTruncateToolCallRecordToFit_RefusesToWriteIfStillOversized exercises
+// the last-resort defensive branch directly: even after every field is
+// capped by truncateFallbackField, an absurdly small maxBytes budget still
+// can't be met, so the function must return an error rather than silently
+// persist a record over budget.
+func TestTruncateToolCallRecordToFit_RefusesToWriteIfStillOversized(t *testing.T) {
+	record := &ToolCallRecord{
+		ID:         "x",
+		ServerID:   "y",
+		ServerName: "z",
+		ToolName:   "t",
+		Response:   strings.Repeat("r", 1000),
+		Timestamp:  time.Unix(1_700_000_000, 0),
+	}
+
+	_, err := truncateToolCallRecordToFit(record, 10)
+	require.Error(t, err, "must refuse to write rather than silently persist a record over an unreachable budget")
+}
+
 // TestRecordServerDiagnostic_TrimsToByteBudget mirrors the tool_calls trim
 // test for diagnostics, which has the identical unbounded-growth shape.
 func TestRecordServerDiagnostic_TrimsToByteBudget(t *testing.T) {
@@ -529,4 +604,64 @@ func TestCleanupStaleServerData_NilMapIsNoOp(t *testing.T) {
 	remaining, err := manager.ListServerIdentities()
 	require.NoError(t, err)
 	assert.Len(t, remaining, 1, "a nil configuredServerIDs map must not delete anything")
+}
+
+// TestCleanupStaleServerData_DeletesOAuthToken is the regression test for
+// round-4's medium-severity finding: oauth_tokens is keyed by plain
+// ServerName (see BoltDB.SaveOAuthToken/GetOAuthToken), not by the
+// content-hashed identity ID every other bucket here uses, so
+// CleanupStaleServerData -- which iterates by ID -- never touched it. A
+// server dropped from config entirely left its refresh/access token behind
+// forever. This proves the token is now deleted along with everything else.
+func TestCleanupStaleServerData_DeletesOAuthToken(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	removed := registerStaleIdentity(t, manager, "dropped-from-config", 48*time.Hour)
+	require.NoError(t, manager.db.SaveOAuthToken(&OAuthTokenRecord{
+		ServerName:  removed.ServerName,
+		AccessToken: "some-access-token",
+	}))
+
+	deleted, err := manager.CleanupStaleServerData(24*time.Hour, map[string]bool{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	_, err = manager.db.GetOAuthToken(removed.ServerName)
+	assert.Error(t, err, "oauth token for a removed-and-cleaned-up server must be deleted, not left behind forever")
+}
+
+// TestCleanupStaleServerData_PreservesOAuthTokenForLiveServerSharingName
+// covers the guard added alongside the fix above: if a still-live identity
+// happens to share its ServerName with the stale identity being cleaned up
+// (e.g. the same name re-added with a new URL, which changes the
+// content-hashed ID but not the name), deleting oauth_tokens by name must
+// NOT wipe the live server's token.
+func TestCleanupStaleServerData_PreservesOAuthTokenForLiveServerSharingName(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	sharedName := "shared-server-name"
+
+	stale := registerStaleIdentity(t, manager, sharedName, 48*time.Hour)
+
+	live := NewServerIdentity(&config.ServerConfig{Name: sharedName, URL: "https://example.com/" + sharedName + "-v2"}, "/tmp/mcp_config.json")
+	live.LastSeen = time.Now()
+	require.NoError(t, manager.saveServerIdentity(live))
+	require.NotEqual(t, stale.ID, live.ID, "test setup requires two distinct identities sharing one ServerName")
+
+	require.NoError(t, manager.db.SaveOAuthToken(&OAuthTokenRecord{
+		ServerName:  sharedName,
+		AccessToken: "live-servers-token",
+	}))
+
+	deleted, err := manager.CleanupStaleServerData(24*time.Hour, map[string]bool{
+		live.ID: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted)
+
+	token, err := manager.db.GetOAuthToken(sharedName)
+	require.NoError(t, err, "the live identity's token must survive even though a stale identity shared its ServerName")
+	assert.Equal(t, "live-servers-token", token.AccessToken)
 }
