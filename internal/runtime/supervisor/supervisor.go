@@ -319,7 +319,7 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 	s.logger.Debug("Starting reconciliation",
 		zap.Int("desired_servers", configSnapshot.ServerCount()))
 
-	plan := s.computeReconcilePlan(configSnapshot)
+	plan := s.computeReconcilePlan(configSnapshot, liveStates)
 
 	// Phase 6 Fix: Execute actions asynchronously to prevent blocking
 	// Each action runs in its own goroutine with timeout
@@ -355,8 +355,13 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 	return nil
 }
 
-// computeReconcilePlan determines what actions need to be taken.
-func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *ReconcilePlan {
+// computeReconcilePlan determines what actions need to be taken. actualStates
+// is the live per-server state fetched fresh at the top of reconcile() (see
+// its call site) -- deliberately NOT s.CurrentSnapshot(), which at this point
+// in the call still holds the *previous* reconcile's snapshot (updateSnapshot
+// runs after this call returns) and would make the retry-backoff check below
+// evaluate against one-cycle-stale ConnectionInfo.
+func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot, actualStates map[string]*ServerState) *ReconcilePlan {
 	plan := &ReconcilePlan{
 		Actions:   make(map[string]ReconcileAction),
 		Timestamp: time.Now(),
@@ -390,6 +395,17 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *R
 				// Should be connected but isn't (or has inspection exemption)
 				// BUT: Don't auto-reconnect if user explicitly logged out
 				if s.upstream.IsUserLoggedOut(name) {
+					plan.Actions[name] = ActionNone
+				} else if actual, ok := actualStates[name]; ok && actual.ConnectionInfo != nil && !actual.ConnectionInfo.ShouldAutoReconnect(time.Now()) {
+					// Respect the client's retry policy: exponential backoff after
+					// consecutive failures, gave-up after MaxConnectionRetries, and
+					// PendingAuth servers waiting on user OAuth login. Without this
+					// gate the periodic 30s reconciliation re-dials a dead upstream
+					// forever, hammering the remote server (~3 requests per tick).
+					s.logger.Debug("Skipping auto-reconnect (backoff/pending-auth)",
+						zap.String("server", name),
+						zap.String("state", actual.ConnectionInfo.State.String()),
+						zap.Int("retry_count", actual.ConnectionInfo.RetryCount))
 					plan.Actions[name] = ActionNone
 				} else {
 					plan.Actions[name] = ActionConnect

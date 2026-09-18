@@ -98,3 +98,135 @@ func TestStateManager_ShouldRetryOAuth_LoggedOut(t *testing.T) {
 	sm.SetUserLoggedOut(true)
 	assert.False(t, sm.ShouldRetryOAuth())
 }
+
+func TestResetForReconnect_PreservesRetryCount(t *testing.T) {
+	sm := NewStateManager()
+
+	// Simulate several failed connection attempts
+	for i := 0; i < 5; i++ {
+		sm.SetError(errors.New("connection failed"))
+	}
+
+	info := sm.GetConnectionInfo()
+	assert.Equal(t, 5, info.RetryCount)
+	assert.Equal(t, StateError, info.State)
+
+	// ResetForReconnect should keep retryCount but transition to Disconnected
+	sm.ResetForReconnect()
+
+	info = sm.GetConnectionInfo()
+	assert.Equal(t, StateDisconnected, info.State)
+	assert.Equal(t, 5, info.RetryCount, "retryCount must be preserved across reconnect")
+	assert.Nil(t, info.LastError, "lastError should be cleared")
+}
+
+func TestReset_ClearsRetryCount(t *testing.T) {
+	sm := NewStateManager()
+
+	for i := 0; i < 5; i++ {
+		sm.SetError(errors.New("connection failed"))
+	}
+
+	sm.Reset()
+
+	info := sm.GetConnectionInfo()
+	assert.Equal(t, StateDisconnected, info.State)
+	assert.Equal(t, 0, info.RetryCount, "Reset should zero retryCount for manual reconnect")
+}
+
+func TestShouldRetry_MaxRetries(t *testing.T) {
+	sm := NewStateManager()
+
+	// Fill up to MaxConnectionRetries
+	for i := 0; i < MaxConnectionRetries; i++ {
+		sm.SetError(errors.New("connection failed"))
+	}
+
+	// At exactly MaxConnectionRetries, should stop
+	assert.False(t, sm.ShouldRetry(), "should not retry after max retries")
+
+	info := sm.GetConnectionInfo()
+	assert.True(t, info.GaveUp, "GaveUp should be true when at max retries")
+}
+
+func TestShouldRetry_BelowMaxRetries(t *testing.T) {
+	sm := NewStateManager()
+
+	// Set a few errors, well below max
+	for i := 0; i < 3; i++ {
+		sm.SetError(errors.New("connection failed"))
+	}
+	// Backoff requires waiting, so set lastRetryTime in the past
+	sm.mu.Lock()
+	sm.lastRetryTime = time.Now().Add(-10 * time.Minute)
+	sm.mu.Unlock()
+
+	assert.True(t, sm.ShouldRetry(), "should retry when below max and backoff elapsed")
+}
+
+func TestShouldRetry_ResetAfterGaveUp(t *testing.T) {
+	sm := NewStateManager()
+
+	// Exhaust retries
+	for i := 0; i < MaxConnectionRetries; i++ {
+		sm.SetError(errors.New("connection failed"))
+	}
+	assert.False(t, sm.ShouldRetry())
+
+	// Manual Reset should allow retrying again
+	sm.Reset()
+	sm.SetError(errors.New("fresh attempt"))
+	sm.mu.Lock()
+	sm.lastRetryTime = time.Now().Add(-10 * time.Minute)
+	sm.mu.Unlock()
+
+	assert.True(t, sm.ShouldRetry(), "should retry after manual Reset clears gave-up state")
+}
+
+// TestRetryBackoffDuration tests the exponential backoff schedule
+func TestRetryBackoffDuration(t *testing.T) {
+	tests := []struct {
+		retryCount int
+		expected   time.Duration
+	}{
+		{0, 1 * time.Second},
+		{1, 1 * time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{5, 16 * time.Second},
+		{10, 5 * time.Minute},  // 512s capped at 5min
+		{100, 5 * time.Minute}, // exponent capped, then duration capped
+	}
+
+	for _, tt := range tests {
+		got := RetryBackoffDuration(tt.retryCount)
+		assert.Equal(t, tt.expected, got, "retryCount=%d", tt.retryCount)
+	}
+}
+
+// TestConnectionInfo_ShouldAutoReconnect tests the supervisor-facing retry policy
+func TestConnectionInfo_ShouldAutoReconnect(t *testing.T) {
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		info     *ConnectionInfo
+		expected bool
+	}{
+		{"nil info", nil, true},
+		{"disconnected fresh server", &ConnectionInfo{State: StateDisconnected}, true},
+		{"ready server", &ConnectionInfo{State: StateReady}, true},
+		{"pending auth is parked", &ConnectionInfo{State: StatePendingAuth}, false},
+		{"error within backoff window", &ConnectionInfo{State: StateError, RetryCount: 5, LastRetryTime: now.Add(-1 * time.Second)}, false},
+		{"error with backoff elapsed", &ConnectionInfo{State: StateError, RetryCount: 3, LastRetryTime: now.Add(-10 * time.Second)}, true},
+		{"error no failures yet", &ConnectionInfo{State: StateError, RetryCount: 0}, true},
+		{"gave up flag", &ConnectionInfo{State: StateError, GaveUp: true, LastRetryTime: now.Add(-time.Hour)}, false},
+		{"retry count at max", &ConnectionInfo{State: StateError, RetryCount: MaxConnectionRetries, LastRetryTime: now.Add(-time.Hour)}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.info.ShouldAutoReconnect(now))
+		})
+	}
+}
