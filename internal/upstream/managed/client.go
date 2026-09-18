@@ -132,6 +132,25 @@ func (mc *Client) Connect(ctx context.Context) error {
 		zap.String("current_state", mc.StateManager.GetState().String()),
 		zap.Bool("list_tools_in_progress", mc.listToolsInProgress))
 
+	// CRITICAL FIX: When reconnecting from Error state, disconnect core client first
+	// to clear stale c.connected flag that may remain from a previous connection
+	// that died silently (e.g., HTTP server timeout). Without this, core client
+	// rejects the connect attempt with "client already connected" error.
+	// Hand-ported from upstream #286 (a prerequisite our fork's lineage never
+	// had) plus #1039's extension to also cover StatePendingAuth: Connect must
+	// clear the stale core client when waking a parked server too.
+	currentState := mc.StateManager.GetState()
+	if currentState == types.StateError || currentState == types.StateDisconnected || currentState == types.StatePendingAuth {
+		mc.logger.Debug("Disconnecting core client before reconnect to clear stale state",
+			zap.String("server", mc.Config.Name),
+			zap.String("from_state", currentState.String()))
+		if err := mc.coreClient.Disconnect(); err != nil {
+			mc.logger.Debug("Core client disconnect before reconnect returned",
+				zap.String("server", mc.Config.Name),
+				zap.Error(err))
+		}
+	}
+
 	// Transition to connecting state
 	mc.StateManager.TransitionTo(types.StateConnecting)
 
@@ -143,9 +162,11 @@ func (mc *Client) Connect(ctx context.Context) error {
 		if core.IsOAuthPending(err) {
 			mc.logger.Info("⏳ OAuth authentication pending user action",
 				zap.String("server", mc.Config.Name))
-			// Transition to PendingAuth state instead of Error
-			mc.StateManager.TransitionTo(types.StatePendingAuth)
-			mc.StateManager.SetError(err)
+			// Park in PendingAuth. SetPendingAuth (not TransitionTo + SetError:
+			// SetError forces StateError and would immediately undo the park, so
+			// the supervisor kept redialing a login-blocked server every 30s --
+			// #1013).
+			mc.StateManager.SetPendingAuth(err)
 			return fmt.Errorf("OAuth authentication pending: %w", err)
 		}
 		// Check if this is an OAuth authorization requirement (not an error)
@@ -155,7 +176,9 @@ func (mc *Client) Connect(ctx context.Context) error {
 			mc.logger.Info("🎯 OAuth authorization required during MCP initialization",
 				zap.String("server", mc.Config.Name),
 				zap.Bool("token_refresh_scenario", isRefreshScenario))
-			// Use OAuth extended backoff — can't auto-complete without user browser action
+			// Use OAuth extended backoff -- can't auto-complete without user
+			// browser action, so the short default ladder would just redial a
+			// login-blocked server (#1013/#1039).
 			mc.StateManager.SetOAuthError(err)
 			return fmt.Errorf("OAuth authorization during MCP init failed: %w", err)
 		} else if mc.isOAuthError(err) {
@@ -642,87 +665,16 @@ func (mc *Client) stopBackgroundMonitoring() {
 }
 
 // backgroundHealthCheck waits for a stop signal. Periodic ListTools polling
-// has been removed — connection failures are detected lazily on first use,
-// which avoids constant upstream API load for no user-visible benefit.
+// (and the reconnect-on-error retry it drove independently of the manager's
+// RetryConnection/ConnectAll and the supervisor's 30s reconcile) has been
+// removed: it was a third, OAuth-unaware retry path that alone accounted for
+// ~1K calls/hr per healthy connection and, unguarded, aggressively re-dialed
+// OAuth-expired servers. Connection failures are now detected lazily on first
+// use, which is fine for AI agent use cases; recovery is left to the
+// manager/supervisor's backoff- and OAuth-aware reconnect paths.
 func (mc *Client) backgroundHealthCheck() {
-	for {
-		select {
-		case <-mc.stopMonitoring:
-			mc.logger.Debug("Background health monitoring stopped",
-				zap.String("server", mc.Config.Name))
-			return
-		}
-	}
-}
-
-// performHealthCheck checks if the connection is still healthy and attempts reconnection if needed
-func (mc *Client) performHealthCheck() {
-	// Skip all health/reconnect work when user explicitly logged out
-	if mc.IsUserLoggedOut() {
-		mc.logger.Debug("Health check skipped - user explicitly logged out",
-			zap.String("server", mc.Config.Name))
-		return
-	}
-
-	// OAuth errors require user action (browser sign-in) — never auto-retry
-	if mc.StateManager.GetState() == types.StateError && mc.StateManager.IsOAuthError() {
-		return
-	}
-
-	// Check if client is in error state and should retry connection (non-OAuth errors)
-	if mc.StateManager.GetState() == types.StateError && mc.ShouldRetry() {
-		mc.logger.Info("Attempting automatic reconnection with exponential backoff",
-			zap.String("server", mc.Config.Name),
-			zap.Int("retry_count", mc.StateManager.GetConnectionInfo().RetryCount))
-
-		mc.tryReconnect()
-		return
-	}
-
-	// Skip health checks if not connected
-	if !mc.IsConnected() {
-		return
-	}
-
-	// Skip health checks for Docker servers to avoid interference with container management
-	if mc.isDockerServer() {
-		mc.logger.Debug("Skipping health check for Docker server",
-			zap.String("server", mc.Config.Name),
-			zap.String("command", mc.Config.Command))
-		return
-	}
-
-	// Create a short timeout for health check
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	listCtx, release, ok := mc.acquireListToolsContext(ctx, 5*time.Second)
-	if !ok {
-		mc.logger.Debug("Health check skipped - ListTools already in progress",
-			zap.String("server", mc.Config.Name))
-		return
-	}
-
-	defer release()
-
-	_, err := mc.coreClient.ListTools(listCtx)
-
-	if err != nil {
-		// Only mark as error if it's a real connection issue, not timeout during high activity
-		if mc.isConnectionError(err) {
-			mc.logger.Warn("Health check failed with connection error, marking as error",
-				zap.String("server", mc.Config.Name),
-				zap.Error(err))
-			mc.StateManager.SetError(err)
-		} else {
-			mc.logger.Debug("Health check failed with timeout (high activity), ignoring",
-				zap.String("server", mc.Config.Name),
-				zap.Error(err))
-		}
-		return
-	}
-
-	mc.logger.Debug("Health check passed successfully",
+	<-mc.stopMonitoring
+	mc.logger.Debug("Background health monitoring stopped",
 		zap.String("server", mc.Config.Name))
 }
 
@@ -809,9 +761,11 @@ func (mc *Client) tryReconnect() {
 			zap.Error(err))
 	}
 
-	// Reset state to disconnected before attempting reconnection,
-	// but preserve retry counts so backoff accumulates across attempts
-	mc.StateManager.ResetPreservingRetryState()
+	// Reset state to disconnected before attempting reconnection. Use
+	// ResetForReconnect (not Reset) so retryCount/lastRetryTime survive --
+	// otherwise every ForceReconnect-driven attempt restarts exponential
+	// backoff from zero, defeating the anti-reconnect-storm goal.
+	mc.StateManager.ResetForReconnect()
 
 	// Attempt to reconnect using the existing Connect method
 	// The Connect method already handles state transitions and error management
@@ -894,8 +848,6 @@ func (mc *Client) isOAuthAuthorizationRequired(err error) bool {
 		"OAuth authorization during MCP init failed",
 		"OAuth authorization not implemented",
 		"OAuth authorization required",
-		"OAuth authentication required",
-		"authentication strategies failed",
 		"authorization required",
 	}
 

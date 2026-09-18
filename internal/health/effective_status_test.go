@@ -58,6 +58,51 @@ func TestDeriveEffectiveStatus_Table(t *testing.T) {
 			want: "unknown",
 		},
 		{
+			// The 2026-08-14 bug: a fully disconnected client with a dead
+			// token was falling through to `return in.State` verbatim
+			// ("error"), never "auth_expired" -- so mcp-reauth.sh's
+			// flush-skip (gated on seeing auth_expired) never engaged for
+			// the most common daily-triage failure mode.
+			name: "not connected, auth failure after success -> auth_expired, not a verbatim State pass-through",
+			in: EffectiveStatusInput{
+				Connected:         false,
+				State:             "error",
+				LastSuccessAt:     pastExpiry,
+				LastAuthFailureAt: now,
+			},
+			want: "auth_expired",
+		},
+		{
+			name: "not connected, token expiry known and in the past -> auth_expired",
+			in: EffectiveStatusInput{
+				Connected:      false,
+				State:          "error",
+				TokenExpiresAt: &pastExpiry,
+			},
+			want: "auth_expired",
+		},
+		{
+			name: "not connected, token expiry known and in the future -> State passes through unchanged",
+			in: EffectiveStatusInput{
+				Connected:      false,
+				State:          "error",
+				TokenExpiresAt: &futureExpiry,
+			},
+			want: "error",
+		},
+		{
+			// auth_expired must win over the ready/connected-lie handling:
+			// a stale token is a stronger, more specific signal than "State
+			// claims a live connection with nothing to back it."
+			name: "not connected, State claims ready AND token expired -> auth_expired takes priority over unknown",
+			in: EffectiveStatusInput{
+				Connected:      false,
+				State:          "ready",
+				TokenExpiresAt: &pastExpiry,
+			},
+			want: "auth_expired",
+		},
+		{
 			name: "connected, auth failure after success -> auth_expired (the zombie)",
 			in: EffectiveStatusInput{
 				Connected:         true,

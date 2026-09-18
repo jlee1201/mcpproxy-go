@@ -109,9 +109,9 @@ type Config struct {
 	OAuthExpiryWarningHours float64 `json:"oauth_expiry_warning_hours,omitempty" mapstructure:"oauth-expiry-warning-hours"` // Hours before token expiry to show degraded status (default: 1.0)
 
 	// Activity logging settings (RFC-003)
-	ActivityRetentionDays      int `json:"activity_retention_days,omitempty" mapstructure:"activity-retention-days"`             // Max age before pruning (default: 90)
-	ActivityMaxRecords         int `json:"activity_max_records,omitempty" mapstructure:"activity-max-records"`                   // Max records before pruning (default: 100000)
-	ActivityMaxResponseSize    int `json:"activity_max_response_size,omitempty" mapstructure:"activity-max-response-size"`       // Response truncation limit in bytes (default: 65536)
+	ActivityRetentionDays      int `json:"activity_retention_days,omitempty" mapstructure:"activity-retention-days"`             // Max age before pruning (default: 7)
+	ActivityMaxRecords         int `json:"activity_max_records,omitempty" mapstructure:"activity-max-records"`                   // Max records before pruning (default: 10000)
+	ActivityMaxResponseSize    int `json:"activity_max_response_size,omitempty" mapstructure:"activity-max-response-size"`       // Response truncation limit in bytes (default: 65536) - not yet wired to any consumer
 	ActivityCleanupIntervalMin int `json:"activity_cleanup_interval_min,omitempty" mapstructure:"activity-cleanup-interval-min"` // Background cleanup interval in minutes (default: 60)
 
 	// Intent declaration settings (Spec 018)
@@ -607,10 +607,16 @@ func DefaultConfig() *Config {
 		CodeExecutionMaxToolCalls: 0,      // Unlimited by default (0 = no limit)
 		CodeExecutionPoolSize:     10,     // 10 JavaScript runtime instances
 
-		// Activity logging defaults (RFC-003)
-		ActivityRetentionDays:      90,     // 90 days retention
-		ActivityMaxRecords:         100000, // 100K records max
-		ActivityMaxResponseSize:    65536,  // 64KB response truncation
+		// Activity logging defaults (RFC-003). Lowered from the original
+		// 90-day/100K-record spec to match ActivityService's own
+		// already-conservative hardcoded defaults now that SetRetentionConfig
+		// is actually wired up (see internal/runtime/runtime.go) - these
+		// values previously had no effect at all, and loosening the running
+		// default 13x/10x on first wiring would directly worsen the
+		// documented config.db bloat this repo has hit repeatedly.
+		ActivityRetentionDays:      7,      // 7 days retention
+		ActivityMaxRecords:         10000,  // 10K records max
+		ActivityMaxResponseSize:    65536,  // 64KB response truncation (not yet wired - see below)
 		ActivityCleanupIntervalMin: 60,     // 1 hour cleanup interval
 
 		// Intent declaration defaults (Spec 018) - strict validation by default for security

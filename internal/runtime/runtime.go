@@ -171,6 +171,18 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 
 	// Initialize activity service for logging tool calls and events
 	activityService := NewActivityService(storageManager, logger)
+	// Wire the configured retention knobs through - SetRetentionConfig
+	// ignores non-positive values, so an unset/zero config field falls back
+	// to ActivityService's own conservative defaults rather than disabling
+	// retention. maxBytes has no config field yet (PR #1 added the byte
+	// budget straight to ActivityService's own defaults); pass 0 to leave
+	// that default in place rather than introduce a new config surface here.
+	activityService.SetRetentionConfig(
+		time.Duration(cfg.ActivityRetentionDays)*24*time.Hour,
+		cfg.ActivityMaxRecords,
+		0,
+		time.Duration(cfg.ActivityCleanupIntervalMin)*time.Minute,
+	)
 
 	rt := &Runtime{
 		cfg:             cfg,

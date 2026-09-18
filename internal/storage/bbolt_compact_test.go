@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,20 @@ import (
 func testLogger(t *testing.T) *zap.SugaredLogger {
 	t.Helper()
 	return zap.NewNop().Sugar()
+}
+
+// skipIfWindows skips tests that exercise compactDBFile's (or an equivalent
+// rename-over-an-open-handle simulation's) rename directly. On Windows this
+// fails with a sharing violation because the source *bbolt.DB stays open
+// through the rename -- the same limitation maybeCompactOnStartupForGOOS
+// already works around in production by never calling compactDBFile on
+// windows at all (see TestMaybeCompactOnStartup_SkipsOnWindows). These tests
+// call the rename path directly, so they need the same skip.
+func skipIfWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("compactDBFile's final rename swaps the compacted file over dbPath while srcDB still holds dbPath open, which fails with a sharing violation on Windows; see TestMaybeCompactOnStartup_SkipsOnWindows")
+	}
 }
 
 // seedTestDB creates a bbolt file at path with the given buckets, each
@@ -69,6 +84,7 @@ func bucketKeyCounts(t *testing.T, path string) map[string]int {
 // with identical bucket key counts to the source, and swaps it into place
 // atomically (dbPath exists, no leftover tmp file).
 func TestCompactDBFile_PreservesData(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir, err := os.MkdirTemp("", "compact_test_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -99,6 +115,7 @@ func TestCompactDBFile_PreservesData(t *testing.T) {
 // files from prior crashed attempts (including this run's own PID-suffixed
 // name, e.g. a recycled PID) don't break the next compaction.
 func TestCompactDBFile_RemovesStaleTmpFile(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir, err := os.MkdirTemp("", "compact_test_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -182,6 +199,7 @@ func TestVerifyBucketCounts_DetectsMissingBucket(t *testing.T) {
 // free pages exist -- as opposed to a file that is still full of live data,
 // which compaction cannot shrink (see maybeCompactOnStartup's doc comment).
 func TestCompactDBFile_ReclaimsSpaceAfterDeletes(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir, err := os.MkdirTemp("", "compact_reclaim_test_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -378,6 +396,7 @@ func TestNewBoltDB_DoesNotAutoCompact(t *testing.T) {
 // does), CompactConfigDBIfNeeded must still actually compact an oversized
 // file that has real reclaimable space.
 func TestCompactConfigDBIfNeeded_CompactsWhenReclaimable(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir, err := os.MkdirTemp("", "compact_if_needed_test_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -464,6 +483,7 @@ func TestMaybeCompactOnStartup_SkipsWhenLittleReclaimableSpace(t *testing.T) {
 // and retry, returning a handle bound to the new (post-rename) file, not
 // the orphaned one.
 func TestOpenBoltDBAtStablePath_DetectsRenameDuringBlockedOpen(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir, err := os.MkdirTemp("", "stable_open_race_*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)

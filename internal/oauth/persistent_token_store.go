@@ -201,11 +201,13 @@ func (p *PersistentTokenStore) GetToken(ctx context.Context) (*client.Token, err
 // mcp-go's benefit.
 //
 // Callers that only want to know "is there a token, and has it changed"
-// (e.g. Manager.scanForNewTokens) must use this instead of GetToken: GetToken
-// elects the caller refresh leader whenever the (grace-adjusted) token looks
-// expired and a refresh token is present, and a caller with no intention of
-// ever calling SaveToken holds that lease until the 30s stale-lease takeover,
-// starving real refreshers (D5).
+// (e.g. Manager.scanForNewTokens, Manager.RetryConnection's diagnostic
+// lookup) must use this instead of GetToken: GetToken elects the caller
+// refresh leader whenever the (grace-adjusted) token looks expired and a
+// refresh token is present, and a caller with no intention of ever calling
+// SaveToken holds that lease until the 30s stale-lease takeover, starving
+// real refreshers (D5). GetToken also logs at Warn on every expired-token
+// read, which a 5s-tick caller would otherwise spam.
 //
 // ExpiresAt is returned exactly as persisted, including a zero value, which
 // means the record's expiry is unknown rather than "expired" or "valid

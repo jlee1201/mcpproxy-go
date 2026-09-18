@@ -6,10 +6,11 @@ components:
           description: 'Background cleanup interval in minutes (default: 60)'
           type: integer
         activity_max_records:
-          description: 'Max records before pruning (default: 100000)'
+          description: 'Max records before pruning (default: 10000)'
           type: integer
         activity_max_response_size:
-          description: 'Response truncation limit in bytes (default: 65536)'
+          description: 'Response truncation limit in bytes (default: 65536) - not
+            yet wired to any consumer'
           type: integer
         activity_retention_days:
           description: Activity logging settings (RFC-003)
@@ -923,7 +924,11 @@ components:
         token_url:
           type: string
         token_valid:
-          description: Whether token is currently valid
+          description: |-
+            TokenValid deliberately has NO omitempty (D3.1 / A4): a bool's zero
+            value is `false`, which omitempty drops from the wire, making
+            "token_valid: false" indistinguishable from "no token field at all."
+            false must reach the client.
           type: boolean
       type: object
     contracts.OAuthErrorDetails:
@@ -1165,6 +1170,13 @@ components:
           type: boolean
         created:
           type: string
+        effective_status:
+          description: |-
+            EffectiveStatus / LastSuccessAt / LastAuthFailureAt are the
+            freshness-aware surfaces added by the status-staleness fix (design doc
+            R1/R3, implementation plan A2/A3). Status stays exactly as it was for
+            wire compatibility; these are additive. See health.DeriveEffectiveStatus.
+          type: string
         enabled:
           type: boolean
         env:
@@ -1181,18 +1193,23 @@ components:
           type: string
         isolation:
           $ref: '#/components/schemas/contracts.IsolationConfig'
+        last_auth_failure_at:
+          type: string
         last_error:
           type: string
         last_reconnect_at:
           type: string
         last_retry_time:
           type: string
+        last_success_at:
+          type: string
         name:
           type: string
         oauth:
           $ref: '#/components/schemas/contracts.OAuthConfig'
         oauth_status:
-          description: 'OAuth status: "authenticated", "expired", "error", "none"'
+          description: 'OAuth status: "authenticated", "expired", "error", "none",
+            "unknown"'
           type: string
         protocol:
           type: string
@@ -1377,7 +1394,8 @@ components:
           description: Request correlation ID
           type: string
         response:
-          description: Tool response (success only); may be a truncation placeholder object (`{truncated, original_bytes, max_bytes}`) if the original response exceeded the per-record storage cap
+          description: Tool response (success only); may be a truncation placeholder
+            object if it exceeded the per-record storage cap
           type: object
         server_id:
           description: Server identity hash

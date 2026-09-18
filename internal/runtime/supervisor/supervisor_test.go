@@ -120,10 +120,6 @@ func (m *MockUpstreamAdapter) IsUserLoggedOut(name string) bool {
 	return false
 }
 
-func (m *MockUpstreamAdapter) ShouldSkipReconnect(name string) bool {
-	return false
-}
-
 func (m *MockUpstreamAdapter) Subscribe() <-chan Event {
 	return m.eventCh
 }
@@ -1124,4 +1120,116 @@ func TestSupervisor_UpdateSnapshot_NoSpuriousEventsWhenNothingChanged(t *testing
 	case <-time.After(200 * time.Millisecond):
 		// Correct: no spurious events.
 	}
+}
+
+// TestSupervisor_Reconcile_RespectsRetryBackoff verifies that periodic
+// reconciliation does not re-dial a failed upstream while the managed client's
+// exponential backoff window is open, after it gave up, or while it is parked
+// in PendingAuth — but does reconnect once the backoff has elapsed.
+func TestSupervisor_Reconcile_RespectsRetryBackoff(t *testing.T) {
+	cfg := &config.Config{
+		Listen: "127.0.0.1:8080",
+		Servers: []*config.ServerConfig{
+			{Name: "flaky-server", Enabled: true},
+		},
+	}
+
+	configSvc := configsvc.NewService(cfg, "/tmp/config.json", zap.NewNop())
+	defer configSvc.Close()
+
+	mockUpstream := NewMockUpstreamAdapter()
+	defer mockUpstream.Close()
+
+	supervisor := New(configSvc, mockUpstream, zap.NewNop())
+
+	// First reconciliation - server is added and connected
+	require.NoError(t, supervisor.reconcile(configSvc.Current()))
+	supervisor.actionWg.Wait()
+
+	setConnectionState := func(connected bool, info *types.ConnectionInfo) {
+		mockUpstream.mu.Lock()
+		defer mockUpstream.mu.Unlock()
+		mockUpstream.connected["flaky-server"] = connected
+		if state, ok := mockUpstream.states["flaky-server"]; ok {
+			state.Connected = connected
+			state.ConnectionInfo = info
+		}
+	}
+	isConnected := func() bool {
+		mockUpstream.mu.Lock()
+		defer mockUpstream.mu.Unlock()
+		return mockUpstream.connected["flaky-server"]
+	}
+	// reconcile dispatches its actions into goroutines tracked by actionWg, so
+	// draining that group is an exact barrier: after it returns, either the
+	// connect ran or none was planned. A fixed sleep would let the negative
+	// assertions below pass before an erroneous redial had a chance to execute.
+	reconcileAndDrain := func() {
+		t.Helper()
+		require.NoError(t, supervisor.reconcile(configSvc.Current()))
+		supervisor.actionWg.Wait()
+	}
+
+	// Simulate a connection failure with the backoff window still open:
+	// reconciliation must NOT re-dial.
+	setConnectionState(false, &types.ConnectionInfo{
+		State:         types.StateError,
+		RetryCount:    5,
+		LastRetryTime: time.Now(),
+	})
+	reconcileAndDrain()
+	require.False(t, isConnected(), "supervisor re-dialed a failed server inside its backoff window")
+
+	// A server that gave up after max retries must not be re-dialed either,
+	// until the give-up probe interval has elapsed (see below).
+	setConnectionState(false, &types.ConnectionInfo{
+		State:         types.StateError,
+		RetryCount:    types.MaxConnectionRetries,
+		GaveUp:        true,
+		LastRetryTime: time.Now().Add(-time.Minute),
+	})
+	reconcileAndDrain()
+	require.False(t, isConnected(), "supervisor re-dialed a server that gave up after max retries")
+
+	// An OAuth-classified failure is paced by the OAuth ladder, which bumps
+	// OAuthRetryCount and never RetryCount — without that gate it reads as
+	// "no failures yet" and is re-dialed on every tick forever (#1013).
+	setConnectionState(false, &types.ConnectionInfo{
+		State:            types.StateError,
+		IsOAuthError:     true,
+		OAuthRetryCount:  2,
+		LastOAuthAttempt: time.Now().Add(-time.Minute),
+	})
+	reconcileAndDrain()
+	require.False(t, isConnected(), "supervisor re-dialed a server inside its OAuth backoff window")
+
+	// A server parked in PendingAuth (waiting for user OAuth login) must not be
+	// re-dialed - each attempt fires real requests at the upstream and cannot
+	// succeed until the user completes the login.
+	setConnectionState(false, &types.ConnectionInfo{
+		State: types.StatePendingAuth,
+	})
+	reconcileAndDrain()
+	require.False(t, isConnected(), "supervisor re-dialed a server pending OAuth login")
+
+	// Once the backoff window has elapsed, reconciliation reconnects as before.
+	setConnectionState(false, &types.ConnectionInfo{
+		State:         types.StateError,
+		RetryCount:    3,
+		LastRetryTime: time.Now().Add(-10 * time.Second), // backoff for 3 failures is 4s
+	})
+	reconcileAndDrain()
+	require.True(t, isConnected(), "supervisor did not reconnect after the backoff window elapsed")
+
+	// A given-up server is still probed once per GaveUpProbeInterval, so an
+	// outage longer than the retry ladder (sleep, VPN, maintenance) self-heals
+	// instead of leaving the upstream silently dead until a human notices.
+	setConnectionState(false, &types.ConnectionInfo{
+		State:         types.StateError,
+		RetryCount:    types.MaxConnectionRetries,
+		GaveUp:        true,
+		LastRetryTime: time.Now().Add(-types.GaveUpProbeInterval - time.Minute),
+	})
+	reconcileAndDrain()
+	require.True(t, isConnected(), "supervisor never probes a given-up server again")
 }

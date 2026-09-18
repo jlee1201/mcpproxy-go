@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	uptransport "github.com/mark3labs/mcp-go/client/transport"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -179,284 +180,130 @@ func TestRefreshOAuthToken_ServerNotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "server not found")
 }
 
-// TestScanForNewTokens_ClearsOAuthErrorWhenTokenPresent reproduces the OAuth
-// token-conflict loop: after a fresh `auth login`, the new token is persisted,
-// but the client is still flagged IsOAuthError. scanForNewTokens detects the
-// token and calls RetryConnection — which (since 8e31b1e) bails out on the
-// IsOAuthError guard, so the reconnect never runs, the flag is never cleared on
-// success, and the daemon loops forever on "Detected persisted OAuth token;
-// triggering reconnect". A disable+enable works only because it rebuilds the
-// client with a fresh StateManager.
-//
-// The fix: when scanForNewTokens sees a freshly-persisted token (the user's
-// browser action), it must clear the OAuth-error gate so RetryConnection
-// actually attempts the reconnect.
-func TestScanForNewTokens_ClearsOAuthErrorWhenTokenPresent(t *testing.T) {
+// TestTokenFingerprint verifies the identity used to decide whether a persisted
+// token is NEW: the same untouched token must compare equal (so the scan does
+// not redial), any re-issue must not.
+func TestTokenFingerprint(t *testing.T) {
+	expires := time.Now().Add(time.Hour).UTC()
+	written := time.Now().UTC()
+	base := &uptransport.Token{AccessToken: "at", RefreshToken: "rt", ExpiresAt: expires}
+	fp := tokenFingerprint(base, written)
+
+	assert.Equal(t, fp, tokenFingerprint(&uptransport.Token{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: expires,
+	}, written), "same token, same write: must fingerprint the same")
+
+	assert.NotEqual(t, fp, tokenFingerprint(&uptransport.Token{
+		AccessToken: "at2", RefreshToken: "rt", ExpiresAt: expires,
+	}, written), "a new access token must fingerprint differently")
+
+	assert.NotEqual(t, fp, tokenFingerprint(&uptransport.Token{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: expires.Add(time.Minute),
+	}, written), "a refreshed expiry must fingerprint differently")
+
+	// A provider may re-issue a byte-identical token; the write stamp is what
+	// keeps that from silently suppressing the wake.
+	assert.NotEqual(t, fp, tokenFingerprint(base, written.Add(time.Second)),
+		"a token rewritten identically must still fingerprint differently")
+
+	assert.NotContains(t, fp, "at", "the fingerprint must not carry the token")
+	assert.Empty(t, tokenFingerprint(nil, written))
+}
+
+// TestScanForNewTokens_OnlyOnNewToken pins the fix for the 5s redial loop: the
+// scan must fire when a login/refresh writes a NEW token, not on every pass just
+// because the server still holds the stale token it already failed with (#1013).
+func TestScanForNewTokens_OnlyOnNewToken(t *testing.T) {
 	logger := zap.NewNop()
-	sugaredLogger := logger.Sugar()
-
-	serverConfig := &config.ServerConfig{
-		Name:     "test-oauth-recovery",
-		URL:      "http://127.0.0.1:1/mcp", // unroutable: background Connect fails fast
-		Protocol: "http",
-		Enabled:  true,
-		Created:  time.Now(),
-	}
-
 	tempDir := t.TempDir()
-	db, err := storage.NewBoltDB(tempDir, sugaredLogger)
+	db, err := storage.NewBoltDB(tempDir, logger.Sugar())
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Persist a FRESH (future-expiry) token — simulates the user having just
-	// completed `auth login`.
-	serverKey := oauth.GenerateServerKey(serverConfig.Name, serverConfig.URL)
-	token := &storage.OAuthTokenRecord{
-		ServerName:   serverKey,
-		DisplayName:  serverConfig.Name,
-		AccessToken:  "fresh-access-token",
-		RefreshToken: "fresh-refresh-token",
-		TokenType:    "Bearer",
-		ExpiresAt:    time.Now().Add(1 * time.Hour),
-		Created:      time.Now(),
-		Updated:      time.Now(),
-	}
-	require.NoError(t, db.SaveOAuthToken(token))
-
-	manager := &Manager{
-		clients:        make(map[string]*managed.Client),
-		logger:         logger,
-		storage:        db,
-		secretResolver: secret.NewResolver(),
-		tokenReconnect: make(map[string]time.Time),
-	}
-
-	client, err := managed.NewClient(
-		serverConfig.Name,
-		serverConfig,
-		logger,
-		nil,
-		&config.Config{},
-		db,
-		secret.NewResolver(),
-	)
-	require.NoError(t, err)
-	manager.clients[serverConfig.Name] = client
-
-	// Put the client into OAuth-error state, as it would be after the token expired.
-	client.StateManager.SetOAuthError(errors.New("OAuth authentication required"))
-	require.True(t, client.StateManager.IsOAuthError())
-	require.Equal(t, types.StateError, client.GetState())
-
-	// Act: the daemon detects the freshly-persisted token.
-	manager.scanForNewTokens()
-
-	// Assert: the OAuth-error gate is cleared so RetryConnection can actually
-	// reconnect. Before the fix this stays true forever → the reconnect loop.
-	// (A background failure to the unroutable URL uses SetError, not
-	// SetOAuthError, so it cannot flip this flag back to true.)
-	assert.False(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must clear the OAuth-error flag when a fresh token is present")
-}
-
-// newScanTestManager builds a Manager + errored managed.Client wired to a
-// fresh BoltDB, for the scanForNewTokens fingerprint-gate tests below. It
-// mirrors the setup in TestScanForNewTokens_ClearsOAuthErrorWhenTokenPresent.
-func newScanTestManager(t *testing.T, serverName string) (*Manager, *managed.Client, *storage.BoltDB, *config.ServerConfig) {
-	t.Helper()
-	logger := zap.NewNop()
-	sugaredLogger := logger.Sugar()
-
 	serverConfig := &config.ServerConfig{
-		Name:     serverName,
-		URL:      "http://127.0.0.1:1/mcp", // unroutable: background Connect fails fast
+		Name:     "parked-server",
+		URL:      "http://127.0.0.1:1/mcp", // refused immediately; no real upstream needed
 		Protocol: "http",
 		Enabled:  true,
 		Created:  time.Now(),
 	}
-
-	tempDir := t.TempDir()
-	db, err := storage.NewBoltDB(tempDir, sugaredLogger)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	serverKey := oauth.GenerateServerKey(serverConfig.Name, serverConfig.URL)
+	saveToken := func(access string) {
+		require.NoError(t, db.SaveOAuthToken(&storage.OAuthTokenRecord{
+			ServerName:  serverKey,
+			DisplayName: serverConfig.Name,
+			AccessToken: access,
+			TokenType:   "Bearer",
+			ExpiresAt:   time.Now().Add(time.Hour),
+			Created:     time.Now(),
+			Updated:     time.Now(),
+		}))
+	}
+	saveToken("stale-token")
 
 	manager := &Manager{
-		clients:          make(map[string]*managed.Client),
-		logger:           logger,
-		storage:          db,
-		secretResolver:   secret.NewResolver(),
-		tokenReconnect:   make(map[string]time.Time),
-		tokenFingerprint: make(map[string]string),
+		clients:           make(map[string]*managed.Client),
+		logger:            logger,
+		storage:           db,
+		secretResolver:    secret.NewResolver(),
+		tokenReconnect:    make(map[string]time.Time),
+		tokenFingerprints: make(map[string]string),
 	}
 
-	client, err := managed.NewClient(
-		serverConfig.Name,
-		serverConfig,
-		logger,
-		nil,
-		&config.Config{},
-		db,
-		secret.NewResolver(),
-	)
+	client, err := managed.NewClient("parked-server", serverConfig, logger, nil, &config.Config{}, db, secret.NewResolver())
 	require.NoError(t, err)
-	manager.clients[serverConfig.Name] = client
+	manager.clients["parked-server"] = client
 
-	client.StateManager.SetOAuthError(errors.New("OAuth authentication required"))
-	require.True(t, client.StateManager.IsOAuthError())
-	require.Equal(t, types.StateError, client.GetState())
+	// Park the client exactly as a deferred-OAuth connect failure would.
+	client.StateManager.SetPendingAuth(errors.New("OAuth authentication required for parked-server: login available via Web UI"))
 
-	return manager, client, db, serverConfig
-}
-
-// saveTestToken persists a token WITH a refresh token — the normal shape,
-// and the one that matters for the expired-token recovery case: mcp-go can
-// only refresh a token that has one.
-func saveTestToken(t *testing.T, db *storage.BoltDB, cfg *config.ServerConfig, accessToken string, expiresAt time.Time) {
-	t.Helper()
-	saveTestTokenWithRefresh(t, db, cfg, accessToken, "refresh-"+accessToken, expiresAt)
-}
-
-// saveTestTokenNoRefresh persists a token with NO refresh token — the
-// genuinely unrecoverable shape scanForNewTokens must skip when expired.
-func saveTestTokenNoRefresh(t *testing.T, db *storage.BoltDB, cfg *config.ServerConfig, accessToken string, expiresAt time.Time) {
-	t.Helper()
-	saveTestTokenWithRefresh(t, db, cfg, accessToken, "", expiresAt)
-}
-
-func saveTestTokenWithRefresh(t *testing.T, db *storage.BoltDB, cfg *config.ServerConfig, accessToken, refreshToken string, expiresAt time.Time) {
-	t.Helper()
-	serverKey := oauth.GenerateServerKey(cfg.Name, cfg.URL)
-	token := &storage.OAuthTokenRecord{
-		ServerName:   serverKey,
-		DisplayName:  cfg.Name,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		TokenType:    "Bearer",
-		ExpiresAt:    expiresAt,
-		Created:      time.Now(),
-		Updated:      time.Now(),
+	// A triggered scan calls RetryConnection, which reconnects in the background
+	// (the dial is refused immediately, but not synchronously). Wait for the
+	// client to settle back into a state the scan considers before the next leg,
+	// otherwise a leg can land while it is still Connecting and be skipped for a
+	// reason the test is not about.
+	settled := func() {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			st := client.GetState()
+			return st == types.StatePendingAuth || st == types.StateError
+		}, 30*time.Second, 10*time.Millisecond, "client never settled into a scannable state")
 	}
-	require.NoError(t, db.SaveOAuthToken(token))
-}
+	// Pretend the per-server rate limit has expired so it cannot mask the result.
+	expireRateLimit := func() {
+		t.Helper()
+		settled()
+		manager.tokenReconnect["parked-server"] = time.Now().Add(-time.Minute)
+	}
 
-// TestScanForNewTokens_SkipsExpiredTokenWithNoRefreshToken asserts that an
-// expired, persisted token with NO refresh token — genuinely unrecoverable,
-// since mcp-go cannot refresh a token that has no refresh token — does not
-// clear the OAuth-error gate or trigger a reconnect (D4/R4).
-func TestScanForNewTokens_SkipsExpiredTokenWithNoRefreshToken(t *testing.T) {
-	manager, client, db, cfg := newScanTestManager(t, "test-scan-expired-no-refresh")
-	saveTestTokenNoRefresh(t, db, cfg, "expired-access-token", time.Now().Add(-1*time.Hour))
-
+	expireRateLimit()
 	manager.scanForNewTokens()
+	require.WithinDuration(t, time.Now(), manager.tokenReconnect["parked-server"], time.Second,
+		"first scan must retry with the stored token")
+	require.NotEmpty(t, manager.tokenFingerprints["parked-server"])
 
-	assert.True(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must NOT clear the OAuth-error flag for an expired token with no refresh token")
-	assert.Empty(t, manager.tokenFingerprint,
-		"the expiry+no-refresh skip must happen before recording a fingerprint, so it can't poison the unchanged-token gate")
-}
-
-// TestScanForNewTokens_FiresOnExpiredTokenWithRefreshToken asserts that an
-// expired access token that STILL HAS a refresh token fires once. This is
-// the normal overnight case: the daemon survives a laptop sleep, tokens
-// expire mid-run, and RetryConnection's Connect drives mcp-go's
-// getValidToken to perform the refresh grant with no user action.
-//
-// RefreshManager does not cover this at runtime — it only refreshes
-// already-expired tokens during daemon startup (executeStartupRefreshes);
-// its runtime scheduling path explicitly skips a token that's already
-// expired. Every other reconnect path (ConnectAll, the runtime ticker,
-// supervisor reconcile) is gated on IsOAuthError. So scanForNewTokens is the
-// only lazy recovery for this case — treating "expired" as always-skip
-// (an earlier, over-broad version of this gate) would leave these servers
-// dead until a manual `auth login`.
-func TestScanForNewTokens_FiresOnExpiredTokenWithRefreshToken(t *testing.T) {
-	manager, client, db, cfg := newScanTestManager(t, "test-scan-expired-with-refresh")
-	saveTestToken(t, db, cfg, "expired-access-token", time.Now().Add(-1*time.Hour))
-
+	// Same token, rate limit expired: must NOT redial again.
+	expireRateLimit()
+	before := manager.tokenReconnect["parked-server"]
 	manager.scanForNewTokens()
+	require.Equal(t, before, manager.tokenReconnect["parked-server"],
+		"scan redialed a parked server for a token it had already tried")
 
-	assert.False(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must still fire once for an expired token that has a refresh token, so Connect can refresh it")
-	assert.Equal(t, tokenFingerprint("expired-access-token"), manager.tokenFingerprint[cfg.Name],
-		"the fingerprint must be recorded so a later scan on this same token — refreshed or not — doesn't refire")
-}
-
-// TestScanForNewTokens_SkipsUnchangedToken is the test carrying the entire
-// anti-storm guarantee: once scanForNewTokens has acted on a token
-// (recovered it, or made the one doomed attempt on a token whose refresh
-// token also turned out to be dead), it must never act on that same token
-// again. This — not the expiry check — is what stops D4: an expired token
-// with a refresh token is now deliberately allowed to fire (see
-// TestScanForNewTokens_FiresOnExpiredTokenWithRefreshToken), so nothing
-// but "already seen this exact fingerprint" bounds it to one attempt.
-//
-// Note: this seeds manager.tokenFingerprint directly to simulate "already
-// fired on this token", rather than driving two real scanForNewTokens calls
-// back-to-back. RetryConnection spawns a background goroutine
-// (Disconnect→Connect) that calls StateManager.Reset() — which clears
-// isOAuthError as a side effect of disconnecting, independent of anything
-// under test here — so a real first scan races that goroutine against a
-// synchronous second scan in the test. Seeding the fingerprint isolates the
-// gate itself from that unrelated timing.
-func TestScanForNewTokens_SkipsUnchangedToken(t *testing.T) {
-	manager, client, db, cfg := newScanTestManager(t, "test-scan-unchanged")
-	saveTestToken(t, db, cfg, "same-access-token", time.Now().Add(1*time.Hour))
-
-	// Simulate scanForNewTokens having already fired for this exact token on
-	// a prior tick.
-	manager.tokenFingerprint[cfg.Name] = tokenFingerprint("same-access-token")
-	oauthRetryCountBefore := client.StateManager.GetConnectionInfo().OAuthRetryCount
-
+	// A fresh token (login completed) must wake it.
+	saveToken("fresh-token")
+	expireRateLimit()
 	manager.scanForNewTokens()
+	require.WithinDuration(t, time.Now(), manager.tokenReconnect["parked-server"], time.Second,
+		"scan did not wake the parked server when a new token appeared")
 
-	// Not just "still errored": nothing about the OAuth-error state moved at
-	// all. If the gate had cleared and immediately re-set (e.g. a bug that
-	// fires, fails, and re-enters SetOAuthError), IsOAuthError() alone
-	// couldn't tell the difference from "never touched" — OAuthRetryCount
-	// can, since ClearOAuthError resets it to 0 and SetOAuthError increments
-	// it. Skipped and untouched must leave it exactly where it was.
-	assert.True(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must not re-fire for an unchanged token fingerprint")
-	assert.Equal(t, oauthRetryCountBefore, client.StateManager.GetConnectionInfo().OAuthRetryCount,
-		"an unchanged token must not touch the OAuth-error state at all, not even clear-then-immediately-re-set")
-	assert.Equal(t, tokenFingerprint("same-access-token"), manager.tokenFingerprint[cfg.Name],
-		"the recorded fingerprint itself must be untouched by a skipped scan")
-}
-
-// TestScanForNewTokens_FiresOnRotatedToken asserts that when the persisted
-// token's fingerprint differs from the last one this server fired on (a
-// genuinely new token, e.g. after another `auth login`), the scan fires
-// again. See TestScanForNewTokens_SkipsUnchangedToken for why the "prior
-// fingerprint" is seeded directly instead of produced by a real first scan.
-func TestScanForNewTokens_FiresOnRotatedToken(t *testing.T) {
-	manager, client, db, cfg := newScanTestManager(t, "test-scan-rotated")
-
-	// Simulate scanForNewTokens having already fired on an older token.
-	manager.tokenFingerprint[cfg.Name] = tokenFingerprint("old-access-token")
-
-	// A rotated token: different access token, still unexpired.
-	saveTestToken(t, db, cfg, "new-access-token", time.Now().Add(1*time.Hour))
-
+	// A re-login that happens to persist a byte-identical token is still a new
+	// write, and this scan is the fallback wake when the CLI could not record an
+	// OAuth completion event — it must not be swallowed. SaveOAuthToken stamps
+	// Updated with the wall clock, so give it a distinct instant.
+	time.Sleep(2 * time.Millisecond)
+	saveToken("fresh-token")
+	expireRateLimit()
 	manager.scanForNewTokens()
-
-	assert.False(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must fire again when the token fingerprint changes")
-	assert.Equal(t, tokenFingerprint("new-access-token"), manager.tokenFingerprint[cfg.Name],
-		"scanForNewTokens must record the fingerprint it fired on, so a future unchanged scan can be gated")
-}
-
-// TestScanForNewTokens_ZeroExpiryStillFires asserts that a persisted token
-// with a zero ExpiresAt (expiry unknown, as observed live for notiongusto
-// and gmailgusto) is treated as usable, not expired, and still fires the
-// post-login self-heal.
-func TestScanForNewTokens_ZeroExpiryStillFires(t *testing.T) {
-	manager, client, db, cfg := newScanTestManager(t, "test-scan-zero-expiry")
-	saveTestToken(t, db, cfg, "zero-expiry-access-token", time.Time{})
-
-	manager.scanForNewTokens()
-
-	assert.False(t, client.StateManager.IsOAuthError(),
-		"scanForNewTokens must treat a zero ExpiresAt as unknown, not expired, and still fire")
-	assert.Equal(t, tokenFingerprint("zero-expiry-access-token"), manager.tokenFingerprint[cfg.Name],
-		"a zero-expiry token that fires must still be recorded, so a later unchanged scan is gated")
+	require.WithinDuration(t, time.Now(), manager.tokenReconnect["parked-server"], time.Second,
+		"scan ignored an identically-rewritten token")
 }

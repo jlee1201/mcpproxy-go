@@ -61,6 +61,16 @@ type Supervisor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// actionWg tracks in-flight reconcile action goroutines (Connect/Disconnect/
+	// Reconnect/Remove). Stop() drains it BEFORE disconnecting upstream clients so
+	// a Connect can never overlap a Disconnect on the same client (root fix for the
+	// MCP-770 race cascade, MCP-783, hand-ported from upstream #558 -- a prerequisite
+	// our fork's lineage never had). stopping (guarded by stateMu) gates dispatch
+	// so no new action is added once Stop() begins -- preventing a WaitGroup
+	// Add-after-Wait.
+	actionWg sync.WaitGroup
+	stopping bool
 }
 
 // inspectionFailureInfo tracks inspection failures for circuit breaker pattern
@@ -79,8 +89,7 @@ type UpstreamInterface interface {
 	ConnectAll(ctx context.Context) error
 	GetServerState(name string) (*ServerState, error)
 	GetAllStates() map[string]*ServerState
-	IsUserLoggedOut(name string) bool     // Returns true if user explicitly logged out (prevents auto-reconnect)
-	ShouldSkipReconnect(name string) bool // Returns true if server should not be auto-reconnected (OAuth error or backoff active)
+	IsUserLoggedOut(name string) bool // Returns true if user explicitly logged out (prevents auto-reconnect)
 	Subscribe() <-chan Event
 	Unsubscribe(ch <-chan Event)
 	Close()
@@ -320,7 +329,17 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 	s.logger.Debug("Starting reconciliation",
 		zap.Int("desired_servers", configSnapshot.ServerCount()))
 
-	plan := s.computeReconcilePlan(configSnapshot)
+	plan := s.computeReconcilePlan(configSnapshot, liveStates)
+
+	// MCP-783: once Stop() has begun (stopping set under stateMu), do not dispatch
+	// new action goroutines. This keeps all actionWg.Add calls strictly ordered
+	// before Stop()'s actionWg.Wait (no Add-after-Wait) and guarantees no Connect
+	// can start after we begin draining for disconnect.
+	if s.stopping {
+		s.logger.Debug("Supervisor stopping, skipping reconcile action dispatch")
+		s.updateSnapshot(configSnapshot, liveStates)
+		return nil
+	}
 
 	// Phase 6 Fix: Execute actions asynchronously to prevent blocking
 	// Each action runs in its own goroutine with timeout
@@ -331,8 +350,12 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 		}
 
 		actionCount++
-		// Launch each action in a goroutine - no waiting!
+		// Launch each action in a goroutine. Tracked by actionWg (Add under
+		// stateMu, before the goroutine starts) so Stop() can drain in-flight
+		// actions before disconnecting clients (MCP-783).
+		s.actionWg.Add(1)
 		go func(name string, act ReconcileAction, snapshot *configsvc.Snapshot) {
+			defer s.actionWg.Done()
 			if err := s.executeAction(name, act, snapshot); err != nil {
 				s.logger.Error("Failed to execute action",
 					zap.String("server", name),
@@ -356,8 +379,13 @@ func (s *Supervisor) reconcile(configSnapshot *configsvc.Snapshot) error {
 	return nil
 }
 
-// computeReconcilePlan determines what actions need to be taken.
-func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *ReconcilePlan {
+// computeReconcilePlan determines what actions need to be taken. actualStates
+// is the live per-server state fetched fresh at the top of reconcile() (see
+// its call site) -- deliberately NOT s.CurrentSnapshot(), which at this point
+// in the call still holds the *previous* reconcile's snapshot (updateSnapshot
+// runs after this call returns) and would make the retry-backoff check below
+// evaluate against one-cycle-stale ConnectionInfo.
+func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot, actualStates map[string]*ServerState) *ReconcilePlan {
 	plan := &ReconcilePlan{
 		Actions:   make(map[string]ReconcileAction),
 		Timestamp: time.Now(),
@@ -389,10 +417,20 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *R
 				plan.Actions[name] = ActionReconnect
 			} else if desiredServer.Enabled && (!desiredServer.Quarantined || s.IsInspectionExempted(name)) && !currentState.Connected {
 				// Should be connected but isn't (or has inspection exemption)
-				// Don't auto-reconnect if user explicitly logged out or backoff is active
+				// BUT: Don't auto-reconnect if user explicitly logged out
 				if s.upstream.IsUserLoggedOut(name) {
 					plan.Actions[name] = ActionNone
-				} else if s.upstream.ShouldSkipReconnect(name) {
+				} else if actual, ok := actualStates[name]; ok && actual.ConnectionInfo != nil && !actual.ConnectionInfo.ShouldAutoReconnect(time.Now()) {
+					// Respect the client's retry policy: exponential backoff after
+					// consecutive failures, the coarse OAuth ladder, half-hourly
+					// probes once the client gave up, and PendingAuth servers
+					// parked waiting on user OAuth login. Without this gate the
+					// periodic 30s reconciliation re-dials a dead upstream forever,
+					// hammering the remote server (~3 requests per tick).
+					s.logger.Debug("Skipping auto-reconnect (backoff/pending-auth)",
+						zap.String("server", name),
+						zap.String("state", actual.ConnectionInfo.State.String()),
+						zap.Int("retry_count", actual.ConnectionInfo.RetryCount))
 					plan.Actions[name] = ActionNone
 				} else {
 					plan.Actions[name] = ActionConnect
@@ -1135,11 +1173,33 @@ func (s *Supervisor) emitEvent(event Event) {
 	}
 }
 
+// actionDrainTimeout bounds how long Stop() waits for in-flight reconcile action
+// goroutines to finish before disconnecting clients. It exceeds the per-action
+// context timeout (executeAction, 30s) so a well-behaved action that observes the
+// cancelled context returns first; the timeout is only a backstop against a wedged
+// Connect so shutdown can't hang forever.
+const actionDrainTimeout = 35 * time.Second
+
 // Stop gracefully stops the supervisor.
 func (s *Supervisor) Stop() {
 	s.logger.Info("Stopping supervisor")
+
+	// MCP-783: mark stopping under stateMu so reconcile() dispatches no further
+	// action goroutines. Serializing on stateMu (the same lock reconcile holds
+	// while dispatching) ensures every actionWg.Add has happened before the
+	// drain below.
+	s.stateMu.Lock()
+	s.stopping = true
+	s.stateMu.Unlock()
+
 	s.cancel()
 	s.wg.Wait()
+
+	// Drain in-flight reconcile actions (Connect/Disconnect/...) BEFORE
+	// disconnecting upstream clients. Without this, ShutdownAll -> Disconnect
+	// overlaps an in-flight Connect on the same client -- the root of the
+	// MCP-770 race cascade (MCP-783, hand-ported from upstream #558).
+	s.drainActions()
 
 	// Close upstream adapter
 	s.upstream.Close()
@@ -1153,6 +1213,27 @@ func (s *Supervisor) Stop() {
 	s.eventMu.Unlock()
 
 	s.logger.Info("Supervisor stopped")
+}
+
+// drainActions waits for in-flight reconcile action goroutines to finish,
+// bounded by actionDrainTimeout. Called from Stop() before disconnecting
+// clients so a Connect can never overlap a Disconnect on the same client
+// (MCP-783).
+func (s *Supervisor) drainActions() {
+	done := make(chan struct{})
+	go func() {
+		s.actionWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.logger.Debug("Drained in-flight reconcile actions before disconnect")
+	case <-time.After(actionDrainTimeout):
+		s.logger.Warn("Timed out draining in-flight reconcile actions before disconnect; "+
+			"proceeding to disconnect (a Connect may still be in flight)",
+			zap.Duration("timeout", actionDrainTimeout))
+	}
 }
 
 // RequestInspectionExemption grants temporary connection permission for a quarantined server.
