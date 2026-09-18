@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestConnectionState_String tests the string representation of connection states
@@ -118,6 +119,25 @@ func TestResetForReconnect_PreservesRetryCount(t *testing.T) {
 	assert.Equal(t, StateDisconnected, info.State)
 	assert.Equal(t, 5, info.RetryCount, "retryCount must be preserved across reconnect")
 	assert.Nil(t, info.LastError, "lastError should be cleared")
+}
+
+func TestResetForReconnect_ClearsOAuthState(t *testing.T) {
+	sm := NewStateManager()
+
+	// Simulate a prior OAuth-authorization-required failure.
+	sm.SetOAuthError(errors.New("oauth authorization required"))
+	require.True(t, sm.IsOAuthError())
+	require.Greater(t, sm.GetConnectionInfo().OAuthRetryCount, 0)
+
+	// A fresh token just landed and a reconnect is about to be attempted.
+	sm.ResetForReconnect()
+
+	info := sm.GetConnectionInfo()
+	assert.False(t, info.IsOAuthError,
+		"ResetForReconnect must clear isOAuthError -- otherwise a subsequent non-OAuth "+
+			"SetError() (which never touches isOAuthError) leaves it stuck true, and "+
+			"ShouldRetryOAuth() misclassifies a plain connectivity failure as still OAuth-blocked")
+	assert.Equal(t, 0, info.OAuthRetryCount, "oauthRetryCount must be cleared alongside isOAuthError")
 }
 
 func TestReset_ClearsRetryCount(t *testing.T) {

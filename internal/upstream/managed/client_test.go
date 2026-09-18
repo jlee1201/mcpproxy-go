@@ -197,3 +197,125 @@ func TestBackgroundHealthCheck_HasNoPeriodicPoll(t *testing.T) {
 
 	assert.True(t, sawStopReceive, "backgroundHealthCheck must receive on mc.stopMonitoring -- that's the only thing it should wait on")
 }
+
+// TestOAuthAuthorizationRequired_UsesExtendedBackoff is a source-level
+// regression guard for a bug found during the reconnect-storm backport
+// review: Connect()'s isOAuthAuthorizationRequired branch called
+// mc.StateManager.SetError(err) (the short default backoff ladder) instead
+// of SetOAuthError(err) (the 5min->24h extended OAuth ladder that
+// fork/main's equivalent branch already uses), silently defeating the PR's
+// own anti-reconnect-storm goal for exactly the OAuth-blocked-server case
+// (#1013/#1039).
+//
+// mc.coreClient is a concrete *core.Client with no fake/mock seam, so there
+// is no way to deterministically drive Connect() into this branch with a
+// real network call. A test that instead calls
+// mc.StateManager.SetOAuthError(...) directly and asserts IsOAuthError()
+// would pass whether or not Connect() itself ever calls SetOAuthError --
+// i.e. it can't fail on the actual regression. So this asserts the shape at
+// the source level instead: the if-block guarded by
+// mc.isOAuthAuthorizationRequired(err) inside Connect() must call
+// StateManager.SetOAuthError and must NOT call StateManager.SetError.
+func TestOAuthAuthorizationRequired_UsesExtendedBackoff(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "client.go", nil, 0)
+	require.NoError(t, err, "parse client.go")
+
+	var connectFn *ast.FuncDecl
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Recv != nil && fn.Name.Name == "Connect" {
+			connectFn = fn
+			break
+		}
+	}
+	require.NotNil(t, connectFn, "Connect FuncDecl not found in client.go -- did it get renamed?")
+
+	var oauthRequiredBranch *ast.BlockStmt
+	ast.Inspect(connectFn.Body, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		call, ok := ifStmt.Cond.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if ok && sel.Sel.Name == "isOAuthAuthorizationRequired" {
+			oauthRequiredBranch = ifStmt.Body
+		}
+		return true
+	})
+	require.NotNil(t, oauthRequiredBranch,
+		"no `if mc.isOAuthAuthorizationRequired(err)` branch found in Connect() -- did it get renamed or restructured?")
+
+	sawSetOAuthError := false
+	sawSetError := false
+	ast.Inspect(oauthRequiredBranch, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "SetOAuthError":
+			sawSetOAuthError = true
+		case "SetError":
+			sawSetError = true
+		}
+		return true
+	})
+
+	assert.True(t, sawSetOAuthError,
+		"the isOAuthAuthorizationRequired branch must call StateManager.SetOAuthError to use the extended OAuth backoff ladder")
+	assert.False(t, sawSetError,
+		"the isOAuthAuthorizationRequired branch must not call StateManager.SetError -- that's the short default ladder this fix replaces")
+}
+
+// TestTryReconnect_PreservesRetryCountAcrossFailures locks in a second
+// regression found during the same review: tryReconnect() (the sole caller
+// of which is ForceReconnect, triggered e.g. by RefreshManager's
+// oauth_token_refresh event) called mc.StateManager.Reset() before
+// reconnecting, which zeroes retryCount/lastRetryTime immediately -- the
+// exact state ResetForReconnect() exists to preserve across a reconnect
+// attempt so exponential backoff isn't defeated. ResetForReconnect already
+// had a StateManager-level unit test (TestResetForReconnect_PreservesRetryCount
+// in internal/upstream/types), but nothing exercised the actual production
+// call site, so the regression (using plain Reset() there instead) shipped
+// silently.
+//
+// Uses an empty ServerConfig so mc.coreClient.Connect fails fast and
+// deterministically (empty Command -> stdio transport -> immediate exec
+// error), never touching the network.
+func TestTryReconnect_PreservesRetryCountAcrossFailures(t *testing.T) {
+	cfg := &config.ServerConfig{Name: "test-reconnect-backoff"}
+	mc, err := NewClient("test-reconnect-backoff", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	// Simulate 3 prior failed attempts, as ConnectAll/RetryConnection's
+	// backoff loop would have produced before ForceReconnect ever fires.
+	mc.StateManager.SetError(fmt.Errorf("prior failure"))
+	mc.StateManager.SetError(fmt.Errorf("prior failure"))
+	mc.StateManager.SetError(fmt.Errorf("prior failure"))
+	require.Equal(t, 3, mc.StateManager.GetConnectionInfo().RetryCount)
+
+	// Now simulate the realistic trigger for tryReconnect: the server was
+	// previously OAuth-blocked, and a fresh token just arrived (the
+	// oauth_token_refresh event that drives ForceReconnect -> tryReconnect).
+	mc.StateManager.SetOAuthError(fmt.Errorf("oauth authorization required"))
+	require.True(t, mc.StateManager.IsOAuthError())
+
+	// tryReconnect is unexported; called directly (synchronously, not via
+	// `go mc.tryReconnect()`) so the assertion below isn't racing it.
+	mc.tryReconnect()
+
+	info := mc.StateManager.GetConnectionInfo()
+	assert.Equal(t, 4, info.RetryCount,
+		"retryCount must carry the prior 3 failures forward (+1 for this attempt's failure) -- "+
+			"the old Reset()-based code would have zeroed it to 0 before Connect(), landing on 1 instead")
+	assert.False(t, mc.StateManager.IsOAuthError(),
+		"tryReconnect's fresh Connect() attempt failed for a non-OAuth reason (empty config -> stdio "+
+			"exec error), so the stale isOAuthError=true from before this reconnect must not survive -- "+
+			"otherwise ShouldRetryOAuth() would misclassify this plain connectivity failure as still "+
+			"OAuth-blocked and park it behind the 5min->24h OAuth ladder instead of the normal one")
+}

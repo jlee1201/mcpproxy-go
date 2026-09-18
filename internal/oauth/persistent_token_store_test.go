@@ -416,3 +416,115 @@ func TestPersistentTokenStoreSameNameDifferentURL(t *testing.T) {
 		t.Errorf("Server2 token should still exist: got %s, want token-for-server2-url", retrievedToken2Again.AccessToken)
 	}
 }
+
+// TestPeekToken_ReturnsRawExpiresAt asserts PeekToken returns the persisted
+// record's ExpiresAt verbatim, unlike GetToken which subtracts
+// TokenRefreshGracePeriod for mcp-go's proactive-refresh benefit. Callers
+// asking "is there a new token" (scanForNewTokens) need the real expiry.
+func TestPeekToken_ReturnsRawExpiresAt(t *testing.T) {
+	tmpDir := t.TempDir()
+	logger := zap.NewNop().Sugar()
+	db, err := storage.NewBoltDB(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("Failed to create BoltDB: %v", err)
+	}
+	defer db.Close()
+
+	store := NewPersistentTokenStore("peek-server", "https://peek.example.com/mcp", db).(*PersistentTokenStore)
+
+	rawExpiry := time.Now().Add(10 * time.Minute) // inside the 5-minute grace period
+	if err := store.SaveToken(context.Background(), &client.Token{
+		AccessToken:  "peek-access-token",
+		RefreshToken: "peek-refresh-token",
+		TokenType:    "Bearer",
+		ExpiresAt:    rawExpiry,
+		Scope:        "mcp.read",
+	}); err != nil {
+		t.Fatalf("Failed to save token: %v", err)
+	}
+
+	peeked, err := store.PeekToken(context.Background())
+	if err != nil {
+		t.Fatalf("PeekToken failed: %v", err)
+	}
+	if !peeked.ExpiresAt.Equal(rawExpiry) {
+		t.Errorf("PeekToken must return the raw ExpiresAt: got %v, want %v", peeked.ExpiresAt, rawExpiry)
+	}
+
+	// GetToken, by contrast, applies the grace-period adjustment.
+	got, err := store.GetToken(context.Background())
+	if err != nil {
+		t.Fatalf("GetToken failed: %v", err)
+	}
+	if got.ExpiresAt.Equal(rawExpiry) {
+		t.Errorf("GetToken should apply the grace-period adjustment, not return the raw ExpiresAt")
+	}
+}
+
+// TestPeekToken_ZeroExpiryPreserved asserts PeekToken returns a zero
+// ExpiresAt as-is (expiry unknown), never substituting or adjusting it.
+func TestPeekToken_ZeroExpiryPreserved(t *testing.T) {
+	tmpDir := t.TempDir()
+	logger := zap.NewNop().Sugar()
+	db, err := storage.NewBoltDB(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("Failed to create BoltDB: %v", err)
+	}
+	defer db.Close()
+
+	store := NewPersistentTokenStore("peek-zero-server", "https://peek-zero.example.com/mcp", db).(*PersistentTokenStore)
+
+	if err := store.SaveToken(context.Background(), &client.Token{
+		AccessToken: "zero-expiry-token",
+		TokenType:   "Bearer",
+		ExpiresAt:   time.Time{},
+	}); err != nil {
+		t.Fatalf("Failed to save token: %v", err)
+	}
+
+	peeked, err := store.PeekToken(context.Background())
+	if err != nil {
+		t.Fatalf("PeekToken failed: %v", err)
+	}
+	if !peeked.ExpiresAt.IsZero() {
+		t.Errorf("PeekToken must preserve a zero ExpiresAt: got %v", peeked.ExpiresAt)
+	}
+}
+
+// TestPeekToken_DoesNotElectRefreshLeader asserts that PeekToken on an
+// expired token with a refresh token present does not enter the
+// coalesceRefresh leader/follower election (D5): scanForNewTokens elected
+// itself leader via GetToken, never completed (nothing downstream calls
+// SaveToken), and held the lease until the 30s stale-lease takeover,
+// starving real refreshers. PeekToken must never touch refreshWait.
+func TestPeekToken_DoesNotElectRefreshLeader(t *testing.T) {
+	tmpDir := t.TempDir()
+	logger := zap.NewNop().Sugar()
+	db, err := storage.NewBoltDB(tmpDir, logger)
+	if err != nil {
+		t.Fatalf("Failed to create BoltDB: %v", err)
+	}
+	defer db.Close()
+
+	store := NewPersistentTokenStore("peek-leader-server", "https://peek-leader.example.com/mcp", db).(*PersistentTokenStore)
+
+	if err := store.SaveToken(context.Background(), &client.Token{
+		AccessToken:  "expiring-access-token",
+		RefreshToken: "has-a-refresh-token",
+		TokenType:    "Bearer",
+		ExpiresAt:    time.Now().Add(-1 * time.Hour), // expired, with a refresh token present
+	}); err != nil {
+		t.Fatalf("Failed to save token: %v", err)
+	}
+
+	if _, err := store.PeekToken(context.Background()); err != nil {
+		t.Fatalf("PeekToken failed: %v", err)
+	}
+
+	store.refreshMu.Lock()
+	held := store.refreshWait != nil
+	store.refreshMu.Unlock()
+	if held {
+		t.Error("PeekToken must not elect itself refresh leader or hold the coalescing lease")
+	}
+}

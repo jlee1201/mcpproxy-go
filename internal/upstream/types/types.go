@@ -513,6 +513,14 @@ func (sm *StateManager) Reset() {
 // ResetForReconnect transitions to Disconnected state for a reconnection attempt
 // while PRESERVING retryCount and lastRetryTime so exponential backoff is not defeated.
 // Use this instead of Reset() when retrying a failed connection.
+//
+// OAuth state (isOAuthError/oauthRetryCount/lastOAuthAttempt) is cleared, not
+// preserved: the caller is about to attempt a fresh Connect(), and if that
+// attempt fails for a *non*-OAuth reason, the subsequent SetError() call does
+// not touch isOAuthError -- so a stale true from before this reconnect would
+// otherwise survive and make ShouldRetryOAuth() misclassify a plain
+// connectivity failure as still OAuth-blocked, parking it behind the 5min->24h
+// OAuth ladder instead of the normal one.
 func (sm *StateManager) ResetForReconnect() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -523,6 +531,9 @@ func (sm *StateManager) ResetForReconnect() {
 	// Preserve: retryCount, lastRetryTime -- these drive exponential backoff
 	sm.serverName = ""
 	sm.serverVersion = ""
+	sm.lastOAuthAttempt = time.Time{}
+	sm.oauthRetryCount = 0
+	sm.isOAuthError = false
 
 	info := ConnectionInfo{
 		State:            sm.currentState,

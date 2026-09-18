@@ -176,8 +176,10 @@ func (mc *Client) Connect(ctx context.Context) error {
 			mc.logger.Info("🎯 OAuth authorization required during MCP initialization",
 				zap.String("server", mc.Config.Name),
 				zap.Bool("token_refresh_scenario", isRefreshScenario))
-			// Don't apply backoff for OAuth authorization requirement
-			mc.StateManager.SetError(err)
+			// Use OAuth extended backoff -- can't auto-complete without user
+			// browser action, so the short default ladder would just redial a
+			// login-blocked server (#1013/#1039).
+			mc.StateManager.SetOAuthError(err)
 			return fmt.Errorf("OAuth authorization during MCP init failed: %w", err)
 		} else if mc.isOAuthError(err) {
 			// Check if this is a token refresh scenario vs full re-auth
@@ -759,8 +761,11 @@ func (mc *Client) tryReconnect() {
 			zap.Error(err))
 	}
 
-	// Reset state to disconnected before attempting reconnection
-	mc.StateManager.Reset()
+	// Reset state to disconnected before attempting reconnection. Use
+	// ResetForReconnect (not Reset) so retryCount/lastRetryTime survive --
+	// otherwise every ForceReconnect-driven attempt restarts exponential
+	// backoff from zero, defeating the anti-reconnect-storm goal.
+	mc.StateManager.ResetForReconnect()
 
 	// Attempt to reconnect using the existing Connect method
 	// The Connect method already handles state transitions and error management
