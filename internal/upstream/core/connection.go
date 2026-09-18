@@ -3020,13 +3020,20 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 	// must not wait on WaitForFlow; it fails the same way isOAuthInProgress
 	// above already does.
 	coordinator := oauth.GetGlobalCoordinator()
-	if _, startErr := coordinator.StartFlow(c.config.Name); startErr != nil {
+	flowCtx, startErr := coordinator.StartFlow(c.config.Name)
+	if startErr != nil {
 		c.logger.Warn("⚠️ OAuth authorization already in progress (coordinator)",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", result.CorrelationID))
 		return result, fmt.Errorf("OAuth authorization already in progress for %s", c.config.Name)
 	}
 
+	// flowCtx.CorrelationID is the coordinator's own flow-ownership token -
+	// distinct from result.CorrelationID (generated above purely for this
+	// call's logs/API response). EndFlow's staleness guard matches on the
+	// former, so it - not result.CorrelationID - must flow into every
+	// EndFlow call below and into the handoff to waitForOAuthCallbackAsync.
+	//
 	// We own this flow until either an early return below ends it ourselves,
 	// or we successfully hand it off to waitForOAuthCallbackAsync (which then
 	// owns EndFlow itself - see handedOff below and that function's own
@@ -3036,7 +3043,7 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			coordinator.EndFlow(c.config.Name, err == nil, err)
+			coordinator.EndFlow(c.config.Name, flowCtx.CorrelationID, err == nil, err)
 		}
 	}()
 
@@ -3112,7 +3119,7 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 		// calls EndFlow itself once the callback wait is done. Must be set
 		// before spawning, so our own defer above knows not to double-end it.
 		handedOff = true
-		go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID)
+		go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID, flowCtx.CorrelationID)
 
 		return result, nil
 	}
@@ -3137,7 +3144,7 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 	// Hand coordinator flow ownership to the background goroutine - see the
 	// HEADLESS branch above for why handedOff must be set before spawning.
 	handedOff = true
-	go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID)
+	go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID, flowCtx.CorrelationID)
 
 	return result, nil
 }
@@ -3307,7 +3314,16 @@ func (c *Client) getAuthorizationURLQuick(ctx context.Context, oauthConfig *clie
 // StartOAuthFlowQuick hands this goroutine ownership of the global coordinator
 // flow it started (see handedOff there), so this function - not its caller -
 // is responsible for ending it.
-func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *uptransport.OAuthHandler, codeVerifier, state, correlationID string) {
+//
+// correlationID is the user/API-facing ID (StartOAuthFlowQuick's
+// result.CorrelationID) used only for this function's own log lines, so
+// log correlation with the API response is unaffected by this parameter.
+// flowCorrelationID is the coordinator's own flow-ownership token
+// (flowCtx.CorrelationID from the StartFlow call this function was handed
+// off from) - EndFlow's staleness guard matches on this, not correlationID,
+// so passing the wrong one here would make EndFlow silently no-op and leak
+// the flow until the expiry timer reaps it.
+func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *uptransport.OAuthHandler, codeVerifier, state, correlationID, flowCorrelationID string) {
 	// Registered first so it fires LAST (defers run LIFO): after the
 	// oauthInProgress reset below and after Unregister(state), so a sibling
 	// waiting on WaitForFlow only wakes once our local state and the
@@ -3315,7 +3331,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 	var flowErr error
 	coordinator := oauth.GetGlobalCoordinator()
 	defer func() {
-		coordinator.EndFlow(c.config.Name, flowErr == nil, flowErr)
+		coordinator.EndFlow(c.config.Name, flowCorrelationID, flowErr == nil, flowErr)
 	}()
 
 	c.markOAuthInProgress()
@@ -3457,7 +3473,7 @@ func (c *Client) ForceOAuthFlowWithResult(ctx context.Context) (*OAuthStartResul
 	var oauthErr error
 	defer func() {
 		success := oauthErr == nil
-		coordinator.EndFlow(c.config.Name, success, oauthErr)
+		coordinator.EndFlow(c.config.Name, flowCtx.CorrelationID, success, oauthErr)
 	}()
 	ctx = oauth.WithFlowContext(ctx, flowCtx)
 

@@ -79,8 +79,7 @@ type UpstreamInterface interface {
 	ConnectAll(ctx context.Context) error
 	GetServerState(name string) (*ServerState, error)
 	GetAllStates() map[string]*ServerState
-	IsUserLoggedOut(name string) bool     // Returns true if user explicitly logged out (prevents auto-reconnect)
-	ShouldSkipReconnect(name string) bool // Returns true if server should not be auto-reconnected (OAuth error or backoff active)
+	IsUserLoggedOut(name string) bool // Returns true if user explicitly logged out (prevents auto-reconnect)
 	Subscribe() <-chan Event
 	Unsubscribe(ch <-chan Event)
 	Close()
@@ -389,10 +388,8 @@ func (s *Supervisor) computeReconcilePlan(configSnapshot *configsvc.Snapshot) *R
 				plan.Actions[name] = ActionReconnect
 			} else if desiredServer.Enabled && (!desiredServer.Quarantined || s.IsInspectionExempted(name)) && !currentState.Connected {
 				// Should be connected but isn't (or has inspection exemption)
-				// Don't auto-reconnect if user explicitly logged out or backoff is active
+				// BUT: Don't auto-reconnect if user explicitly logged out
 				if s.upstream.IsUserLoggedOut(name) {
-					plan.Actions[name] = ActionNone
-				} else if s.upstream.ShouldSkipReconnect(name) {
 					plan.Actions[name] = ActionNone
 				} else {
 					plan.Actions[name] = ActionConnect

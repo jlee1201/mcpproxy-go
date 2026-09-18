@@ -63,13 +63,13 @@ func TestForceOAuthFlowWithResult_WaitAndReuse_SiblingSucceeds(t *testing.T) {
 	client := newTestOAuthClient(t, serverName)
 	coordinator := oauth.GetGlobalCoordinator()
 
-	_, err := coordinator.StartFlow(serverName)
+	flowCtx, err := coordinator.StartFlow(serverName)
 	require.NoError(t, err)
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	t.Cleanup(func() { coordinator.EndFlow(serverName, flowCtx.CorrelationID, false, nil) })
 
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		coordinator.EndFlow(serverName, true, nil)
+		coordinator.EndFlow(serverName, flowCtx.CorrelationID, true, nil)
 	}()
 
 	// Short ctx: pre-fix this call ignores the coordinator and heads straight
@@ -90,14 +90,14 @@ func TestForceOAuthFlowWithResult_WaitAndReuse_SiblingFails(t *testing.T) {
 	client := newTestOAuthClient(t, serverName)
 	coordinator := oauth.GetGlobalCoordinator()
 
-	_, err := coordinator.StartFlow(serverName)
+	flowCtx, err := coordinator.StartFlow(serverName)
 	require.NoError(t, err)
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	t.Cleanup(func() { coordinator.EndFlow(serverName, flowCtx.CorrelationID, false, nil) })
 
 	siblingErr := fmt.Errorf("sibling flow: authorization denied")
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		coordinator.EndFlow(serverName, false, siblingErr)
+		coordinator.EndFlow(serverName, flowCtx.CorrelationID, false, siblingErr)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -115,11 +115,11 @@ func TestForceOAuthFlowWithResult_GivesUpOnStuckSibling(t *testing.T) {
 	client := newTestOAuthClient(t, serverName)
 	coordinator := oauth.GetGlobalCoordinator()
 
-	_, err := coordinator.StartFlow(serverName)
+	flowCtx, err := coordinator.StartFlow(serverName)
 	require.NoError(t, err)
 	// Sibling never completes - simulates a hung browser round-trip. Clean up
 	// so this doesn't leak a 10-minute stale entry into later tests.
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	t.Cleanup(func() { coordinator.EndFlow(serverName, flowCtx.CorrelationID, false, nil) })
 
 	// The caller's own ctx deadline (not the production ~5min bound) is what
 	// must cut this short - WaitForFlow's three-way select races ctx.Done()
@@ -140,7 +140,11 @@ func TestForceOAuthFlowWithResult_NoSibling_EndsOwnFlowOnFailure(t *testing.T) {
 	serverName := "test-force-oauth-no-sibling"
 	client := newTestOAuthClientAtURL(t, serverName, unusedLoopbackURL(t))
 	coordinator := oauth.GetGlobalCoordinator()
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	// No flow seeded here - the code under test starts and ends its own. This
+	// cleanup is a safety net only: EndFlow no-ops when no flow is active
+	// regardless of correlationID, so "" is fine if the assertion below ever
+	// fails and leaves a flow behind.
+	t.Cleanup(func() { coordinator.EndFlow(serverName, "", false, nil) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -164,7 +168,7 @@ func TestStartOAuthFlowQuick_FastFailsOnActiveSibling_WithoutDisturbingIt(t *tes
 
 	siblingFlow, err := coordinator.StartFlow(serverName)
 	require.NoError(t, err)
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	t.Cleanup(func() { coordinator.EndFlow(serverName, siblingFlow.CorrelationID, false, nil) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -185,7 +189,9 @@ func TestStartOAuthFlowQuick_NoSibling_EndsOwnFlowOnEarlyFailure(t *testing.T) {
 	serverName := "test-quick-oauth-no-sibling"
 	client := newTestOAuthClientAtURL(t, serverName, unusedLoopbackURL(t))
 	coordinator := oauth.GetGlobalCoordinator()
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	// No flow seeded here - the code under test starts and ends its own; see
+	// the comment on the analogous ForceOAuthFlowWithResult test above.
+	t.Cleanup(func() { coordinator.EndFlow(serverName, "", false, nil) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -208,9 +214,9 @@ func TestWaitForOAuthCallbackAsync_EndsHandedOffFlowOnCtxCancel(t *testing.T) {
 	client := newTestOAuthClient(t, serverName)
 	coordinator := oauth.GetGlobalCoordinator()
 
-	_, err := coordinator.StartFlow(serverName)
+	flowCtx, err := coordinator.StartFlow(serverName)
 	require.NoError(t, err)
-	t.Cleanup(func() { coordinator.EndFlow(serverName, false, nil) })
+	t.Cleanup(func() { coordinator.EndFlow(serverName, flowCtx.CorrelationID, false, nil) })
 
 	manager := oauth.GetGlobalCallbackManager()
 	_, err = manager.StartCallbackServer(serverName, 0)
@@ -223,7 +229,9 @@ func TestWaitForOAuthCallbackAsync_EndsHandedOffFlowOnCtxCancel(t *testing.T) {
 	// oauthHandler is nil: safe here because the ctx.Done() branch this test
 	// drives never dereferences it (only the success branch, deep inside the
 	// channel-received case, calls oauthHandler.ProcessAuthorizationResponse).
-	client.waitForOAuthCallbackAsync(ctx, nil, "test-verifier", "test-state", "test-correlation")
+	// "test-correlation" is the log-only ID; flowCtx.CorrelationID is the real
+	// coordinator flow-ownership token EndFlow's staleness guard checks.
+	client.waitForOAuthCallbackAsync(ctx, nil, "test-verifier", "test-state", "test-correlation", flowCtx.CorrelationID)
 
 	assert.False(t, coordinator.IsFlowActive(serverName), "must end the flow handed to it once its own wait is done, not leak it")
 }

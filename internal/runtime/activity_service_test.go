@@ -1,13 +1,101 @@
 package runtime
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 )
+
+// TestNew_WiresActivityRetentionConfigThroughToService is the wiring-level
+// counterpart to the two SetRetentionConfig unit tests below: it drives the
+// real New() constructor (see runtime.go) end-to-end instead of hand-calling
+// SetRetentionConfig with a copy-pasted expression. If someone ever deletes
+// the SetRetentionConfig call in New() - the exact class of bug item 2 was
+// opened to fix - the unit tests below would keep passing (they don't touch
+// New() at all) while this test fails, because rt.activityService would be
+// left on ActivityService's own hardcoded defaults instead of the
+// non-default config values below.
+func TestNew_WiresActivityRetentionConfigThroughToService(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		DataDir:                    tempDir,
+		Listen:                     "127.0.0.1:0",
+		Servers:                    []*config.ServerConfig{},
+		ActivityRetentionDays:      30,
+		ActivityMaxRecords:         5000,
+		ActivityCleanupIntervalMin: 15,
+	}
+
+	rt, err := New(cfg, filepath.Join(tempDir, "config.yaml"), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rt.Close() })
+
+	require.NotNil(t, rt.activityService, "New() must construct an ActivityService")
+	assert.Equal(t, 30*24*time.Hour, rt.activityService.maxAge, "New() must wire cfg.ActivityRetentionDays through to the activity service, not leave it on the default")
+	assert.Equal(t, 5000, rt.activityService.maxRecords, "New() must wire cfg.ActivityMaxRecords through to the activity service")
+	assert.Equal(t, 15*time.Minute, rt.activityService.checkInterval, "New() must wire cfg.ActivityCleanupIntervalMin through to the activity service")
+}
+
+// TestNewActivityService_ConfiguredRetentionOverridesDefaults mirrors the
+// SetRetentionConfig call New() makes right after constructing the
+// ActivityService (see runtime.go): it must translate the config's
+// activity-retention-days/-max-records/-cleanup-interval-min knobs into the
+// service's internal retention state, not silently leave the service on its
+// own conservative defaults. maxBytes has no config field yet, so New()
+// passes 0 there deliberately - this test locks in that "0 means leave
+// ActivityService's own DefaultRetentionMaxBytes in place" behavior too.
+func TestNewActivityService_ConfiguredRetentionOverridesDefaults(t *testing.T) {
+	logger := zap.NewNop()
+	svc := NewActivityService(nil, logger)
+
+	cfg := &config.Config{
+		ActivityRetentionDays:      30,
+		ActivityMaxRecords:         5000,
+		ActivityCleanupIntervalMin: 15,
+	}
+
+	svc.SetRetentionConfig(
+		time.Duration(cfg.ActivityRetentionDays)*24*time.Hour,
+		cfg.ActivityMaxRecords,
+		0,
+		time.Duration(cfg.ActivityCleanupIntervalMin)*time.Minute,
+	)
+
+	assert.Equal(t, 30*24*time.Hour, svc.maxAge, "configured retention days must override the service's default max age")
+	assert.Equal(t, 5000, svc.maxRecords, "configured max records must override the service's default")
+	assert.Equal(t, 15*time.Minute, svc.checkInterval, "configured cleanup interval must override the service's default")
+	assert.Equal(t, int64(DefaultRetentionMaxBytes), svc.maxBytes, "maxBytes has no config field yet; passing 0 must leave the service's own default byte budget in place, not zero it out")
+}
+
+// TestNewActivityService_ZeroConfigKeepsConservativeDefaults verifies the
+// flip side: an unset (zero-value) config - e.g. a config.Config built
+// without GetDefaultConfig() - must not disable retention entirely.
+// SetRetentionConfig's "ignore non-positive values" guard means the service
+// falls back to its own hardcoded conservative defaults (7d/10k/1h) instead.
+func TestNewActivityService_ZeroConfigKeepsConservativeDefaults(t *testing.T) {
+	logger := zap.NewNop()
+	svc := NewActivityService(nil, logger)
+
+	cfg := &config.Config{} // zero-value: no ActivityRetentionDays etc. set
+
+	svc.SetRetentionConfig(
+		time.Duration(cfg.ActivityRetentionDays)*24*time.Hour,
+		cfg.ActivityMaxRecords,
+		0,
+		time.Duration(cfg.ActivityCleanupIntervalMin)*time.Minute,
+	)
+
+	assert.Equal(t, DefaultRetentionMaxAge, svc.maxAge)
+	assert.Equal(t, DefaultRetentionMaxRecords, svc.maxRecords)
+	assert.Equal(t, DefaultRetentionCheckInterval, svc.checkInterval)
+	assert.Equal(t, int64(DefaultRetentionMaxBytes), svc.maxBytes)
+}
 
 // TestEmitActivitySystemStart verifies system_start event emission (Spec 024)
 func TestEmitActivitySystemStart(t *testing.T) {

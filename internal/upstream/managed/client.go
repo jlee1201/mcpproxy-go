@@ -155,8 +155,8 @@ func (mc *Client) Connect(ctx context.Context) error {
 			mc.logger.Info("🎯 OAuth authorization required during MCP initialization",
 				zap.String("server", mc.Config.Name),
 				zap.Bool("token_refresh_scenario", isRefreshScenario))
-			// Use OAuth extended backoff — can't auto-complete without user browser action
-			mc.StateManager.SetOAuthError(err)
+			// Don't apply backoff for OAuth authorization requirement
+			mc.StateManager.SetError(err)
 			return fmt.Errorf("OAuth authorization during MCP init failed: %w", err)
 		} else if mc.isOAuthError(err) {
 			// Check if this is a token refresh scenario vs full re-auth
@@ -641,12 +641,15 @@ func (mc *Client) stopBackgroundMonitoring() {
 	mc.stopMonitoring = make(chan struct{})
 }
 
-// backgroundHealthCheck waits for a stop signal. Periodic ListTools polling
-// has been removed — connection failures are detected lazily on first use,
-// which avoids constant upstream API load for no user-visible benefit.
+// backgroundHealthCheck performs periodic health checks
 func (mc *Client) backgroundHealthCheck() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
+		case <-ticker.C:
+			mc.performHealthCheck()
 		case <-mc.stopMonitoring:
 			mc.logger.Debug("Background health monitoring stopped",
 				zap.String("server", mc.Config.Name))
@@ -664,8 +667,22 @@ func (mc *Client) performHealthCheck() {
 		return
 	}
 
-	// OAuth errors require user action (browser sign-in) — never auto-retry
+	// Handle OAuth errors with extended backoff
 	if mc.StateManager.GetState() == types.StateError && mc.StateManager.IsOAuthError() {
+		if mc.StateManager.ShouldRetryOAuth() {
+			info := mc.StateManager.GetConnectionInfo()
+			mc.logger.Info("Attempting OAuth reconnection with extended backoff",
+				zap.String("server", mc.Config.Name),
+				zap.Int("oauth_retry_count", info.OAuthRetryCount),
+				zap.Time("last_oauth_attempt", info.LastOAuthAttempt))
+			mc.tryReconnect()
+		} else {
+			info := mc.StateManager.GetConnectionInfo()
+			mc.logger.Debug("OAuth backoff period not elapsed, skipping reconnection",
+				zap.String("server", mc.Config.Name),
+				zap.Int("oauth_retry_count", info.OAuthRetryCount),
+				zap.Time("last_oauth_attempt", info.LastOAuthAttempt))
+		}
 		return
 	}
 
@@ -809,9 +826,8 @@ func (mc *Client) tryReconnect() {
 			zap.Error(err))
 	}
 
-	// Reset state to disconnected before attempting reconnection,
-	// but preserve retry counts so backoff accumulates across attempts
-	mc.StateManager.ResetPreservingRetryState()
+	// Reset state to disconnected before attempting reconnection
+	mc.StateManager.Reset()
 
 	// Attempt to reconnect using the existing Connect method
 	// The Connect method already handles state transitions and error management
@@ -894,8 +910,6 @@ func (mc *Client) isOAuthAuthorizationRequired(err error) bool {
 		"OAuth authorization during MCP init failed",
 		"OAuth authorization not implemented",
 		"OAuth authorization required",
-		"OAuth authentication required",
-		"authentication strategies failed",
 		"authorization required",
 	}
 

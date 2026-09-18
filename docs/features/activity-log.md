@@ -346,8 +346,8 @@ Activity logging is enabled by default. Configure via `mcp_config.json`:
 
 ```json
 {
-  "activity_retention_days": 90,
-  "activity_max_records": 100000,
+  "activity_retention_days": 7,
+  "activity_max_records": 10000,
   "activity_max_response_size": 65536,
   "activity_cleanup_interval_min": 60
 }
@@ -355,9 +355,9 @@ Activity logging is enabled by default. Configure via `mcp_config.json`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `activity_retention_days` | 90 | Days to retain activity records |
-| `activity_max_records` | 100000 | Maximum records before pruning oldest |
-| `activity_max_response_size` | 65536 | Max response size stored (bytes) |
+| `activity_retention_days` | 7 | Days to retain activity records |
+| `activity_max_records` | 10000 | Maximum records before pruning oldest |
+| `activity_max_response_size` | 65536 | Max response size stored (bytes) - not yet wired to any consumer |
 | `activity_cleanup_interval_min` | 60 | Background cleanup interval (minutes) |
 
 ## Use Cases
