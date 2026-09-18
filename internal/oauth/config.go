@@ -1080,14 +1080,51 @@ func GetCallbackServer(serverName string) (*CallbackServer, bool) {
 	return globalCallbackManager.GetCallbackServer(serverName)
 }
 
-// StopCallbackServer stops and removes the callback server for a given server name
+// StopCallbackServer tears down the callback server for a given server name,
+// but ONLY if no OAuth flow is still waiting on it. A single callback server
+// is shared by every concurrent flow for that server name (see CallbackServer
+// docs), so one flow completing must not sever a SIBLING flow's callback.
+//
+// Callers MUST release their own waiter (CallbackServer.Unregister(state))
+// before calling this - otherwise their own still-registered entry would
+// always make the server look "in use" and it would never tear down. This is
+// why markOAuthComplete unregisters its state first and calls this second.
+//
+// If a waiter remains, this is a no-op: the server stays up, and whichever
+// flow is last to finish will tear it down when IT calls this. For
+// unconditional teardown regardless of live waiters (daemon shutdown, test
+// cleanup), use StopCallbackServerForce.
 func (m *CallbackServerManager) StopCallbackServer(serverName string) error {
+	return m.stopCallbackServer(serverName, false)
+}
+
+// StopCallbackServerForce unconditionally tears down the callback server for
+// serverName, closing every outstanding waiter channel regardless of how
+// many OAuth flows are still in flight. Use for daemon shutdown and test
+// cleanup; use StopCallbackServer for normal per-flow completion.
+func (m *CallbackServerManager) StopCallbackServerForce(serverName string) error {
+	return m.stopCallbackServer(serverName, true)
+}
+
+func (m *CallbackServerManager) stopCallbackServer(serverName string, force bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	server, exists := m.servers[serverName]
 	if !exists {
 		return nil // Already stopped or never started
+	}
+
+	if !force {
+		server.mu.Lock()
+		activeWaiters := len(server.waiters)
+		server.mu.Unlock()
+		if activeWaiters > 0 {
+			m.logger.Debug("Skipping OAuth callback server teardown - other flow(s) still waiting on it",
+				zap.String("server", serverName),
+				zap.Int("active_waiters", activeWaiters))
+			return nil
+		}
 	}
 
 	// Shutdown the server
@@ -1100,8 +1137,10 @@ func (m *CallbackServerManager) StopCallbackServer(serverName string) error {
 			zap.Error(err))
 	}
 
-	// Close every outstanding waiter channel and mark the server closed so any
-	// in-flight flows unblock instead of hanging until their 120s timeout.
+	// Close every outstanding waiter channel (only relevant when force=true;
+	// the non-force path only reaches here once waiters is already empty)
+	// and mark the server closed so any in-flight flows unblock instead of
+	// hanging until their 120s timeout.
 	server.mu.Lock()
 	server.closed = true
 	for state, ch := range server.waiters {
@@ -1115,7 +1154,8 @@ func (m *CallbackServerManager) StopCallbackServer(serverName string) error {
 
 	m.logger.Info("OAuth callback server stopped",
 		zap.String("server", serverName),
-		zap.Int("port", server.Port))
+		zap.Int("port", server.Port),
+		zap.Bool("force", force))
 
 	return nil
 }

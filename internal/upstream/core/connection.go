@@ -287,7 +287,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	if c.isOAuthInProgress() {
 		c.logger.Info("✅ OAuth flow completed successfully - connection established with token",
 			zap.String("server", c.config.Name))
-		c.markOAuthComplete()
+		// No state of our own here - this fast path detected an already-valid
+		// persisted token and never registered a callback waiter.
+		c.markOAuthComplete("")
 	}
 
 	c.logger.Info("Successfully connected to upstream MCP server",
@@ -2566,7 +2568,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 			zap.String("server", c.config.Name))
 
 		// Mark OAuth as complete to prevent retry loops
-		c.markOAuthComplete()
+		c.markOAuthComplete(state)
 
 		// Record OAuth completion in global token manager for other clients
 		tokenManager := oauth.GetTokenStoreManager()
@@ -2865,7 +2867,7 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 			zap.String("correlation_id", result.CorrelationID))
 
 		// Mark OAuth as complete
-		c.markOAuthComplete()
+		c.markOAuthComplete(state)
 		tokenManager := oauth.GetTokenStoreManager()
 		tokenManager.MarkOAuthCompleted(c.config.Name)
 
@@ -2896,8 +2898,14 @@ func (c *Client) markOAuthInProgress() {
 	c.lastOAuthTimestamp = time.Now()
 }
 
-// markOAuthComplete marks OAuth as complete and cleans up callback server
-func (c *Client) markOAuthComplete() {
+// markOAuthComplete marks OAuth as complete and cleans up the callback
+// server. state is THIS flow's own OAuth state (or "" for the Connect() fast
+// path, which never registered a waiter of its own) - it is released before
+// the manager is asked to tear the server down, so a still-registered "own"
+// entry never makes the server look permanently in-use. A SIBLING flow's
+// waiter, if any, is left untouched: StopCallbackServer only tears down once
+// no waiter remains at all (see its docs).
+func (c *Client) markOAuthComplete(state string) {
 	c.oauthMu.Lock()
 	defer c.oauthMu.Unlock()
 
@@ -2929,8 +2937,15 @@ func (c *Client) markOAuthComplete() {
 			zap.String("server", c.config.Name))
 	}
 
-	// Clean up the callback server to free the port
+	// Release this flow's own waiter FIRST, then ask the manager to tear the
+	// callback server down. StopCallbackServer no-ops while any OTHER flow
+	// for this server name is still waiting, so a sibling in-flight flow
+	// (manual auth login racing an automatic reconnect, etc.) keeps its
+	// callback server alive until it too completes.
 	if manager := oauth.GetGlobalCallbackManager(); manager != nil {
+		if callbackServer, exists := manager.GetCallbackServer(c.config.Name); exists {
+			callbackServer.Unregister(state)
+		}
 		if err := manager.StopCallbackServer(c.config.Name); err != nil {
 			c.logger.Warn("Failed to stop OAuth callback server",
 				zap.String("server", c.config.Name),
@@ -2961,17 +2976,20 @@ func (c *Client) ForceOAuthFlow(ctx context.Context) error {
 
 // StartOAuthFlowQuick starts the OAuth flow and returns browser status immediately.
 // Unlike ForceOAuthFlowWithResult which blocks until OAuth completes, this function:
-// 1. Gets authorization URL synchronously (quick operation)
-// 2. Checks HEADLESS environment variable
-// 3. Attempts browser open and captures result
-// 4. Returns OAuthStartResult immediately
-// 5. Continues OAuth callback handling in a goroutine
+// 1. Fails fast (never blocks) if the global OAuth flow coordinator already has
+//    a flow running for this server - see the coordinator.StartFlow call below.
+// 2. Gets authorization URL synchronously (quick operation)
+// 3. Checks HEADLESS environment variable
+// 4. Attempts browser open and captures result
+// 5. Returns OAuthStartResult immediately
+// 6. Continues OAuth callback handling in a goroutine, which hands that
+//    goroutine ownership of the coordinator flow started in step 1
 //
 // This is used by the login API endpoint to return accurate browser_opened status
 // without blocking the HTTP response for the full OAuth flow.
-func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, error) {
+func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartResult, err error) {
 	// Generate correlation ID first so all logs can use it
-	result := &OAuthStartResult{
+	result = &OAuthStartResult{
 		CorrelationID: fmt.Sprintf("oauth-%s-%d", c.config.Name, time.Now().UnixNano()),
 	}
 
@@ -2987,13 +3005,40 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, er
 		return result, fmt.Errorf("OAuth is not supported or not applicable for server '%s'", c.config.Name)
 	}
 
-	// Check if OAuth is already in progress
+	// Check if OAuth is already in progress (same-instance flag)
 	if c.isOAuthInProgress() {
 		c.logger.Warn("⚠️ OAuth authorization already in progress",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", result.CorrelationID))
 		return result, fmt.Errorf("OAuth authorization already in progress for %s", c.config.Name)
 	}
+
+	// Cross-instance/cross-path guard: fail fast (never block) if the global
+	// coordinator already has a flow running for this server - e.g. an
+	// automatic reconnect via tryOAuthAuth, or another manual call. This is
+	// the login API's synchronous path, so unlike ForceOAuthFlowWithResult it
+	// must not wait on WaitForFlow; it fails the same way isOAuthInProgress
+	// above already does.
+	coordinator := oauth.GetGlobalCoordinator()
+	if _, startErr := coordinator.StartFlow(c.config.Name); startErr != nil {
+		c.logger.Warn("⚠️ OAuth authorization already in progress (coordinator)",
+			zap.String("server", c.config.Name),
+			zap.String("correlation_id", result.CorrelationID))
+		return result, fmt.Errorf("OAuth authorization already in progress for %s", c.config.Name)
+	}
+
+	// We own this flow until either an early return below ends it ourselves,
+	// or we successfully hand it off to waitForOAuthCallbackAsync (which then
+	// owns EndFlow itself - see handedOff below and that function's own
+	// defer). Named returns mean every `return result, err` below - including
+	// the metadata-validation and getAuthorizationURLQuick error paths - is
+	// visible to this defer with no extra plumbing.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			coordinator.EndFlow(c.config.Name, err == nil, err)
+		}
+	}()
 
 	// Clear any existing OAuth state
 	c.clearOAuthState()
@@ -3063,7 +3108,10 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, er
 		result.BrowserOpened = false
 		result.BrowserError = "HEADLESS mode - browser not opened. Please open the auth_url manually."
 
-		// Start OAuth callback handling in background
+		// Hand coordinator flow ownership to the background goroutine - it
+		// calls EndFlow itself once the callback wait is done. Must be set
+		// before spawning, so our own defer above knows not to double-end it.
+		handedOff = true
 		go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID)
 
 		return result, nil
@@ -3086,7 +3134,9 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (*OAuthStartResult, er
 			zap.String("server", c.config.Name))
 	}
 
-	// Start OAuth callback handling in background
+	// Hand coordinator flow ownership to the background goroutine - see the
+	// HEADLESS branch above for why handedOff must be set before spawning.
+	handedOff = true
 	go c.waitForOAuthCallbackAsync(ctx, oauthHandler, codeVerifier, state, result.CorrelationID)
 
 	return result, nil
@@ -3254,7 +3304,20 @@ func (c *Client) getAuthorizationURLQuick(ctx context.Context, oauthConfig *clie
 }
 
 // waitForOAuthCallbackAsync waits for OAuth callback and handles token exchange in background.
+// StartOAuthFlowQuick hands this goroutine ownership of the global coordinator
+// flow it started (see handedOff there), so this function - not its caller -
+// is responsible for ending it.
 func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *uptransport.OAuthHandler, codeVerifier, state, correlationID string) {
+	// Registered first so it fires LAST (defers run LIFO): after the
+	// oauthInProgress reset below and after Unregister(state), so a sibling
+	// waiting on WaitForFlow only wakes once our local state and the
+	// callback registration are fully settled, not while still mid-teardown.
+	var flowErr error
+	coordinator := oauth.GetGlobalCoordinator()
+	defer func() {
+		coordinator.EndFlow(c.config.Name, flowErr == nil, flowErr)
+	}()
+
 	c.markOAuthInProgress()
 	defer func() {
 		c.oauthMu.Lock()
@@ -3271,6 +3334,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 	if !exists {
 		c.logger.Error("❌ Callback server not found",
 			zap.String("server", c.config.Name))
+		flowErr = fmt.Errorf("callback server not found for %s", c.config.Name)
 		return
 	}
 
@@ -3286,6 +3350,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 			c.logger.Info("OAuth callback channel closed before completion (server shutdown/superseded)",
 				zap.String("server", c.config.Name),
 				zap.String("correlation_id", correlationID))
+			flowErr = fmt.Errorf("OAuth callback channel closed for %s (server shutdown or superseded)", c.config.Name)
 			return
 		}
 		c.logger.Info("🎯 OAuth callback received",
@@ -3298,6 +3363,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 				zap.String("server", c.config.Name),
 				zap.String("expected", state),
 				zap.String("got", params["state"]))
+			flowErr = fmt.Errorf("state mismatch in OAuth callback for %s", c.config.Name)
 			return
 		}
 
@@ -3309,6 +3375,9 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 					zap.String("server", c.config.Name),
 					zap.String("error", params["error"]),
 					zap.String("description", params["error_description"]))
+				flowErr = fmt.Errorf("OAuth authorization failed for %s: %s", c.config.Name, params["error"])
+			} else {
+				flowErr = fmt.Errorf("no authorization code received for %s", c.config.Name)
 			}
 			return
 		}
@@ -3318,6 +3387,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 			c.logger.Error("❌ Failed to exchange authorization code",
 				zap.String("server", c.config.Name),
 				zap.Error(err))
+			flowErr = fmt.Errorf("failed to exchange authorization code for %s: %w", c.config.Name, err)
 			return
 		}
 
@@ -3326,7 +3396,7 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 			zap.String("correlation_id", correlationID))
 
 		// Mark OAuth as complete
-		c.markOAuthComplete()
+		c.markOAuthComplete(state)
 		tokenManager := oauth.GetTokenStoreManager()
 		tokenManager.MarkOAuthCompleted(c.config.Name)
 
@@ -3334,10 +3404,12 @@ func (c *Client) waitForOAuthCallbackAsync(ctx context.Context, oauthHandler *up
 		c.logger.Warn("⏱️ OAuth authorization timeout",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", correlationID))
+		flowErr = fmt.Errorf("OAuth authorization timeout for %s", c.config.Name)
 
 	case <-ctx.Done():
 		c.logger.Info("OAuth flow cancelled",
 			zap.String("server", c.config.Name))
+		flowErr = ctx.Err()
 	}
 }
 
@@ -3351,6 +3423,43 @@ func (c *Client) ForceOAuthFlowWithResult(ctx context.Context) (*OAuthStartResul
 	if !oauth.ShouldUseOAuth(c.config) {
 		return nil, fmt.Errorf("OAuth is not supported or not applicable for server '%s'", c.config.Name)
 	}
+
+	// Use the global OAuth flow coordinator to prevent racing an automatic
+	// reconnect (tryOAuthAuth/trySSEOAuthAuth) or another manual flow for the
+	// same server - see internal/oauth/coordinator.go. This is the manual
+	// counterpart to tryOAuthAuth's own coordinator usage; callers of this
+	// function hand it a long-lived ctx (StartManualOAuth/WithInfo give it up
+	// to 30 minutes), so waiting for a sibling to finish is in-contract here.
+	coordinator := oauth.GetGlobalCoordinator()
+	flowCtx, err := coordinator.StartFlow(c.config.Name)
+	if err != nil {
+		if err == oauth.ErrFlowInProgress {
+			c.logger.Info("⏳ OAuth flow already in progress for this server, waiting for completion",
+				zap.String("server", c.config.Name))
+
+			waitErr := coordinator.WaitForFlow(ctx, c.config.Name, oauth.DefaultFlowTimeout)
+			result := &OAuthStartResult{
+				CorrelationID: flowCtx.CorrelationID,
+				BrowserOpened: false,
+			}
+			if waitErr != nil {
+				return result, fmt.Errorf("OAuth flow already in progress for %s: %w", c.config.Name, waitErr)
+			}
+
+			c.logger.Info("✅ OAuth flow completed by another goroutine, reusing its result",
+				zap.String("server", c.config.Name))
+			return result, nil
+		}
+		return nil, fmt.Errorf("failed to start OAuth flow: %w", err)
+	}
+
+	// We own this OAuth flow, make sure to end it when done.
+	var oauthErr error
+	defer func() {
+		success := oauthErr == nil
+		coordinator.EndFlow(c.config.Name, success, oauthErr)
+	}()
+	ctx = oauth.WithFlowContext(ctx, flowCtx)
 
 	// Clear any existing OAuth state
 	c.clearOAuthState()
@@ -3367,14 +3476,16 @@ func (c *Client) ForceOAuthFlowWithResult(ctx context.Context) (*OAuthStartResul
 	manualCtx := context.WithValue(ctx, manualOAuthKey, true)
 
 	// Try to create an OAuth-enabled client that will trigger the OAuth flow
+	var result *OAuthStartResult
 	switch c.transportType {
 	case transportHTTP, transportHTTPStreamable:
-		return c.forceHTTPOAuthFlowWithResult(manualCtx)
+		result, oauthErr = c.forceHTTPOAuthFlowWithResult(manualCtx)
 	case transportSSE:
-		return c.forceSSEOAuthFlowWithResult(manualCtx)
+		result, oauthErr = c.forceSSEOAuthFlowWithResult(manualCtx)
 	default:
-		return nil, fmt.Errorf("OAuth not supported for transport type: %s", c.transportType)
+		oauthErr = fmt.Errorf("OAuth not supported for transport type: %s", c.transportType)
 	}
+	return result, oauthErr
 }
 // forceHTTPOAuthFlowWithResult forces OAuth flow for HTTP transport and returns auth URL/browser status.
 func (c *Client) forceHTTPOAuthFlowWithResult(ctx context.Context) (*OAuthStartResult, error) {
