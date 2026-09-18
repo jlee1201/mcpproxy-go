@@ -264,6 +264,37 @@ func TestMaybeCompactOnStartup_NoOpBelowThreshold(t *testing.T) {
 	assert.Equal(t, before.ModTime(), after.ModTime(), "file must be untouched below threshold")
 }
 
+// TestMaybeCompactOnStartup_SkipsOnWindows is the regression test for
+// round-5 finding #1: compactDBFile's final rename swaps the compacted file
+// over dbPath while srcDB still holds dbPath open, which fails with a
+// sharing violation on Windows (see maybeCompactOnStartup's doc comment).
+// Even on a file that is both over the size threshold and has meaningful
+// reclaimable space -- i.e. one that would otherwise trigger a real
+// compaction attempt -- goos "windows" must skip the attempt entirely and
+// leave the file untouched, rather than unconditionally failing every
+// startup on real Windows.
+func TestMaybeCompactOnStartup_SkipsOnWindows(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "compact_test_*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "config.db")
+	seedOversizedDBWithReclaimableSpace(t, dbPath)
+
+	before, err := os.Stat(dbPath)
+	require.NoError(t, err)
+
+	maybeCompactOnStartupForGOOS(dbPath, testLogger(t), "windows")
+
+	stale, globErr := filepath.Glob(dbPath + ".compact-tmp*")
+	require.NoError(t, globErr)
+	assert.Empty(t, stale, "no compaction attempt should have started on windows")
+
+	after, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	assert.Equal(t, before.ModTime(), after.ModTime(), "file must be untouched on windows even when over threshold with reclaimable space")
+}
+
 // seedOversizedDBWithReclaimableSpace creates a bbolt file at dbPath that is
 // over compactionThresholdBytes in size AND has meaningful reclaimable free
 // space: it writes well past the threshold, then deletes most of what it

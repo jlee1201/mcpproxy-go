@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -637,7 +638,41 @@ func CompactConfigDBIfNeeded(dataDir string, logger *zap.SugaredLogger) {
 // This must never block startup on a corrupt, locked, or otherwise
 // unreadable file: any failure is logged and the normal (uncompacted)
 // database is opened afterwards by the caller.
+//
+// Skipped entirely on Windows (round-5 finding #1): compactDBFile's final
+// os.Rename(tmpPath, dbPath) swaps the compacted file over dbPath while
+// srcDB still holds dbPath open -- intentionally, so a second process's
+// concurrent compaction attempt blocks on that same flock rather than ever
+// observing a half-swapped file (see compactDBFile's doc comment). On Unix,
+// rename-over-an-open-file is fine. On Windows, MoveFileEx (what os.Rename
+// uses there) fails with a sharing violation when the destination has an
+// open handle that wasn't granted delete-sharing, which os.OpenFile's
+// default share mode does not grant -- so this would fail on every single
+// attempt, unconditionally, on Windows: not a crash (the error is only
+// logged and the caller falls back to the uncompacted database), but a
+// startup-time compaction attempt that can never succeed there, wasting a
+// multi-second compact-and-verify pass on every restart of a large
+// database for no benefit. Rather than guess at a close-rename-reopen
+// sequence with retry logic that reintroduces the concurrent-compaction
+// race the current design deliberately avoids -- unverifiable here since
+// this repo has no Windows test environment -- startup compaction is
+// disabled on Windows until someone can implement and verify a
+// Windows-safe swap on real Windows. bbolt.Compact itself, and the
+// per-record/per-bucket write-time caps this PR adds, are unaffected: this
+// only skips the one-time startup reclaim of already-freed pages.
 func maybeCompactOnStartup(dbPath string, logger *zap.SugaredLogger) {
+	maybeCompactOnStartupForGOOS(dbPath, logger, goruntime.GOOS)
+}
+
+// maybeCompactOnStartupForGOOS is maybeCompactOnStartup with the OS name
+// passed in explicitly, so a test can exercise the Windows-skip branch
+// without depending on which OS actually runs the test.
+func maybeCompactOnStartupForGOOS(dbPath string, logger *zap.SugaredLogger, goos string) {
+	if goos == "windows" {
+		logger.Debugw("Skipping startup config.db compaction on Windows: rename-over-open-file is not supported there, see maybeCompactOnStartup's doc comment", "path", dbPath)
+		return
+	}
+
 	info, err := os.Stat(dbPath)
 	if err != nil {
 		return // no existing file yet, nothing to compact
@@ -721,6 +756,25 @@ func estimateReclaimableBytes(dbPath string) (int64, error) {
 //     itself is opened via openBoltDBAtStablePath for exactly this reason;
 //     see its doc comment for the detect-and-retry mechanism, which callers
 //     of dbPath (NewBoltDB included) must also use.
+//
+// Known limitation, deliberately out of scope for this PR: this function has
+// no wall-clock deadline, and neither does anything in its caller chain
+// (maybeCompactOnStartup -> maybeCompactOnStartupForGOOS -> here). The only
+// timeout in play, bbolt.Options{Timeout: 5 * time.Second} above, bounds file
+// *lock acquisition*, not the compaction-and-verification work itself, which
+// scales with config.db size and could in principle block startup for a long
+// time on a very large database. A real deadline can't be layered on
+// cleanly: bbolt.Compact takes no context and isn't cancellable mid-call, so
+// "abort on timeout" can only mean racing it in a goroutine and proceeding
+// with the uncompacted DB while the orphaned goroutine keeps running
+// unbounded in the background -- which reintroduces exactly the
+// concurrent-compaction/swap risk this whole design (see the flock and
+// stable-path comments above) exists to avoid. A safe fix needs either an
+// upstream bbolt API change or moving compaction off the startup path
+// entirely; tracked as follow-up, not folded into this PR. The one cheap,
+// low-risk mitigation left on the table is an *upper* size gate mirroring
+// compactionThresholdBytes's lower gate (skip compaction and log "run
+// manually" above some size) -- also not implemented here.
 func compactDBFile(dbPath string, logger *zap.SugaredLogger) error {
 	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", dbPath, os.Getpid())
 

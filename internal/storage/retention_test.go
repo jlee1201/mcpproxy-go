@@ -276,11 +276,84 @@ func TestRecordToolCall_OversizedResponseIsTruncatedBeforeWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, survivors, 1)
 
-	responseStr, ok := survivors[0].Response.(string)
-	require.True(t, ok)
-	assert.Less(t, len(responseStr), MaxToolCallRecordBytes,
-		"oversized response must have been truncated before write, not stored at full size")
-	assert.Contains(t, responseStr, "omitted")
+	// Response stays an object after truncation, matching the OAS contract
+	// (contracts.ToolCallRecord.Response is swaggertype:"object") -- a bare
+	// string placeholder would silently violate that for typed API consumers.
+	responseObj, ok := survivors[0].Response.(map[string]interface{})
+	require.True(t, ok, "truncated Response must remain a JSON object, not a string")
+	assert.Equal(t, true, responseObj["truncated"])
+	assert.Contains(t, responseObj, "original_bytes")
+	assert.False(t, survivors[0].ArgumentsTruncated,
+		"clearing Response alone was enough to fit the budget; Arguments must not have been touched")
+}
+
+// TestRecordToolCall_OversizedResponseDoesNotTruncateArguments is the
+// regression test for round-5 finding #4's reorder fix: when clearing
+// Response alone is enough to fit the per-record budget,
+// truncateToolCallRecordToFit must stop there and leave Arguments intact --
+// Arguments is what ReplayToolCall falls back to when no override is
+// supplied, so clearing it destroys replay capability and should only
+// happen if clearing Response alone wasn't sufficient.
+func TestRecordToolCall_OversizedResponseDoesNotTruncateArguments(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	serverID := "test-server-id"
+	oversized := strings.Repeat("r", MaxToolCallRecordBytes+1024)
+
+	record := &ToolCallRecord{
+		ID:        "call-huge-response-real-args",
+		ServerID:  serverID,
+		ToolName:  "some_tool",
+		Arguments: map[string]interface{}{"path": "/tmp/important-file.txt"},
+		Response:  oversized,
+		Timestamp: time.Unix(1_700_000_000, 0),
+		RequestID: "req-huge-response-real-args",
+	}
+	require.NoError(t, manager.RecordToolCall(record))
+
+	survivors, err := manager.GetServerToolCalls(serverID, 10)
+	require.NoError(t, err)
+	require.Len(t, survivors, 1)
+
+	assert.False(t, survivors[0].ArgumentsTruncated,
+		"Response alone was enough to fit the budget; Arguments must survive intact")
+	assert.Equal(t, "/tmp/important-file.txt", survivors[0].Arguments["path"],
+		"Arguments must be preserved verbatim when only Response needed clearing")
+}
+
+// TestRecordToolCall_OversizedArgumentsAndResponseTruncatesArguments covers
+// the case where clearing Response alone is NOT enough: Arguments must then
+// be cleared too, and ArgumentsTruncated must be set to true so callers
+// (specifically ReplayToolCall) can tell that a nil Arguments here means
+// "unknown", not "no arguments".
+func TestRecordToolCall_OversizedArgumentsAndResponseTruncatesArguments(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	serverID := "test-server-id"
+	oversized := strings.Repeat("r", MaxToolCallRecordBytes+1024)
+
+	record := &ToolCallRecord{
+		ID:       "call-huge-args-and-response",
+		ServerID: serverID,
+		ToolName: "some_tool",
+		Arguments: map[string]interface{}{
+			"blob": strings.Repeat("a", MaxToolCallRecordBytes),
+		},
+		Response:  oversized,
+		Timestamp: time.Unix(1_700_000_000, 0),
+		RequestID: "req-huge-args-and-response",
+	}
+	require.NoError(t, manager.RecordToolCall(record))
+
+	survivors, err := manager.GetServerToolCalls(serverID, 10)
+	require.NoError(t, err)
+	require.Len(t, survivors, 1)
+
+	assert.True(t, survivors[0].ArgumentsTruncated,
+		"clearing Response alone was not enough; Arguments must have been cleared and flagged")
+	assert.Nil(t, survivors[0].Arguments)
 }
 
 // TestRecordToolCall_OversizedErrorIsTruncatedBeforeWrite is the round-3
@@ -412,6 +485,128 @@ func TestTruncateToolCallRecordToFit_RefusesToWriteIfStillOversized(t *testing.T
 	require.Error(t, err, "must refuse to write rather than silently persist a record over an unreachable budget")
 }
 
+// TestSaveActivity_OversizedResponseIsTruncatedBeforeWrite is the regression
+// test for round-5's finding that activity_records had no per-record byte
+// cap at all (unlike tool_calls/diagnostics), leaving it exposed to the same
+// single-oversized-record cascade-wipe class MaxToolCallRecordBytes exists
+// to prevent -- just never applied here. A response larger than
+// MaxActivityRecordBytes must be truncated before write, not stored at full
+// size, and ResponseTruncated must be set so callers can tell.
+func TestSaveActivity_OversizedResponseIsTruncatedBeforeWrite(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	oversized := strings.Repeat("r", MaxActivityRecordBytes+1024)
+
+	record := &ActivityRecord{
+		Type:       ActivityTypeToolCall,
+		ServerName: "test-server",
+		ToolName:   "some_tool",
+		Response:   oversized,
+		Status:     "success",
+	}
+	require.NoError(t, manager.SaveActivity(record))
+
+	stored, err := manager.GetActivity(record.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	assert.Less(t, len(stored.Response), MaxActivityRecordBytes,
+		"oversized response must have been truncated before write, not stored at full size")
+	assert.Contains(t, stored.Response, "omitted")
+	assert.True(t, stored.ResponseTruncated, "ResponseTruncated must be set when the response is truncated on write")
+}
+
+// TestPruneActivitiesByBudget_OversizedRecordDoesNotCascadeWipe proves the
+// per-record cap above actually prevents the cascade-wipe end to end: write
+// several normal-sized activities, then one that would have been oversized
+// without MaxActivityRecordBytes, then run the same trimBucketToByteBudget
+// pass PruneActivitiesByBudget uses. The older, individually-small records
+// must survive.
+func TestPruneActivitiesByBudget_OversizedRecordDoesNotCascadeWipe(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	base := time.Unix(1_700_000_000, 0)
+	for i := 0; i < 3; i++ {
+		require.NoError(t, manager.SaveActivity(&ActivityRecord{
+			Type:       ActivityTypeToolCall,
+			ServerName: "test-server",
+			ToolName:   "some_tool",
+			Response:   "small response",
+			Status:     "success",
+			Timestamp:  base.Add(time.Duration(i) * time.Second),
+		}))
+	}
+
+	require.NoError(t, manager.SaveActivity(&ActivityRecord{
+		Type:       ActivityTypeToolCall,
+		ServerName: "test-server",
+		ToolName:   "some_tool",
+		Response:   strings.Repeat("h", MaxActivityRecordBytes+4096),
+		Status:     "success",
+		Timestamp:  base.Add(10 * time.Second),
+	}))
+
+	// The per-record cap already bounded the huge record's stored size, so
+	// even a tight budget here must not need to evict anything.
+	deleted, err := manager.PruneActivitiesByBudget(int64(MaxActivityRecordBytes) * 2)
+	require.NoError(t, err)
+	assert.Equal(t, 0, deleted, "the per-record cap should keep total bucket bytes low enough that nothing needs eviction")
+
+	count, err := manager.CountActivities()
+	require.NoError(t, err)
+	assert.Equal(t, 4, count, "no record should have been cascade-wiped")
+}
+
+// TestSaveActivity_MinimalFallbackCapsServerName mirrors
+// TestRecordToolCall_MinimalFallbackCapsServerName for activity_records: the
+// minimal last-resort record's fields must be capped by truncateFallbackField,
+// not copied verbatim, or a pathologically long ServerName could make even
+// the "minimal" record exceed maxBytes.
+func TestSaveActivity_MinimalFallbackCapsServerName(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	hugeServerName := strings.Repeat("s", MaxActivityRecordBytes+4096)
+
+	record := &ActivityRecord{
+		Type:       ActivityTypeToolCall,
+		ServerName: hugeServerName,
+		ToolName:   "some_tool",
+		Response:   "small",
+		Status:     "success",
+	}
+	require.NoError(t, manager.SaveActivity(record))
+
+	stored, err := manager.GetActivity(record.ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	assert.Less(t, len(stored.ServerName), MaxActivityRecordBytes,
+		"ServerName in the minimal fallback record must be capped, not stored at full size")
+	assert.Contains(t, stored.ServerName, "...(truncated)")
+}
+
+// TestTruncateActivityRecordToFit_RefusesToWriteIfStillOversized mirrors
+// TestTruncateToolCallRecordToFit_RefusesToWriteIfStillOversized: even after
+// every field is capped, an absurdly small maxBytes budget still can't be
+// met, so the function must return an error rather than silently persist a
+// record over budget.
+func TestTruncateActivityRecordToFit_RefusesToWriteIfStillOversized(t *testing.T) {
+	record := &ActivityRecord{
+		ID:         "x",
+		Type:       ActivityTypeToolCall,
+		ServerName: "y",
+		ToolName:   "t",
+		Response:   strings.Repeat("r", 1000),
+		Timestamp:  time.Unix(1_700_000_000, 0),
+	}
+
+	_, err := truncateActivityRecordToFit(record, 10)
+	require.Error(t, err, "must refuse to write rather than silently persist a record over an unreachable budget")
+}
+
 // TestRecordServerDiagnostic_TrimsToByteBudget mirrors the tool_calls trim
 // test for diagnostics, which has the identical unbounded-growth shape.
 func TestRecordServerDiagnostic_TrimsToByteBudget(t *testing.T) {
@@ -537,6 +732,59 @@ func TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestTrimAllServerBuckets_TrimsMultipleServersIndependently is the
+// regression test for round-5 finding #5's fix: TrimAllServerBuckets now
+// trims each server's buckets in its own transaction (releasing m.mu
+// between servers) instead of one giant transaction covering every server.
+// This verifies that refactor didn't break the aggregation across servers
+// -- every oversized server must still end up trimmed and counted, not
+// just the first or last one processed.
+func TestTrimAllServerBuckets_TrimsMultipleServersIndependently(t *testing.T) {
+	manager, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+
+	const recordSize = 100
+	numRecords := (DefaultToolCallsBucketMaxBytes / recordSize) + 20
+	value := strings.Repeat("v", recordSize)
+
+	var identities []*ServerIdentity
+	for i := 0; i < 3; i++ {
+		identity := registerStaleIdentity(t, manager, fmt.Sprintf("quiet-server-%d", i), 1*time.Hour)
+		identities = append(identities, identity)
+
+		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
+		require.NoError(t, manager.db.db.Update(func(tx *bbolt.Tx) error {
+			bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+			if err != nil {
+				return err
+			}
+			for j := 0; j < numRecords; j++ {
+				key := fmt.Sprintf("%06d", j)
+				if err := bucket.Put([]byte(key), []byte(value)); err != nil {
+					return err
+				}
+			}
+			return nil
+		}))
+	}
+
+	trimmed, err := manager.TrimAllServerBuckets()
+	require.NoError(t, err)
+	assert.Equal(t, 3, trimmed, "all three oversized servers must be trimmed and counted, not just one")
+
+	for _, identity := range identities {
+		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
+		err = manager.db.db.View(func(tx *bbolt.Tx) error {
+			bucket := tx.Bucket([]byte(bucketName))
+			require.NotNil(t, bucket)
+			assert.Less(t, bucket.Stats().KeyN, numRecords,
+				"server %s's bucket must have actually been trimmed", identity.ServerName)
+			return nil
+		})
+		require.NoError(t, err)
+	}
+}
+
 // TestTrimAllServerBuckets_NoOpWhenAllBucketsWithinBudget verifies the
 // negative case: buckets already within budget are left untouched and
 // TrimAllServerBuckets reports zero buckets trimmed.
@@ -606,62 +854,67 @@ func TestCleanupStaleServerData_NilMapIsNoOp(t *testing.T) {
 	assert.Len(t, remaining, 1, "a nil configuredServerIDs map must not delete anything")
 }
 
-// TestCleanupStaleServerData_DeletesOAuthToken is the regression test for
-// round-4's medium-severity finding: oauth_tokens is keyed by plain
-// ServerName (see BoltDB.SaveOAuthToken/GetOAuthToken), not by the
-// content-hashed identity ID every other bucket here uses, so
-// CleanupStaleServerData -- which iterates by ID -- never touched it. A
-// server dropped from config entirely left its refresh/access token behind
-// forever. This proves the token is now deleted along with everything else.
-func TestCleanupStaleServerData_DeletesOAuthToken(t *testing.T) {
+// TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup is the
+// regression test for round-5 medium finding #2: PersistentTokenStore.SaveToken
+// writes OAuth tokens via *storage.BoltDB directly, bypassing Manager.mu
+// entirely, so a concurrent save has no lock-based coordination with
+// CleanupStaleServerData's delete. The fix re-reads the token from inside the
+// delete's own transaction and skips deleting if its Updated timestamp is
+// after staleDecisionTime (computed before the transaction began) -- i.e. a
+// save that landed after staleness was decided. This test writes directly
+// into the oauth_tokens bucket (bypassing SaveOAuthToken, which always
+// stamps Updated=time.Now() and so can't produce a deterministic future
+// timestamp) to simulate that race window without depending on real
+// goroutine timing.
+func TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup(t *testing.T) {
 	manager, cleanup := setupTestStorageForActivity(t)
 	defer cleanup()
 
-	removed := registerStaleIdentity(t, manager, "dropped-from-config", 48*time.Hour)
-	require.NoError(t, manager.db.SaveOAuthToken(&OAuthTokenRecord{
-		ServerName:  removed.ServerName,
-		AccessToken: "some-access-token",
-	}))
+	identity := registerStaleIdentity(t, manager, "racy-server", 60*24*time.Hour)
+	hashedKey := GenerateOAuthServerKey(identity.ServerName, identity.Attributes.URL)
 
-	deleted, err := manager.CleanupStaleServerData(24*time.Hour, map[string]bool{})
+	futureUpdated := time.Now().Add(1 * time.Hour)
+	record := &OAuthTokenRecord{
+		ServerName:  hashedKey,
+		AccessToken: "still-alive-token",
+		Updated:     futureUpdated,
+	}
+	data, err := record.MarshalBinary()
 	require.NoError(t, err)
-	assert.Equal(t, 1, deleted)
-
-	_, err = manager.db.GetOAuthToken(removed.ServerName)
-	assert.Error(t, err, "oauth token for a removed-and-cleaned-up server must be deleted, not left behind forever")
-}
-
-// TestCleanupStaleServerData_PreservesOAuthTokenForLiveServerSharingName
-// covers the guard added alongside the fix above: if a still-live identity
-// happens to share its ServerName with the stale identity being cleaned up
-// (e.g. the same name re-added with a new URL, which changes the
-// content-hashed ID but not the name), deleting oauth_tokens by name must
-// NOT wipe the live server's token.
-func TestCleanupStaleServerData_PreservesOAuthTokenForLiveServerSharingName(t *testing.T) {
-	manager, cleanup := setupTestStorageForActivity(t)
-	defer cleanup()
-
-	sharedName := "shared-server-name"
-
-	stale := registerStaleIdentity(t, manager, sharedName, 48*time.Hour)
-
-	live := NewServerIdentity(&config.ServerConfig{Name: sharedName, URL: "https://example.com/" + sharedName + "-v2"}, "/tmp/mcp_config.json")
-	live.LastSeen = time.Now()
-	require.NoError(t, manager.saveServerIdentity(live))
-	require.NotEqual(t, stale.ID, live.ID, "test setup requires two distinct identities sharing one ServerName")
-
-	require.NoError(t, manager.db.SaveOAuthToken(&OAuthTokenRecord{
-		ServerName:  sharedName,
-		AccessToken: "live-servers-token",
+	require.NoError(t, manager.db.db.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists([]byte(OAuthTokenBucket))
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(hashedKey), data)
 	}))
 
-	deleted, err := manager.CleanupStaleServerData(24*time.Hour, map[string]bool{
-		live.ID: true,
+	deleted, err := manager.CleanupStaleServerData(30*24*time.Hour, map[string]bool{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, deleted, "identity itself must still be cleaned up")
+
+	// The OAuth token must survive: staleDecisionTime (computed at the top
+	// of CleanupStaleServerData, before this update transaction) is before
+	// futureUpdated, so the guard must have skipped the delete.
+	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(OAuthTokenBucket))
+		require.NotNil(t, bucket)
+		assert.NotNil(t, bucket.Get([]byte(hashedKey)), "token saved after staleness was decided must survive this cleanup pass")
+		return nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, deleted)
-
-	token, err := manager.db.GetOAuthToken(sharedName)
-	require.NoError(t, err, "the live identity's token must survive even though a stale identity shared its ServerName")
-	assert.Equal(t, "live-servers-token", token.AccessToken)
 }
+
+// NOTE: the OAuth-token-cleanup regression tests that used to live here
+// (TestCleanupStaleServerData_DeletesOAuthToken and
+// TestCleanupStaleServerData_PreservesOAuthTokenForLiveServerSharingName)
+// moved to manager_oauth_test.go (package storage_test). They saved tokens
+// directly under the plain ServerName via manager.db.SaveOAuthToken, but
+// production tokens are stored under oauth.GenerateServerKey(name, url) (a
+// SHA256-suffixed key) via PersistentTokenStore -- so they gave false
+// confidence for a fix (round 4's CleanupStaleServerData OAuth cleanup)
+// that was a silent no-op against real data (round 5 finding). The
+// replacement tests go through oauth.NewPersistentTokenStore's real
+// SaveToken/GetToken path, which requires importing internal/oauth --
+// internal/storage cannot import it back (oauth already imports storage),
+// so they had to move to the external storage_test package.

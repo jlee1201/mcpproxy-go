@@ -933,6 +933,15 @@ func (r *Runtime) ReplayToolCall(id string, arguments map[string]interface{}) (*
 	// Use modified arguments if provided, otherwise use original
 	callArgs := arguments
 	if callArgs == nil {
+		if originalCall.ArgumentsTruncated {
+			// The original record's Arguments were cleared by
+			// truncateToolCallRecordToFit because the record was too large
+			// to store (see storage.ToolCallRecord.ArgumentsTruncated).
+			// originalCall.Arguments is nil here, but that's "unknown", not
+			// "no arguments" -- silently replaying with nil would call the
+			// tool with the wrong (empty) arguments instead of refusing.
+			return nil, fmt.Errorf("cannot replay tool call %s: original arguments were truncated from storage and no replacement arguments were provided", id)
+		}
 		callArgs = originalCall.Arguments
 	}
 

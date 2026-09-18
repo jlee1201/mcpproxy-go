@@ -76,6 +76,7 @@ type ToolCallRecord struct {
 	MCPClientName    string                    `json:"mcp_client_name,omitempty"`   // MCP client name from InitializeRequest
 	MCPClientVersion string                    `json:"mcp_client_version,omitempty"` // MCP client version
 	Annotations      *config.ToolAnnotations   `json:"annotations,omitempty"`       // Tool behavior hints snapshot
+	ArgumentsTruncated bool                    `json:"arguments_truncated,omitempty"` // True if Arguments was cleared by truncateToolCallRecordToFit; nil Arguments on such a record is NOT "no arguments", it's "unknown" -- replay must refuse rather than substitute nil
 }
 
 // DiagnosticRecord represents a diagnostic event for a server

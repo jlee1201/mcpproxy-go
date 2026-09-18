@@ -2,8 +2,6 @@ package oauth
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -58,18 +56,13 @@ func NewPersistentTokenStore(serverName, serverURL string, storage *storage.Bolt
 	}
 }
 
-// GenerateServerKey creates a unique key for a server by combining name and URL
-// Exported for use by connection.go when persisting DCR credentials
+// GenerateServerKey creates a unique key for a server by combining name and URL.
+// Exported for use by connection.go when persisting DCR credentials.
+// Delegates to storage.GenerateOAuthServerKey, the single implementation --
+// this package imports internal/storage already, and storage cannot import
+// oauth back (that would cycle), so the canonical copy lives there.
 func GenerateServerKey(serverName, serverURL string) string {
-	// Create a unique identifier by combining server name and URL
-	combined := fmt.Sprintf("%s|%s", serverName, serverURL)
-
-	// Generate SHA256 hash for consistent length and uniqueness
-	hash := sha256.Sum256([]byte(combined))
-	hashStr := hex.EncodeToString(hash[:])
-
-	// Return first 16 characters of hash for readability (still highly unique)
-	key := fmt.Sprintf("%s_%s", serverName, hashStr[:16])
+	key := storage.GenerateOAuthServerKey(serverName, serverURL)
 
 	// Log key generation for debugging server key mismatches
 	zap.L().Debug("Generated OAuth server key",
