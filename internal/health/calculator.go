@@ -173,6 +173,19 @@ func CalculateHealth(input HealthCalculatorInput, cfg *HealthCalculatorConfig) *
 			Detail:     input.LastError,
 			Action:     action,
 		}
+	case "pending auth", "pending_auth":
+		// Parked awaiting user login (#1013): the client stopped redialing on
+		// purpose, so this never "resolves on its own" — it is always an
+		// attention item with a Sign-in CTA, regardless of OAuthRequired (a
+		// header-auth server whose token expired is parked the same way).
+		level, action, summary := oauthAttentionState(input.LastError)
+		return &contracts.HealthStatus{
+			Level:      level,
+			AdminState: StateEnabled,
+			Summary:    summary,
+			Detail:     input.LastError,
+			Action:     action,
+		}
 	case "connecting", "idle":
 		return &contracts.HealthStatus{
 			Level:      LevelDegraded,
@@ -436,6 +449,63 @@ func isOAuthRelatedError(err string) bool {
 		"access_denied",
 	}
 	for _, pattern := range oauthPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// oauthAttentionState maps an OAuth-related error into the health level, action,
+// and summary the user should see. A first-time sign-in (ErrOAuthPending) is an
+// expected setup step, so it surfaces as degraded/amber with "Sign-in required".
+// A previously-working token that broke (re-auth) stays unhealthy/red because it
+// is a regression from a working state. Both suggest the login action.
+//
+// Hand-ported (minimal slice only) from upstream's OAuth-classification feature
+// (#628) as a dependency of the "pending auth" case below (#1013/#1039) -- that
+// larger feature itself is out of this backport's scope.
+func oauthAttentionState(lastError string) (level, action, summary string) {
+	// Only a first-time deferred sign-in (ErrOAuthPending) is amber. Re-auth and
+	// every other genuine OAuth error (revoked token, invalid_grant, …) stays red
+	// because the server was -- or should have been -- working.
+	if isOAuthLoginRequiredError(lastError) {
+		return LevelDegraded, ActionLogin, "Sign-in required"
+	}
+	return LevelUnhealthy, ActionLogin, "Authentication required"
+}
+
+// isOAuthLoginRequiredError reports whether an OAuth-related error is a
+// first-time deferred sign-in (ErrOAuthPending), as opposed to a broken
+// previously-working token (re-auth), which is excluded so it stays red.
+func isOAuthLoginRequiredError(err string) bool {
+	if isOAuthReauthError(err) {
+		return false
+	}
+	loginPatterns := []string{
+		"oauth authentication required",
+		"login available",
+		"mcpproxy auth login",
+	}
+	for _, pattern := range loginPatterns {
+		if stringutil.ContainsIgnoreCase(err, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOAuthReauthError reports whether an OAuth-related error indicates that a
+// previously-working stored token broke and must be refreshed by signing in
+// again (as opposed to a first-time sign-in).
+func isOAuthReauthError(err string) bool {
+	reauthPatterns := []string{
+		"re-login available",
+		"re-authentication required",
+		"server error with stored token",
+		"stored token may be invalid",
+	}
+	for _, pattern := range reauthPatterns {
 		if stringutil.ContainsIgnoreCase(err, pattern) {
 			return true
 		}

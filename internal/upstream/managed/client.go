@@ -132,6 +132,25 @@ func (mc *Client) Connect(ctx context.Context) error {
 		zap.String("current_state", mc.StateManager.GetState().String()),
 		zap.Bool("list_tools_in_progress", mc.listToolsInProgress))
 
+	// CRITICAL FIX: When reconnecting from Error state, disconnect core client first
+	// to clear stale c.connected flag that may remain from a previous connection
+	// that died silently (e.g., HTTP server timeout). Without this, core client
+	// rejects the connect attempt with "client already connected" error.
+	// Hand-ported from upstream #286 (a prerequisite our fork's lineage never
+	// had) plus #1039's extension to also cover StatePendingAuth: Connect must
+	// clear the stale core client when waking a parked server too.
+	currentState := mc.StateManager.GetState()
+	if currentState == types.StateError || currentState == types.StateDisconnected || currentState == types.StatePendingAuth {
+		mc.logger.Debug("Disconnecting core client before reconnect to clear stale state",
+			zap.String("server", mc.Config.Name),
+			zap.String("from_state", currentState.String()))
+		if err := mc.coreClient.Disconnect(); err != nil {
+			mc.logger.Debug("Core client disconnect before reconnect returned",
+				zap.String("server", mc.Config.Name),
+				zap.Error(err))
+		}
+	}
+
 	// Transition to connecting state
 	mc.StateManager.TransitionTo(types.StateConnecting)
 
@@ -143,9 +162,11 @@ func (mc *Client) Connect(ctx context.Context) error {
 		if core.IsOAuthPending(err) {
 			mc.logger.Info("⏳ OAuth authentication pending user action",
 				zap.String("server", mc.Config.Name))
-			// Transition to PendingAuth state instead of Error
-			mc.StateManager.TransitionTo(types.StatePendingAuth)
-			mc.StateManager.SetError(err)
+			// Park in PendingAuth. SetPendingAuth (not TransitionTo + SetError:
+			// SetError forces StateError and would immediately undo the park, so
+			// the supervisor kept redialing a login-blocked server every 30s --
+			// #1013).
+			mc.StateManager.SetPendingAuth(err)
 			return fmt.Errorf("OAuth authentication pending: %w", err)
 		}
 		// Check if this is an OAuth authorization requirement (not an error)

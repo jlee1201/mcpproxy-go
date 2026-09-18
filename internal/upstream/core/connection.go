@@ -84,10 +84,16 @@ func (e *ErrOAuthPending) Error() string {
 	return fmt.Sprintf("OAuth authentication required for %s - use 'mcpproxy auth login --server=%s' or tray menu", e.ServerName, e.ServerName)
 }
 
-// IsOAuthPending checks if an error is an ErrOAuthPending
+// IsOAuthPending checks if an error is (or wraps) an ErrOAuthPending.
+//
+// It MUST unwrap: the pending error is raised inside an auth strategy and then
+// wrapped on its way out (e.g. "failed to connect: %w"). With a bare type
+// assertion the check never fires once wrapped, and every login-blocked
+// server falls through to the generic error path and gets re-dialed instead
+// of parked (upstream #1013).
 func IsOAuthPending(err error) bool {
-	_, ok := err.(*ErrOAuthPending)
-	return ok
+	var pending *ErrOAuthPending
+	return errors.As(err, &pending)
 }
 
 // OAuthStartResult contains the result of initiating an OAuth flow.
