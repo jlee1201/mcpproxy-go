@@ -9,9 +9,11 @@ the last **1 minute**, further automatic opens are suppressed (the user is
 shown the auth URL to open manually instead) until the count drops back
 below the threshold.
 
-The counter is tracked globally per-server in `internal/oauth/config.go`
-(`RecordBrowserOpen` / `RecentBrowserOpenCount`), not per-`Client` instance,
-since a new `Client` is typically constructed on each reconnect attempt.
+The counter is tracked globally per-server in `internal/oauth/config.go`, not
+per-`Client` instance, since a new `Client` is typically constructed on each
+reconnect attempt. The check and the record happen atomically under one lock
+(`TryRecordBrowserOpen`) so concurrent automatic attempts for the same server
+can't each observe a below-threshold count and jointly exceed it.
 
 ## Why burst-based, not a flat cooldown
 

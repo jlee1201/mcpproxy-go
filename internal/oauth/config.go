@@ -113,7 +113,33 @@ var (
 func RecordBrowserOpen(server string) {
 	browserOpenMu.Lock()
 	defer browserOpenMu.Unlock()
-	now := time.Now()
+	recordBrowserOpenLocked(server, time.Now())
+}
+
+// RecentBrowserOpenCount reports how many automatic browser-open attempts were
+// recorded for server within window, across all Client instances.
+func RecentBrowserOpenCount(server string, window time.Duration) int {
+	browserOpenMu.Lock()
+	defer browserOpenMu.Unlock()
+	return recentBrowserOpenCountLocked(server, window)
+}
+
+// TryRecordBrowserOpen atomically checks whether server is under threshold
+// within window and, if so, records this open. A separate check-then-record
+// pair would let concurrent callers each observe a below-threshold count and
+// all pass, jointly exceeding threshold; holding the lock across both steps
+// closes that race.
+func TryRecordBrowserOpen(server string, window time.Duration, threshold int) bool {
+	browserOpenMu.Lock()
+	defer browserOpenMu.Unlock()
+	if recentBrowserOpenCountLocked(server, window) >= threshold {
+		return false
+	}
+	recordBrowserOpenLocked(server, time.Now())
+	return true
+}
+
+func recordBrowserOpenLocked(server string, now time.Time) {
 	times := append(browserOpenTimes[server], now)
 	cutoff := now.Add(-browserOpenRetention)
 	pruned := times[:0]
@@ -125,11 +151,7 @@ func RecordBrowserOpen(server string) {
 	browserOpenTimes[server] = pruned
 }
 
-// RecentBrowserOpenCount reports how many automatic browser-open attempts were
-// recorded for server within window, across all Client instances.
-func RecentBrowserOpenCount(server string, window time.Duration) int {
-	browserOpenMu.Lock()
-	defer browserOpenMu.Unlock()
+func recentBrowserOpenCountLocked(server string, window time.Duration) int {
 	cutoff := time.Now().Add(-window)
 	count := 0
 	for _, t := range browserOpenTimes[server] {
