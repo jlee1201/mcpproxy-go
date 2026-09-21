@@ -4,6 +4,7 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -44,6 +45,15 @@ const (
 	// before giving up completely. After this duration, we assume the refresh token
 	// is no longer valid even if it wasn't explicitly rejected.
 	MaxExpiredTokenAge = 24 * time.Hour
+
+	// PendingAuthRecheckInterval is how long to wait before rechecking whether
+	// a server parked in StatePendingAuth has completed interactive login.
+	// Deliberately separate from RetryBackoffBase: this is not a failure retry
+	// (RetryCount must never advance for it — see handleRefreshFailure's doc
+	// comment on why that machinery assumes every increment is a real
+	// failure) and has no relation to the exponential-backoff schedule. The
+	// wait is bounded only by how long the user takes to complete login.
+	PendingAuthRecheckInterval = 30 * time.Second
 )
 
 // RefreshState represents the current state of token refresh for health reporting.
@@ -389,6 +399,13 @@ func (m *RefreshManager) executeImmediateRefresh(serverName string) {
 	}
 
 	if refreshErr != nil {
+		if errors.Is(refreshErr, ErrPendingInteractiveLogin) {
+			m.logger.Debug("OAuth token refresh skipped - server pending interactive login, will recheck",
+				zap.String("server", serverName),
+				zap.Duration("recheck_in", PendingAuthRecheckInterval))
+			m.rescheduleAfterDelay(serverName, PendingAuthRecheckInterval)
+			return
+		}
 		m.handleRefreshFailure(serverName, refreshErr)
 	} else {
 		m.handleRefreshSuccess(serverName)
@@ -640,6 +657,13 @@ func (m *RefreshManager) executeRefresh(serverName string) {
 	}
 
 	if refreshErr != nil {
+		if errors.Is(refreshErr, ErrPendingInteractiveLogin) {
+			m.logger.Debug("OAuth token refresh skipped - server pending interactive login, will recheck",
+				zap.String("server", serverName),
+				zap.Duration("recheck_in", PendingAuthRecheckInterval))
+			m.rescheduleAfterDelay(serverName, PendingAuthRecheckInterval)
+			return
+		}
 		m.handleRefreshFailure(serverName, refreshErr)
 	} else {
 		m.handleRefreshSuccess(serverName)
@@ -796,14 +820,18 @@ func classifyRefreshError(err error) string {
 		return "success"
 	}
 
-	errStr := err.Error()
-
 	// Guard-skip, not a failure: server is parked awaiting interactive login
-	// (see manager.go RefreshOAuthToken's StatePendingAuth check). Bucket it
-	// separately so dashboards don't conflate an intentional skip with a real failure.
-	if stringutil.ContainsIgnoreCase(errStr, "pending interactive login") {
+	// (see manager.go RefreshOAuthToken's IsBusyOrParked check). Bucket it
+	// separately so dashboards don't conflate an intentional skip with a real
+	// failure. Matched via errors.Is against the sentinel rather than
+	// string-matching the message, so rewording the message can't silently
+	// break this classification (and can't accidentally match an unrelated
+	// error that happens to contain this substring).
+	if errors.Is(err, ErrPendingInteractiveLogin) {
 		return "skipped_pending_auth"
 	}
+
+	errStr := err.Error()
 
 	// Check for terminal server-gone errors (server removed from config or not OAuth).
 	// These should never be retried because the server no longer exists or doesn't use OAuth.

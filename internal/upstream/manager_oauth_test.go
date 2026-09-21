@@ -180,6 +180,51 @@ func TestRefreshOAuthToken_ServerNotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "server not found")
 }
 
+// TestRefreshOAuthToken_SkipsWhenPendingAuth pins the must-fix: a server
+// parked in StatePendingAuth must have its refresh skipped via the typed
+// sentinel (so RefreshManager can classify this via errors.Is, not by
+// string-matching the message), not silently attempt a reconnect that
+// cannot succeed until the user completes interactive login.
+func TestRefreshOAuthToken_SkipsWhenPendingAuth(t *testing.T) {
+	logger := zap.NewNop()
+
+	serverConfig := &config.ServerConfig{
+		Name:     "parked-server",
+		URL:      "https://example.com/mcp",
+		Protocol: "http",
+		Enabled:  true,
+		Created:  time.Now(),
+		OAuth: &config.OAuthConfig{
+			ClientID: "test-client-id",
+		},
+	}
+
+	tempDir := t.TempDir()
+	db, err := storage.NewBoltDB(tempDir, logger.Sugar())
+	require.NoError(t, err)
+	defer db.Close()
+
+	manager := &Manager{
+		clients:        make(map[string]*managed.Client),
+		logger:         logger,
+		storage:        db,
+		secretResolver: secret.NewResolver(),
+	}
+
+	client, err := managed.NewClient("parked-server", serverConfig, logger, nil, &config.Config{}, db, secret.NewResolver())
+	require.NoError(t, err)
+	manager.clients["parked-server"] = client
+
+	// Park the client exactly as a deferred-OAuth connect failure would.
+	client.StateManager.SetPendingAuth(errors.New("OAuth authentication required for parked-server: login available via Web UI"))
+
+	err = manager.RefreshOAuthToken("parked-server")
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, oauth.ErrPendingInteractiveLogin),
+		"RefreshOAuthToken must wrap the typed sentinel so callers can classify this via errors.Is, not string-matching")
+}
+
 // TestTokenFingerprint verifies the identity used to decide whether a persisted
 // token is NEW: the same untouched token must compare equal (so the scan does
 // not redial), any re-issue must not.

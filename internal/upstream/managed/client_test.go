@@ -319,3 +319,60 @@ func TestTryReconnect_PreservesRetryCountAcrossFailures(t *testing.T) {
 			"otherwise ShouldRetryOAuth() would misclassify this plain connectivity failure as still "+
 			"OAuth-blocked and park it behind the 5min->24h OAuth ladder instead of the normal one")
 }
+
+// TestForceReconnect_NoOpWhenPendingAuth pins the should-consider that
+// unified ForceReconnect's still-busy/parked guard behind
+// types.ConnectionState.IsBusyOrParked() (previously a bespoke
+// StatePendingAuth == check): a server parked awaiting interactive OAuth
+// login must not have ForceReconnect kick off a redial goroutine, since that
+// redial cannot succeed until the user completes login and would otherwise
+// tear down the parked state chasing a login that hasn't happened yet.
+func TestForceReconnect_NoOpWhenPendingAuth(t *testing.T) {
+	cfg := &config.ServerConfig{Name: "test-force-reconnect-pending"}
+	mc, err := NewClient("test-force-reconnect-pending", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	mc.StateManager.SetPendingAuth(fmt.Errorf("OAuth authentication required: login available via Web UI"))
+	require.Equal(t, types.StatePendingAuth, mc.StateManager.GetState())
+
+	mc.ForceReconnect("test")
+
+	// ForceReconnect's guard should return before ever spawning tryReconnect.
+	// Give a wrongly-spawned goroutine a moment to run and corrupt state
+	// before asserting it never happened.
+	time.Sleep(50 * time.Millisecond)
+
+	info := mc.StateManager.GetConnectionInfo()
+	assert.Equal(t, types.StatePendingAuth, info.State,
+		"ForceReconnect must not touch a client parked in StatePendingAuth")
+	assert.Equal(t, 0, info.RetryCount,
+		"a no-op ForceReconnect must never advance retry state -- if this is nonzero, tryReconnect ran anyway")
+}
+
+// TestTryReconnect_AbortsWhenPendingAuth pins the concurrency should-consider:
+// ForceReconnect's PendingAuth guard is checked once, synchronously, but the
+// actual redial happens in a goroutine dispatched afterward (`go
+// mc.tryReconnect()`). Between those two points a concurrent Connect()
+// attempt can park the client in StatePendingAuth for the first time, so
+// tryReconnect must recheck for itself immediately before tearing down
+// state, not just trust the caller's now-stale check.
+//
+// Called directly (not via ForceReconnect) to simulate landing exactly in
+// that race window: state is PendingAuth by the time tryReconnect runs,
+// regardless of what ForceReconnect saw when it was dispatched.
+func TestTryReconnect_AbortsWhenPendingAuth(t *testing.T) {
+	cfg := &config.ServerConfig{Name: "test-tryreconnect-pending"}
+	mc, err := NewClient("test-tryreconnect-pending", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	mc.StateManager.SetPendingAuth(fmt.Errorf("OAuth authentication required: login available via Web UI"))
+	require.Equal(t, types.StatePendingAuth, mc.StateManager.GetState())
+
+	mc.tryReconnect()
+
+	info := mc.StateManager.GetConnectionInfo()
+	assert.Equal(t, types.StatePendingAuth, info.State,
+		"tryReconnect must abort before Disconnect/ResetForReconnect when it finds PendingAuth, not race a redial against the pending login")
+	assert.Equal(t, 0, info.RetryCount,
+		"an aborted tryReconnect must not touch retry state")
+}

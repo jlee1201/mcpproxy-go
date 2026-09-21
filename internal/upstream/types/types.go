@@ -124,6 +124,27 @@ func OAuthRetryBackoffDuration(oauthRetryCount int) time.Duration {
 // that self-healing at ~48 requests/day instead of ~2880.
 const GaveUpProbeInterval = 30 * time.Minute
 
+// IsBusyOrParked reports whether a fresh connect/redial attempt on top of
+// this state would be wasted (an attempt is already in flight) or premature
+// (parked waiting on the user). ShouldAutoReconnect, ForceReconnect, and
+// RefreshOAuthToken's PendingAuth guard all delegate to this single
+// predicate so a future state added to the set only needs updating here --
+// not independently re-derived at each call site, which is exactly the drift
+// between ShouldAutoReconnect and StateManager.IsConnecting() that caused
+// the reconnect storm this type was introduced to fix. Deliberately separate
+// from StateManager.IsConnecting(): that method is a narrower, thread-safe
+// "still connecting" check used where PendingAuth must NOT count as busy
+// (Client.Connect()'s own re-entry guard, so a user-initiated login can wake
+// a parked server, #1039).
+func (s ConnectionState) IsBusyOrParked() bool {
+	switch s {
+	case StateConnecting, StateAuthenticating, StateDiscovering, StatePendingAuth:
+		return true
+	default:
+		return false
+	}
+}
+
 // ShouldAutoReconnect reports whether an automatic (supervisor-driven) reconnect
 // attempt is appropriate given the connection's failure history. It returns false
 // while a backoff window from the last failure has not elapsed, for servers
@@ -135,10 +156,8 @@ func (ci *ConnectionInfo) ShouldAutoReconnect(now time.Time) bool {
 	if ci == nil {
 		return true
 	}
-	switch ci.State {
-	case StatePendingAuth, StateConnecting, StateAuthenticating, StateDiscovering:
-		// These are the same in-flight states StateManager.IsConnecting() treats
-		// as busy. Without this, the reconcile ticker's GetAllStates() read (taken
+	if ci.State.IsBusyOrParked() {
+		// Without this, the reconcile ticker's GetAllStates() read (taken
 		// outside any lock so it never blocks the hot event path, see
 		// Supervisor.reconcile's comment) can land mid-connect and see e.g.
 		// StateConnecting hit the default case below, planning a second
@@ -152,6 +171,8 @@ func (ci *ConnectionInfo) ShouldAutoReconnect(now time.Time) bool {
 		// tick period) restart its whole OAuth flow every single reconcile tick,
 		// forever.
 		return false
+	}
+	switch ci.State {
 	case StateError:
 		// OAuth-classified failures are paced by SetOAuthError's coarse ladder,
 		// which bumps OAuthRetryCount and NOT RetryCount. Without this branch such

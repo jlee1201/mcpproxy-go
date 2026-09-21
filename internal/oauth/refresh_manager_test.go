@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -298,6 +299,50 @@ func TestRefreshManager_StopOnPermanentFailure(t *testing.T) {
 	if schedule != nil {
 		assert.Equal(t, RefreshStateFailed, schedule.RefreshState, "State should be failed for permanent error")
 	}
+}
+
+// Test that a refresh skipped for PendingAuth never advances RetryCount or
+// reaches RefreshStateFailed/RefreshStateRetrying, no matter how many times
+// it recurs -- the wait is bounded only by the user completing login, not by
+// the retry/backoff circuit breaker (which has a finite MaxRetries).
+func TestRefreshManager_PendingAuthSkipNeverReachesFailedState(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	store := newMockTokenStore()
+	emitter := &mockEventEmitter{}
+
+	config := &RefreshManagerConfig{
+		Threshold:  0.1,
+		MaxRetries: 2, // low ceiling: if RetryCount were advancing, this would trip fast
+	}
+
+	manager := NewRefreshManager(store, nil, config, logger)
+	runtime := &mockRuntime{
+		refreshErr: fmt.Errorf("server test-server is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin),
+	}
+	manager.SetRuntime(runtime)
+	manager.SetEventEmitter(emitter)
+
+	ctx := context.Background()
+	require.NoError(t, manager.Start(ctx))
+	defer manager.Stop()
+
+	expiresAt := time.Now().Add(10 * time.Second)
+	manager.OnTokenSaved("test-server", expiresAt)
+	time.Sleep(50 * time.Millisecond)
+
+	// Drive several rounds directly, well past MaxRetries, to prove the
+	// skip path never touches the failure machinery.
+	for i := 0; i < 5; i++ {
+		manager.executeRefresh("test-server")
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	schedule := manager.GetSchedule("test-server")
+	require.NotNil(t, schedule)
+	assert.Equal(t, 0, schedule.RetryCount, "RetryCount must not advance for a PendingAuth skip")
+	assert.NotEqual(t, RefreshStateFailed, schedule.RefreshState)
+	assert.NotEqual(t, RefreshStateRetrying, schedule.RefreshState)
+	assert.Equal(t, 0, emitter.GetFailedEvents(), "PendingAuth skip must not emit a failure event")
 }
 
 // T015: Test RefreshManager coordination with OAuthFlowCoordinator
@@ -651,6 +696,9 @@ func TestClassifyRefreshError(t *testing.T) {
 		{"server not found", errors.New("server not found: gcw2"), "failed_server_gone"},
 		{"server not found wrapped", errors.New("failed to refresh OAuth token: server not found: myserver"), "failed_server_gone"},
 		{"server does not use OAuth", errors.New("server does not use OAuth: gcw2"), "failed_server_gone"},
+		// Guard-skip: matched via errors.Is against the sentinel, not string content.
+		{"pending interactive login sentinel", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin), "skipped_pending_auth"},
+		{"pending interactive login wrapped twice", fmt.Errorf("failed to refresh OAuth token: %w", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin)), "skipped_pending_auth"},
 	}
 
 	for _, tt := range tests {

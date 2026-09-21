@@ -710,18 +710,24 @@ func (mc *Client) ForceReconnect(reason string) {
 		return
 	}
 
-	// Server is parked pending an interactive OAuth login (no persisted token,
-	// automatic reconnect already deferred to avoid blocking). Redialing here
-	// cannot succeed until the user completes login via CLI/tray/Web UI, and
-	// each attempt costs a real request against the upstream. ForceReconnect
-	// is the one call path exempt from ShouldAutoReconnect's backoff policy
-	// (see types.go PendingAuth doc comment), so without this check callers
-	// like RefreshOAuthToken's proactive refresh loop storm this server on
-	// every tick instead of waiting for the explicit login.
-	if mc.StateManager.GetState() == types.StatePendingAuth {
-		mc.logger.Debug("Force reconnect skipped - server is parked pending interactive login",
+	// Server is busy (already connecting/authenticating/discovering, caught
+	// again below by IsConnecting() too but re-checked here via the shared
+	// predicate for consistency) or parked pending an interactive OAuth login
+	// (no persisted token, automatic reconnect already deferred to avoid
+	// blocking). Redialing here cannot succeed until the user completes
+	// login via CLI/tray/Web UI, and each attempt costs a real request
+	// against the upstream. ForceReconnect is the one call path exempt from
+	// ShouldAutoReconnect's backoff policy (see types.go PendingAuth doc
+	// comment), so without this check callers like RefreshOAuthToken's
+	// proactive refresh loop storm this server on every tick instead of
+	// waiting for the explicit login. Note this check has a TOCTOU race with
+	// the goroutine dispatched below -- see tryReconnect's own recheck for
+	// why that's still needed even with this guard in place.
+	if mc.StateManager.GetState().IsBusyOrParked() {
+		mc.logger.Debug("Force reconnect skipped - server is busy or parked pending interactive login",
 			zap.String("server", serverName),
-			zap.String("reason", reason))
+			zap.String("reason", reason),
+			zap.String("state", mc.StateManager.GetState().String()))
 		return
 	}
 
@@ -766,6 +772,22 @@ func (mc *Client) tryReconnect() {
 	mc.logger.Info("Starting reconnection attempt",
 		zap.String("server", mc.Config.Name),
 		zap.String("current_state", mc.StateManager.GetState().String()))
+
+	// Recheck PendingAuth here, not just in ForceReconnect's caller-side
+	// guard: this goroutine runs after a dispatch delay, during which a
+	// concurrent Connect() attempt (e.g. from the reconcile loop) can have
+	// already failed and parked the state in PendingAuth. Without this
+	// recheck, disconnecting/resetting below would tear down that freshly
+	// parked state and race a redial against the login flow it's waiting
+	// on. reconnectInProgress (checked above) only dedupes concurrent
+	// tryReconnect calls against each other -- it doesn't protect against
+	// state that changed for an unrelated reason between the check in
+	// ForceReconnect and this goroutine actually running.
+	if mc.StateManager.GetState() == types.StatePendingAuth {
+		mc.logger.Debug("Reconnection attempt aborted - server parked pending interactive login since dispatch",
+			zap.String("server", mc.Config.Name))
+		return
+	}
 
 	// First, disconnect the current client to clean up any broken connections
 	// We don't need to hold the mutex here as Disconnect() already handles it
