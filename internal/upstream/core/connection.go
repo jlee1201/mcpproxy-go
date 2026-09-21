@@ -2458,24 +2458,23 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 	// Check if this is a manual OAuth flow using the proper context key
 	isManualFlow := c.isManualOAuthFlow(ctx)
 
-	// Rate limit browser opening to prevent spam (CRITICAL FIX for Phase 1)
-	// Skip rate limiting for manual OAuth flows
-	browserRateLimit := 5 * time.Minute
-	c.oauthMu.RLock()
-	timeSinceLastBrowser := time.Since(c.lastOAuthTimestamp)
-	c.oauthMu.RUnlock()
-	// Single-flight (B): also honor a global, cross-Client-instance browser-open
-	// timestamp so an automatic reconnect on a new Client won't reopen a tab the
-	// moment another flow for this server just did.
-	if globalSince := oauth.TimeSinceBrowserOpen(c.config.Name); globalSince < timeSinceLastBrowser {
-		timeSinceLastBrowser = globalSince
-	}
+	// Rate limit browser opening to prevent an automatic reconnect-retry storm
+	// from repeatedly popping browser tabs. Skip rate limiting for manual OAuth
+	// flows. Gated on a burst count rather than "any attempt within N minutes" —
+	// a single automatic retry landing seconds apart from an unrelated attempt
+	// is not a storm and shouldn't block it (see docs/oauth-browser-rate-limit.md).
+	const (
+		browserBurstWindow    = 1 * time.Minute
+		browserBurstThreshold = 5 // automatic attempts allowed within the window before throttling
+	)
+	recentAttempts := oauth.RecentBrowserOpenCount(c.config.Name, browserBurstWindow)
 
-	if !isManualFlow && timeSinceLastBrowser < browserRateLimit {
-		c.logger.Warn("⏱️ Browser opening rate limited - OAuth attempt too soon after previous attempt",
+	if !isManualFlow && recentAttempts >= browserBurstThreshold {
+		c.logger.Warn("⏱️ Browser opening rate limited - too many automatic OAuth attempts in a short window",
 			zap.String("server", c.config.Name),
-			zap.Duration("time_since_last", timeSinceLastBrowser),
-			zap.Duration("rate_limit", browserRateLimit),
+			zap.Int("recent_attempts", recentAttempts),
+			zap.Duration("window", browserBurstWindow),
+			zap.Int("threshold", browserBurstThreshold),
 			zap.String("auth_url", authURL))
 
 		fmt.Printf("OAuth authorization required for %s, but browser opening is rate limited.\n", c.config.Name)
@@ -2484,7 +2483,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		if isManualFlow {
 			c.logger.Info("🎯 Manual OAuth flow detected - bypassing rate limiting",
 				zap.String("server", c.config.Name),
-				zap.Duration("time_since_last", timeSinceLastBrowser))
+				zap.Int("recent_automatic_attempts", recentAttempts))
 		}
 
 		// Open the browser to the authorization URL
@@ -2504,7 +2503,9 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		c.oauthMu.Lock()
 		c.lastOAuthTimestamp = time.Now()
 		c.oauthMu.Unlock()
-		oauth.RecordBrowserOpen(c.config.Name)
+		if !isManualFlow {
+			oauth.RecordBrowserOpen(c.config.Name)
+		}
 	}
 
 	// Wait for the callback using our callback server coordination system
@@ -2816,9 +2817,6 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 		fmt.Printf("Please open the following URL in your browser: %s\n", authURL)
 	} else {
 		result.BrowserOpened = true
-		// Record for the cross-instance browser-open throttle so a following
-		// auto-reconnect on another Client instance won't open a second tab.
-		oauth.RecordBrowserOpen(c.config.Name)
 	}
 
 	// Update the timestamp
@@ -3140,9 +3138,6 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 		result.BrowserError = err.Error()
 	} else {
 		result.BrowserOpened = true
-		// Record for the cross-instance browser-open throttle so a following
-		// auto-reconnect on another Client instance won't open a second tab.
-		oauth.RecordBrowserOpen(c.config.Name)
 		c.logger.Info("✅ Browser opened successfully",
 			zap.String("server", c.config.Name))
 	}
