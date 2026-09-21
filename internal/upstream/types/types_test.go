@@ -272,6 +272,31 @@ func TestConnectionInfo_ShouldAutoReconnect(t *testing.T) {
 	}
 }
 
+// TestConnectionState_IsBusyOrParked pins the single predicate that
+// ShouldAutoReconnect, ForceReconnect, and RefreshOAuthToken's guard now all
+// delegate to, so the three call sites can't drift out of sync the way
+// ShouldAutoReconnect and StateManager.IsConnecting() once did.
+func TestConnectionState_IsBusyOrParked(t *testing.T) {
+	tests := []struct {
+		state    ConnectionState
+		expected bool
+	}{
+		{StateDisconnected, false},
+		{StateConnecting, true},
+		{StatePendingAuth, true},
+		{StateAuthenticating, true},
+		{StateDiscovering, true},
+		{StateReady, false},
+		{StateError, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state.String(), func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.state.IsBusyOrParked())
+		})
+	}
+}
+
 // TestOAuthRetryBackoffDuration pins the coarse OAuth ladder shared by
 // StateManager.ShouldRetryOAuth and the supervisor's reconnect gate.
 func TestOAuthRetryBackoffDuration(t *testing.T) {

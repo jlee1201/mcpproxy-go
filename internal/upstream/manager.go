@@ -2422,6 +2422,27 @@ func (m *Manager) RefreshOAuthToken(serverName string) error {
 		return fmt.Errorf("server not found: %s", serverName)
 	}
 
+	// Server is busy (already connecting/authenticating/discovering) or
+	// parked pending an interactive login (deferred OAuth, no persisted
+	// token yet) - a refresh/reconnect here cannot succeed without the user
+	// completing login via CLI/tray/Web UI, and ForceReconnect below bypasses
+	// ShouldAutoReconnect's backoff entirely, so without this check every
+	// caller of RefreshOAuthToken (proactive refresh scheduling, the CLI/API
+	// passthrough) storms the server instead of waiting for login. Checked
+	// before the OAuth-detection block below since it's cheaper (no storage
+	// read) and applies regardless of OAuth type. This is NOT redundant with
+	// the equivalent check inside ForceReconnect: that check is re-evaluated
+	// against a TOCTOU race (state can change between the check and the
+	// goroutine dispatch) and guards direct ForceReconnect callers that skip
+	// this function entirely - both checks are load-bearing, neither
+	// supersedes the other.
+	if client.GetState().IsBusyOrParked() {
+		m.logger.Debug("Skipping OAuth token refresh - server is busy or parked pending interactive login",
+			zap.String("server", serverName),
+			zap.String("state", client.GetState().String()))
+		return fmt.Errorf("server %s is busy or parked pending interactive login, refresh skipped: %w", serverName, oauth.ErrPendingInteractiveLogin)
+	}
+
 	// Check if server uses OAuth via either static config or dynamic discovery
 	serverConfig := client.GetConfig()
 	hasStaticOAuth := serverConfig != nil && serverConfig.OAuth != nil
@@ -2446,21 +2467,6 @@ func (m *Manager) RefreshOAuthToken(serverName string) error {
 
 	if !hasStaticOAuth && !hasStoredTokens {
 		return fmt.Errorf("server does not use OAuth: %s", serverName)
-	}
-
-	// Server is parked pending an interactive login (deferred OAuth, no
-	// persisted token yet) - a refresh/reconnect here cannot succeed without
-	// the user completing login via CLI/tray/Web UI, and ForceReconnect below
-	// bypasses ShouldAutoReconnect's backoff entirely, so without this check
-	// every caller of RefreshOAuthToken (proactive refresh scheduling, the
-	// CLI/API passthrough) storms the server instead of waiting for login.
-	// Belt-and-suspenders with the equivalent check inside ForceReconnect
-	// itself - keeping both means any other future caller of ForceReconnect
-	// is covered too.
-	if client.GetState() == types.StatePendingAuth {
-		m.logger.Debug("Skipping OAuth token refresh - server is parked pending interactive login",
-			zap.String("server", serverName))
-		return fmt.Errorf("server %s is pending interactive login, refresh skipped", serverName)
 	}
 
 	// Force a reconnection which will trigger token refresh via mcp-go's
