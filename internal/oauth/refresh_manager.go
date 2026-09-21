@@ -798,6 +798,13 @@ func classifyRefreshError(err error) string {
 
 	errStr := err.Error()
 
+	// Guard-skip, not a failure: server is parked awaiting interactive login
+	// (see manager.go RefreshOAuthToken's StatePendingAuth check). Bucket it
+	// separately so dashboards don't conflate an intentional skip with a real failure.
+	if stringutil.ContainsIgnoreCase(errStr, "pending interactive login") {
+		return "skipped_pending_auth"
+	}
+
 	// Check for terminal server-gone errors (server removed from config or not OAuth).
 	// These should never be retried because the server no longer exists or doesn't use OAuth.
 	serverGoneErrors := []string{

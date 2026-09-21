@@ -710,6 +710,21 @@ func (mc *Client) ForceReconnect(reason string) {
 		return
 	}
 
+	// Server is parked pending an interactive OAuth login (no persisted token,
+	// automatic reconnect already deferred to avoid blocking). Redialing here
+	// cannot succeed until the user completes login via CLI/tray/Web UI, and
+	// each attempt costs a real request against the upstream. ForceReconnect
+	// is the one call path exempt from ShouldAutoReconnect's backoff policy
+	// (see types.go PendingAuth doc comment), so without this check callers
+	// like RefreshOAuthToken's proactive refresh loop storm this server on
+	// every tick instead of waiting for the explicit login.
+	if mc.StateManager.GetState() == types.StatePendingAuth {
+		mc.logger.Debug("Force reconnect skipped - server is parked pending interactive login",
+			zap.String("server", serverName),
+			zap.String("reason", reason))
+		return
+	}
+
 	mc.logger.Info("Force reconnect requested",
 		zap.String("server", serverName),
 		zap.String("reason", reason),

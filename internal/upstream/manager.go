@@ -2448,6 +2448,21 @@ func (m *Manager) RefreshOAuthToken(serverName string) error {
 		return fmt.Errorf("server does not use OAuth: %s", serverName)
 	}
 
+	// Server is parked pending an interactive login (deferred OAuth, no
+	// persisted token yet) - a refresh/reconnect here cannot succeed without
+	// the user completing login via CLI/tray/Web UI, and ForceReconnect below
+	// bypasses ShouldAutoReconnect's backoff entirely, so without this check
+	// every caller of RefreshOAuthToken (proactive refresh scheduling, the
+	// CLI/API passthrough) storms the server instead of waiting for login.
+	// Belt-and-suspenders with the equivalent check inside ForceReconnect
+	// itself - keeping both means any other future caller of ForceReconnect
+	// is covered too.
+	if client.GetState() == types.StatePendingAuth {
+		m.logger.Debug("Skipping OAuth token refresh - server is parked pending interactive login",
+			zap.String("server", serverName))
+		return fmt.Errorf("server %s is pending interactive login, refresh skipped", serverName)
+	}
+
 	// Force a reconnection which will trigger token refresh via mcp-go's
 	// automatic token refresh when TokenStore provides a refresh token
 	client.ForceReconnect("oauth_token_refresh")
