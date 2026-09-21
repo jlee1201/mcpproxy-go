@@ -126,16 +126,31 @@ const GaveUpProbeInterval = 30 * time.Minute
 
 // ShouldAutoReconnect reports whether an automatic (supervisor-driven) reconnect
 // attempt is appropriate given the connection's failure history. It returns false
-// while a backoff window from the last failure has not elapsed and for servers
+// while a backoff window from the last failure has not elapsed, for servers
 // parked in PendingAuth — redialing cannot succeed until the user completes the
-// OAuth login, and each attempt costs real requests against the upstream. Manual
-// reconnects, login flows, and reconnect-on-use are not subject to this policy.
+// OAuth login, and each attempt costs real requests against the upstream — and
+// for a connect attempt already in flight. Manual reconnects, login flows, and
+// reconnect-on-use are not subject to this policy.
 func (ci *ConnectionInfo) ShouldAutoReconnect(now time.Time) bool {
 	if ci == nil {
 		return true
 	}
 	switch ci.State {
-	case StatePendingAuth:
+	case StatePendingAuth, StateConnecting, StateAuthenticating, StateDiscovering:
+		// These are the same in-flight states StateManager.IsConnecting() treats
+		// as busy. Without this, the reconcile ticker's GetAllStates() read (taken
+		// outside any lock so it never blocks the hot event path, see
+		// Supervisor.reconcile's comment) can land mid-connect and see e.g.
+		// StateConnecting hit the default case below, planning a second
+		// ActionConnect. That plan doesn't execute until a goroutine dispatch
+		// later, by which point the original attempt has often already failed and
+		// parked in PendingAuth -- and Client.Connect()'s own re-entry guard only
+		// rejects IsConnecting()/IsReady(), not PendingAuth (intentionally, so a
+		// user-initiated login can wake a parked server, #1039). The combination
+		// let a slow-failing upstream (workdaygusto: OAuth setup succeeds locally
+		// in ~1s, then the actual MCP init hangs until it errors near the full 30s
+		// tick period) restart its whole OAuth flow every single reconcile tick,
+		// forever.
 		return false
 	case StateError:
 		// OAuth-classified failures are paced by SetOAuthError's coarse ladder,

@@ -1212,6 +1212,16 @@ func TestSupervisor_Reconcile_RespectsRetryBackoff(t *testing.T) {
 	reconcileAndDrain()
 	require.False(t, isConnected(), "supervisor re-dialed a server pending OAuth login")
 
+	// A server whose connect attempt is still in flight (workdaygusto's 30s
+	// loop, #1039-follow-on): the mock reports Connected=false because the
+	// attempt hasn't succeeded yet, so without this gate the reconcile ticker
+	// plans a redundant second ActionConnect on top of the one already running.
+	setConnectionState(false, &types.ConnectionInfo{
+		State: types.StateConnecting,
+	})
+	reconcileAndDrain()
+	require.False(t, isConnected(), "supervisor re-dialed a server whose connect attempt was still in flight")
+
 	// Once the backoff window has elapsed, reconciliation reconnects as before.
 	setConnectionState(false, &types.ConnectionInfo{
 		State:         types.StateError,
