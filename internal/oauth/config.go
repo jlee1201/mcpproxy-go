@@ -93,33 +93,73 @@ var globalCallbackManager = &CallbackServerManager{
 	logger:  zap.L().Named("oauth-callback"),
 }
 
-// Global browser-open throttle, keyed by upstream server name. Unlike the
-// per-Client lastOAuthTimestamp, this coordinates across Client instances so an
-// automatic reconnect running on a freshly-created Client won't reopen a browser
-// tab while another flow for the same server just did (single-flight, defense in
-// depth on top of state-routed callbacks). Manual `auth login` flows bypass it.
+// Global browser-open history, keyed by upstream server name. Coordinates
+// across Client instances so a burst of automatic reconnects spread across
+// freshly-created Clients for the same server is still counted as one burst.
+// Manual `auth login` flows are never gated by this (see isManualFlow in
+// handleOAuthAuthorization) and don't record into it.
+//
+// browserOpenRetention just bounds memory for servers that see occasional
+// opens over a long uptime; it is not itself a rate-limit window.
+const browserOpenRetention = 10 * time.Minute
+
 var (
-	browserOpenMu   sync.Mutex
-	lastBrowserOpen = make(map[string]time.Time)
+	browserOpenMu    sync.Mutex
+	browserOpenTimes = make(map[string][]time.Time)
 )
 
-// RecordBrowserOpen notes that a browser was just opened for server's OAuth flow.
+// RecordBrowserOpen notes that a browser was just opened for server's automatic
+// OAuth flow, and prunes entries older than browserOpenRetention.
 func RecordBrowserOpen(server string) {
 	browserOpenMu.Lock()
-	lastBrowserOpen[server] = time.Now()
-	browserOpenMu.Unlock()
+	defer browserOpenMu.Unlock()
+	recordBrowserOpenLocked(server, time.Now())
 }
 
-// TimeSinceBrowserOpen reports how long since the last recorded browser open for
-// server, across all Client instances. Returns a very large duration if none.
-func TimeSinceBrowserOpen(server string) time.Duration {
+// RecentBrowserOpenCount reports how many automatic browser-open attempts were
+// recorded for server within window, across all Client instances.
+func RecentBrowserOpenCount(server string, window time.Duration) int {
 	browserOpenMu.Lock()
 	defer browserOpenMu.Unlock()
-	t, ok := lastBrowserOpen[server]
-	if !ok {
-		return 365 * 24 * time.Hour
+	return recentBrowserOpenCountLocked(server, window)
+}
+
+// TryRecordBrowserOpen atomically checks whether server is under threshold
+// within window and, if so, records this open. A separate check-then-record
+// pair would let concurrent callers each observe a below-threshold count and
+// all pass, jointly exceeding threshold; holding the lock across both steps
+// closes that race.
+func TryRecordBrowserOpen(server string, window time.Duration, threshold int) bool {
+	browserOpenMu.Lock()
+	defer browserOpenMu.Unlock()
+	if recentBrowserOpenCountLocked(server, window) >= threshold {
+		return false
 	}
-	return time.Since(t)
+	recordBrowserOpenLocked(server, time.Now())
+	return true
+}
+
+func recordBrowserOpenLocked(server string, now time.Time) {
+	times := append(browserOpenTimes[server], now)
+	cutoff := now.Add(-browserOpenRetention)
+	pruned := times[:0]
+	for _, t := range times {
+		if t.After(cutoff) {
+			pruned = append(pruned, t)
+		}
+	}
+	browserOpenTimes[server] = pruned
+}
+
+func recentBrowserOpenCountLocked(server string, window time.Duration) int {
+	cutoff := time.Now().Add(-window)
+	count := 0
+	for _, t := range browserOpenTimes[server] {
+		if t.After(cutoff) {
+			count++
+		}
+	}
+	return count
 }
 
 // Global token store manager to persist tokens across client instances

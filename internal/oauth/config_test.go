@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -743,4 +745,48 @@ func TestCreateOAuthConfig_FallsBackToServerURL(t *testing.T) {
 	resource, hasResource := extraParams["resource"]
 	assert.True(t, hasResource, "extraParams should contain 'resource' key (fallback)")
 	assert.Equal(t, mockMetadataServer.URL+"/mcp", resource, "Resource should fall back to server URL")
+}
+
+func TestTryRecordBrowserOpen_ThrottlesAfterThreshold(t *testing.T) {
+	server := t.Name()
+	const threshold = 5
+	window := time.Minute
+
+	for i := 0; i < threshold; i++ {
+		assert.True(t, TryRecordBrowserOpen(server, window, threshold), "attempt %d should be allowed", i+1)
+	}
+	assert.False(t, TryRecordBrowserOpen(server, window, threshold), "6th attempt within the window should be throttled")
+	assert.Equal(t, threshold, RecentBrowserOpenCount(server, window))
+}
+
+func TestRecentBrowserOpenCount_IgnoresEntriesOutsideWindow(t *testing.T) {
+	server := t.Name()
+	RecordBrowserOpen(server)
+	assert.Equal(t, 1, RecentBrowserOpenCount(server, time.Minute))
+	assert.Equal(t, 0, RecentBrowserOpenCount(server, 0))
+}
+
+// Regression test for the check-then-record race: concurrent automatic
+// attempts for the same server must not jointly exceed threshold.
+func TestTryRecordBrowserOpen_ConcurrentBurstStaysAtThreshold(t *testing.T) {
+	server := t.Name()
+	const threshold = 5
+	const concurrentAttempts = 50
+	window := time.Minute
+
+	var wg sync.WaitGroup
+	var allowedCount int32
+	for i := 0; i < concurrentAttempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if TryRecordBrowserOpen(server, window, threshold) {
+				atomic.AddInt32(&allowedCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.EqualValues(t, threshold, allowedCount, "exactly threshold attempts should have been let through")
+	assert.Equal(t, threshold, RecentBrowserOpenCount(server, window))
 }
