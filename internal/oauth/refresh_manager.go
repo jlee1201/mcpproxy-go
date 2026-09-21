@@ -400,7 +400,7 @@ func (m *RefreshManager) executeImmediateRefresh(serverName string) {
 
 	if refreshErr != nil {
 		if errors.Is(refreshErr, ErrPendingInteractiveLogin) {
-			m.logger.Debug("OAuth token refresh skipped - server pending interactive login, will recheck",
+			m.logger.Debug("OAuth token refresh skipped - server busy or parked pending interactive login, will recheck",
 				zap.String("server", serverName),
 				zap.Duration("recheck_in", PendingAuthRecheckInterval))
 			m.rescheduleAfterDelay(serverName, PendingAuthRecheckInterval)
@@ -658,7 +658,7 @@ func (m *RefreshManager) executeRefresh(serverName string) {
 
 	if refreshErr != nil {
 		if errors.Is(refreshErr, ErrPendingInteractiveLogin) {
-			m.logger.Debug("OAuth token refresh skipped - server pending interactive login, will recheck",
+			m.logger.Debug("OAuth token refresh skipped - server busy or parked pending interactive login, will recheck",
 				zap.String("server", serverName),
 				zap.Duration("recheck_in", PendingAuthRecheckInterval))
 			m.rescheduleAfterDelay(serverName, PendingAuthRecheckInterval)
@@ -828,7 +828,7 @@ func classifyRefreshError(err error) string {
 	// break this classification (and can't accidentally match an unrelated
 	// error that happens to contain this substring).
 	if errors.Is(err, ErrPendingInteractiveLogin) {
-		return "skipped_pending_auth"
+		return "skipped_busy_or_parked"
 	}
 
 	errStr := err.Error()

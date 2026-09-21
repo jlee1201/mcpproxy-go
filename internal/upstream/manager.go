@@ -2440,7 +2440,7 @@ func (m *Manager) RefreshOAuthToken(serverName string) error {
 		m.logger.Debug("Skipping OAuth token refresh - server is busy or parked pending interactive login",
 			zap.String("server", serverName),
 			zap.String("state", client.GetState().String()))
-		return fmt.Errorf("server %s is pending interactive login, refresh skipped: %w", serverName, oauth.ErrPendingInteractiveLogin)
+		return fmt.Errorf("server %s is busy or parked pending interactive login, refresh skipped: %w", serverName, oauth.ErrPendingInteractiveLogin)
 	}
 
 	// Check if server uses OAuth via either static config or dynamic discovery

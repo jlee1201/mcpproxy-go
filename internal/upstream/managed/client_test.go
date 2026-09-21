@@ -376,3 +376,29 @@ func TestTryReconnect_AbortsWhenPendingAuth(t *testing.T) {
 	assert.Equal(t, 0, info.RetryCount,
 		"an aborted tryReconnect must not touch retry state")
 }
+
+// TestTryReconnect_AbortsWhenConnecting pins the must-fix from the full-panel
+// re-review of this same commit: the recheck above originally tested only
+// `== StatePendingAuth`, so a concurrent Connect() attempt that had moved
+// state to Connecting/Authenticating/Discovering (or had just landed in
+// Ready) during the dispatch gap sailed through the recheck and got torn
+// down by Disconnect()/ResetForReconnect() anyway -- reproducing the exact
+// reconnect-race class this commit exists to close, just for a narrower set
+// of states than PendingAuth alone. The recheck must use the same
+// IsBusyOrParked() predicate ForceReconnect itself checks before dispatch.
+func TestTryReconnect_AbortsWhenConnecting(t *testing.T) {
+	cfg := &config.ServerConfig{Name: "test-tryreconnect-connecting"}
+	mc, err := NewClient("test-tryreconnect-connecting", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	mc.StateManager.TransitionTo(types.StateConnecting)
+	require.Equal(t, types.StateConnecting, mc.StateManager.GetState())
+
+	mc.tryReconnect()
+
+	info := mc.StateManager.GetConnectionInfo()
+	assert.Equal(t, types.StateConnecting, info.State,
+		"tryReconnect must abort before Disconnect/ResetForReconnect when it finds a concurrent Connect() already in flight, not tear it down")
+	assert.Equal(t, 0, info.RetryCount,
+		"an aborted tryReconnect must not touch retry state")
+}

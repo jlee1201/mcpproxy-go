@@ -773,24 +773,40 @@ func (mc *Client) tryReconnect() {
 		zap.String("server", mc.Config.Name),
 		zap.String("current_state", mc.StateManager.GetState().String()))
 
-	// Recheck PendingAuth here, not just in ForceReconnect's caller-side
+	// Recheck busy-or-parked here, not just in ForceReconnect's caller-side
 	// guard: this goroutine runs after a dispatch delay, during which a
 	// concurrent Connect() attempt (e.g. from the reconcile loop) can have
-	// already failed and parked the state in PendingAuth. Without this
-	// recheck, disconnecting/resetting below would tear down that freshly
-	// parked state and race a redial against the login flow it's waiting
-	// on. reconnectInProgress (checked above) only dedupes concurrent
+	// moved the state to Connecting/Authenticating/Discovering, parked it in
+	// PendingAuth, or even landed it in Ready. Originally this only rechecked
+	// == StatePendingAuth, which meant a Connect() that was still in flight
+	// (or had just succeeded) during the dispatch gap got torn down anyway by
+	// Disconnect()/ResetForReconnect() below -- reintroducing the exact
+	// reconnect-race class this fix exists to close, just for a narrower set
+	// of states. Use the same IsBusyOrParked() predicate ForceReconnect
+	// checked two lines above the dispatch, plus an explicit StateReady bail
+	// (a success state IsBusyOrParked() deliberately excludes) so a Connect()
+	// that raced ahead and just succeeded isn't discarded either.
+	// reconnectInProgress (checked above) only dedupes concurrent
 	// tryReconnect calls against each other -- it doesn't protect against
 	// state that changed for an unrelated reason between the check in
 	// ForceReconnect and this goroutine actually running.
-	if mc.StateManager.GetState() == types.StatePendingAuth {
-		mc.logger.Debug("Reconnection attempt aborted - server parked pending interactive login since dispatch",
-			zap.String("server", mc.Config.Name))
+	//
+	// The recheck and the disconnect/reset below are done under mc.mu so this
+	// closes an otherwise-later TOCTOU: Connect() (above) holds mc.mu for its
+	// entire duration, so acquiring it here serializes against any Connect()
+	// already in flight instead of just moving the same race one interleaving
+	// later.
+	mc.mu.Lock()
+	state := mc.StateManager.GetState()
+	if state.IsBusyOrParked() || state == types.StateReady {
+		mc.mu.Unlock()
+		mc.logger.Debug("Reconnection attempt aborted - server busy, parked pending interactive login, or already reconnected since dispatch",
+			zap.String("server", mc.Config.Name),
+			zap.String("state", state.String()))
 		return
 	}
 
 	// First, disconnect the current client to clean up any broken connections
-	// We don't need to hold the mutex here as Disconnect() already handles it
 	mc.cancelInFlightListTools()
 	if err := mc.coreClient.Disconnect(); err != nil {
 		mc.logger.Warn("Failed to disconnect during reconnection attempt",
@@ -803,6 +819,7 @@ func (mc *Client) tryReconnect() {
 	// otherwise every ForceReconnect-driven attempt restarts exponential
 	// backoff from zero, defeating the anti-reconnect-storm goal.
 	mc.StateManager.ResetForReconnect()
+	mc.mu.Unlock()
 
 	// Attempt to reconnect using the existing Connect method
 	// The Connect method already handles state transitions and error management

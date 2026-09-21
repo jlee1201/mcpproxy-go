@@ -697,8 +697,8 @@ func TestClassifyRefreshError(t *testing.T) {
 		{"server not found wrapped", errors.New("failed to refresh OAuth token: server not found: myserver"), "failed_server_gone"},
 		{"server does not use OAuth", errors.New("server does not use OAuth: gcw2"), "failed_server_gone"},
 		// Guard-skip: matched via errors.Is against the sentinel, not string content.
-		{"pending interactive login sentinel", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin), "skipped_pending_auth"},
-		{"pending interactive login wrapped twice", fmt.Errorf("failed to refresh OAuth token: %w", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin)), "skipped_pending_auth"},
+		{"pending interactive login sentinel", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin), "skipped_busy_or_parked"},
+		{"pending interactive login wrapped twice", fmt.Errorf("failed to refresh OAuth token: %w", fmt.Errorf("server myserver is pending interactive login, refresh skipped: %w", ErrPendingInteractiveLogin)), "skipped_busy_or_parked"},
 	}
 
 	for _, tt := range tests {
