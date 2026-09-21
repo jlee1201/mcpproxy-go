@@ -237,6 +237,15 @@ func TestConnectionInfo_ShouldAutoReconnect(t *testing.T) {
 		{"disconnected fresh server", &ConnectionInfo{State: StateDisconnected}, true},
 		{"ready server", &ConnectionInfo{State: StateReady}, true},
 		{"pending auth is parked", &ConnectionInfo{State: StatePendingAuth}, false},
+		// An in-flight connect attempt (workdaygusto's 30s loop, root-caused via
+		// this exact case: it previously hit the switch's default case, same as
+		// Ready/Disconnected, letting reconcile's outside-the-lock GetAllStates()
+		// read plan a redundant second ActionConnect while one was already
+		// running) must not be treated as redialable — these are the same states
+		// StateManager.IsConnecting() already calls busy.
+		{"connecting (in-flight, already busy)", &ConnectionInfo{State: StateConnecting}, false},
+		{"authenticating (in-flight, already busy)", &ConnectionInfo{State: StateAuthenticating}, false},
+		{"discovering (in-flight, already busy)", &ConnectionInfo{State: StateDiscovering}, false},
 		{"error within backoff window", &ConnectionInfo{State: StateError, RetryCount: 5, LastRetryTime: now.Add(-1 * time.Second)}, false},
 		{"error with backoff elapsed", &ConnectionInfo{State: StateError, RetryCount: 3, LastRetryTime: now.Add(-10 * time.Second)}, true},
 		{"error no failures yet", &ConnectionInfo{State: StateError, RetryCount: 0}, true},
