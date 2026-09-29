@@ -37,6 +37,14 @@ type Manager struct {
 	mu       sync.RWMutex
 	logger   *zap.SugaredLogger
 	asyncMgr *AsyncManager
+
+	// activity_records byte budget enforced on write (see SaveActivity);
+	// 0 disables it. activityBytes is an upper bound on the bucket's value
+	// bytes, valid only while activityBytesKnown -- deletes just clear the
+	// flag so the next write rescans. Guarded by mu.
+	activityMaxBytes   int64
+	activityBytes      int64
+	activityBytesKnown bool
 }
 
 // NewManager creates a new storage manager
@@ -883,7 +891,14 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 // proportional to bucket size, not free; a much larger per-server bucket
 // would make this walk proportionally more expensive on every write.
 func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64, protectedKey []byte) (int, error) {
-	var cumulative int64
+	deleted, _, err := trimBucketToByteBudgetKept(bucket, maxBytes, protectedKey)
+	return deleted, err
+}
+
+// trimBucketToByteBudgetKept is trimBucketToByteBudget that also reports the
+// value bytes left in the bucket afterwards, exempt records included.
+func trimBucketToByteBudgetKept(bucket *bbolt.Bucket, maxBytes int64, protectedKey []byte) (int, int64, error) {
+	var cumulative, exempt, deletedBytes int64
 	var keysToDelete [][]byte
 
 	cursor := bucket.Cursor()
@@ -891,21 +906,23 @@ func trimBucketToByteBudget(bucket *bbolt.Bucket, maxBytes int64, protectedKey [
 	for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
 		if first || bytes.Equal(k, protectedKey) {
 			first = false
+			exempt += int64(len(v))
 			continue
 		}
 		cumulative += int64(len(v))
 		if cumulative > maxBytes {
 			keysToDelete = append(keysToDelete, append([]byte{}, k...))
+			deletedBytes += int64(len(v))
 		}
 	}
 
 	for _, key := range keysToDelete {
 		if err := bucket.Delete(key); err != nil {
-			return 0, fmt.Errorf("failed to trim bucket over byte budget: %w", err)
+			return 0, 0, fmt.Errorf("failed to trim bucket over byte budget: %w", err)
 		}
 	}
 
-	return len(keysToDelete), nil
+	return len(keysToDelete), exempt + cumulative - deletedBytes, nil
 }
 
 // GetServerToolCalls gets tool calls for a server

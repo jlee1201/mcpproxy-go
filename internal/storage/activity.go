@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -45,8 +46,8 @@ func truncateResponse(response string, maxSize int) (string, bool) {
 // MaxActivityRecordBytes caps the marshaled size of a single activity record
 // before it's written, mirroring MaxToolCallRecordBytes/
 // MaxDiagnosticRecordBytes for the tool_calls/diagnostics buckets.
-// PruneActivitiesByBudget's trimBucketToByteBudget never evicts the
-// just-written record (see its doc comment), so without this cap one
+// The byte-budget trim (SaveActivity's on-write pass and
+// PruneActivitiesByBudget) never evicts the just-written record (see its doc comment), so without this cap one
 // oversized activity (a large tool response or arguments blob logged
 // verbatim) could alone exceed the whole byte budget and, because the
 // running total never resets once it crosses the threshold, cascade into
@@ -159,7 +160,7 @@ func (m *Manager) SaveActivity(record *ActivityRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(ActivityRecordsBucket))
 		if err != nil {
 			return fmt.Errorf("failed to create activity bucket: %w", err)
@@ -175,8 +176,73 @@ func (m *Manager) SaveActivity(record *ActivityRecord) error {
 			return fmt.Errorf("failed to store activity record: %w", err)
 		}
 
-		return nil
+		return m.enforceActivityBudgetLocked(bucket, key, int64(len(data)))
 	})
+	if err != nil {
+		m.invalidateActivityBytesLocked()
+	}
+	return err
+}
+
+// SetActivityByteBudget sets the activity_records byte budget SaveActivity
+// enforces on every write (0 disables it). Without it the budget only
+// applied at the hourly retention sweep, so a burst of large responses could
+// grow config.db far past it in between -- and bbolt never shrinks the file.
+func (m *Manager) SetActivityByteBudget(maxBytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activityMaxBytes = maxBytes
+}
+
+// activityBudgetTrimTarget is the fraction of the budget a write-path trim
+// cuts down to, so a bucket sitting at the budget doesn't rescan every write.
+const activityBudgetTrimTarget = 0.9
+
+// enforceActivityBudgetLocked trims the oldest records once the bucket's
+// tracked size passes the budget. Caller holds m.mu and has just Put key
+// (whose value is addedBytes long) in the same transaction. The full-bucket
+// walk only happens to seed the size or when over budget, not per write.
+func (m *Manager) enforceActivityBudgetLocked(bucket *bbolt.Bucket, key []byte, addedBytes int64) error {
+	if m.activityMaxBytes <= 0 {
+		return nil
+	}
+
+	size := m.activityBytes + addedBytes
+	if !m.activityBytesKnown {
+		size = 0
+		if err := bucket.ForEach(func(_, v []byte) error {
+			size += int64(len(v))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to size activity bucket: %w", err)
+		}
+	}
+
+	if size > m.activityMaxBytes {
+		target := int64(float64(m.activityMaxBytes) * activityBudgetTrimTarget)
+		deleted, kept, err := trimBucketToByteBudgetKept(bucket, target, key)
+		if err != nil {
+			return fmt.Errorf("failed to trim activity bucket to budget: %w", err)
+		}
+		if deleted > 0 {
+			m.logger.Debugw("Trimmed activity records over byte budget on write",
+				"deleted", deleted,
+				"max_bytes", m.activityMaxBytes)
+		}
+		size = kept
+	}
+
+	// Only trusted once the transaction commits; SaveActivity's caller
+	// discards it on error via invalidateActivityBytesLocked.
+	m.activityBytes = size
+	m.activityBytesKnown = true
+	return nil
+}
+
+// invalidateActivityBytesLocked forces the next write to rescan the bucket
+// size. Caller holds m.mu.
+func (m *Manager) invalidateActivityBytesLocked() {
+	m.activityBytesKnown = false
 }
 
 // GetActivity retrieves an activity record by ID.
@@ -298,6 +364,7 @@ func (m *Manager) DeleteActivity(id string) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.invalidateActivityBytesLocked()
 
 	return m.db.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
@@ -337,9 +404,12 @@ func (m *Manager) CountActivities() (int, error) {
 }
 
 // StreamActivities returns a channel that yields activity records matching the filter.
-// The channel is closed when all matching records have been sent.
+// The channel is closed when all matching records have been sent or ctx is done.
 // This is useful for streaming large exports without loading all records into memory.
-func (m *Manager) StreamActivities(filter ActivityFilter) <-chan *ActivityRecord {
+// The producer holds a read transaction and m.mu.RLock until it finishes, so
+// a consumer that stops reading must cancel ctx: otherwise the producer
+// blocks on the send forever and every storage writer waits on m.mu behind it.
+func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <-chan *ActivityRecord {
 	filter.Validate()
 	ch := make(chan *ActivityRecord, 100)
 
@@ -366,7 +436,11 @@ func (m *Manager) StreamActivities(filter ActivityFilter) <-chan *ActivityRecord
 					continue
 				}
 
-				ch <- &record
+				select {
+				case ch <- &record:
+				case <-ctx.Done():
+					return nil
+				}
 			}
 
 			return nil
@@ -388,6 +462,7 @@ func (m *Manager) PruneOldActivities(maxAge time.Duration) (int, error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.invalidateActivityBytesLocked()
 
 	var deleted int
 
@@ -443,6 +518,7 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.invalidateActivityBytesLocked()
 
 	var deleted int
 
@@ -503,6 +579,7 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.invalidateActivityBytesLocked()
 
 	var deleted int
 

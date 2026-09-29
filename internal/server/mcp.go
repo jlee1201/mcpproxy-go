@@ -1391,9 +1391,11 @@ func (p *MCPProxyServer) handleCallToolVariant(ctx context.Context, request mcp.
 	}
 	p.emitActivityToolCallCompleted(serverName, actualToolName, sessionID, requestID, activitySource, "success", "", duration.Milliseconds(), args, response, responseTruncated, toolVariant, intentMap)
 
-	// Spec 024: Emit internal tool call event for success
+	// Spec 024: Emit internal tool call event for success. The response is
+	// omitted: the tool_call record above already stores it (truncated), and
+	// a second, untruncated copy here roughly doubled activity_records bytes.
 	internalToolName := "call_tool_" + intent.OperationType // e.g., "call_tool_read"
-	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), args, result, intentMap)
+	p.emitActivityInternalToolCall(internalToolName, serverName, actualToolName, toolVariant, sessionID, requestID, "success", "", time.Since(internalStartTime).Milliseconds(), args, nil, intentMap)
 
 	return mcp.NewToolResultText(response), nil
 }

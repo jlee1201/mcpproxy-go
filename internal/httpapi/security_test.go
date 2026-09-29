@@ -321,7 +321,7 @@ func (m *baseController) ListActivities(_ storage.ActivityFilter) ([]*storage.Ac
 func (m *baseController) GetActivity(_ string) (*storage.ActivityRecord, error) {
 	return nil, nil
 }
-func (m *baseController) StreamActivities(_ storage.ActivityFilter) <-chan *storage.ActivityRecord {
+func (m *baseController) StreamActivities(_ context.Context, _ storage.ActivityFilter) <-chan *storage.ActivityRecord {
 	ch := make(chan *storage.ActivityRecord)
 	close(ch)
 	return ch
