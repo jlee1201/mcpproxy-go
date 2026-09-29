@@ -115,7 +115,7 @@ type ServerController interface {
 	// Activity logging (RFC-003)
 	ListActivities(filter storage.ActivityFilter) ([]*storage.ActivityRecord, int, error)
 	GetActivity(id string) (*storage.ActivityRecord, error)
-	StreamActivities(filter storage.ActivityFilter) <-chan *storage.ActivityRecord
+	StreamActivities(ctx context.Context, filter storage.ActivityFilter) <-chan *storage.ActivityRecord
 }
 
 // Server provides HTTP API endpoints with chi router

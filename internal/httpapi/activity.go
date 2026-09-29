@@ -283,7 +283,7 @@ func (s *Server) handleExportActivity(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 
 	// Stream activities
-	activityCh := s.controller.StreamActivities(filter)
+	activityCh := s.controller.StreamActivities(r.Context(), filter)
 
 	// Write CSV header if format is CSV
 	if format == "csv" {

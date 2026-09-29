@@ -19,7 +19,8 @@ const (
 	// DefaultRetentionMaxBytes is the default byte budget for activity_records
 	// (20MB). The age/count caps above permit up to ~100MB of legitimate
 	// stored bytes at typical record sizes; this is the cap that actually
-	// bounds config.db size.
+	// bounds config.db size. Enforced on every write (storage
+	// SetActivityByteBudget) and again at each retention sweep.
 	DefaultRetentionMaxBytes = 20 * 1024 * 1024
 	// DefaultRetentionCheckInterval is the default interval between retention checks (1 hour)
 	DefaultRetentionCheckInterval = 1 * time.Hour
@@ -57,6 +58,9 @@ type ActivityService struct {
 
 // NewActivityService creates a new activity service.
 func NewActivityService(storage *storage.Manager, logger *zap.Logger) *ActivityService {
+	if storage != nil {
+		storage.SetActivityByteBudget(DefaultRetentionMaxBytes)
+	}
 	return &ActivityService{
 		storage:        storage,
 		logger:         logger,
@@ -84,6 +88,9 @@ func (s *ActivityService) SetRetentionConfig(maxAge time.Duration, maxRecords in
 	}
 	if maxBytes > 0 {
 		s.maxBytes = maxBytes
+		if s.storage != nil {
+			s.storage.SetActivityByteBudget(maxBytes)
+		}
 	}
 	if checkInterval > 0 {
 		s.checkInterval = checkInterval
@@ -189,9 +196,9 @@ func (s *ActivityService) runRetentionCleanup() {
 		}
 	}
 
-	// Prune by byte budget. The age/count caps above still permit a large
-	// number of bytes at real-world record sizes, so this is the cap that
-	// actually bounds config.db size for activity_records.
+	// Prune by byte budget. SaveActivity already enforces it on write; this
+	// sweep catches a budget lowered at runtime and records written before
+	// the budget was set.
 	if s.maxBytes > 0 {
 		deleted, err := s.storage.PruneActivitiesByBudget(s.maxBytes)
 		if err != nil {

@@ -174,9 +174,9 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 	// Wire the configured retention knobs through - SetRetentionConfig
 	// ignores non-positive values, so an unset/zero config field falls back
 	// to ActivityService's own conservative defaults rather than disabling
-	// retention. maxBytes has no config field yet (PR #1 added the byte
-	// budget straight to ActivityService's own defaults); pass 0 to leave
-	// that default in place rather than introduce a new config surface here.
+	// retention. maxBytes has no config field yet; pass 0 to keep
+	// DefaultRetentionMaxBytes (NewActivityService already hands it to
+	// storage for on-write enforcement).
 	activityService.SetRetentionConfig(
 		time.Duration(cfg.ActivityRetentionDays)*24*time.Hour,
 		cfg.ActivityMaxRecords,
@@ -2054,11 +2054,11 @@ func (r *Runtime) GetActivity(id string) (*storage.ActivityRecord, error) {
 }
 
 // StreamActivities returns a channel that yields activity records matching the filter.
-func (r *Runtime) StreamActivities(filter storage.ActivityFilter) <-chan *storage.ActivityRecord {
+func (r *Runtime) StreamActivities(ctx context.Context, filter storage.ActivityFilter) <-chan *storage.ActivityRecord {
 	if r.storageManager == nil {
 		ch := make(chan *storage.ActivityRecord)
 		close(ch)
 		return ch
 	}
-	return r.storageManager.StreamActivities(filter)
+	return r.storageManager.StreamActivities(ctx, filter)
 }

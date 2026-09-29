@@ -22,6 +22,7 @@ import (
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 )
 
 // TestEnvironment holds all test dependencies
@@ -1519,6 +1520,33 @@ func TestE2E_IntentDeclarationToolVariants(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, result.IsError, "call_tool_read with matching intent should succeed")
 		t.Log("✅ call_tool_read with matching intent succeeded")
+	})
+
+	t.Run("successful call_tool_read wrapper record stores no duplicate response", func(t *testing.T) {
+		storageMgr := env.proxyServer.runtime.StorageManager()
+		var wrapper, inner *storage.ActivityRecord
+		require.Eventually(t, func() bool {
+			records, _, err := storageMgr.ListActivities(storage.ActivityFilter{
+				Types: []string{string(storage.ActivityTypeInternalToolCall), string(storage.ActivityTypeToolCall)},
+				Limit: 100,
+			})
+			if err != nil {
+				return false
+			}
+			wrapper, inner = nil, nil
+			for _, r := range records {
+				switch {
+				case r.Type == storage.ActivityTypeInternalToolCall && r.ToolName == contracts.ToolVariantRead && r.Status == "success":
+					wrapper = r
+				case r.Type == storage.ActivityTypeToolCall && r.ToolName == "read_data" && r.Status == "success":
+					inner = r
+				}
+			}
+			return wrapper != nil && inner != nil
+		}, 5*time.Second, 100*time.Millisecond)
+
+		assert.Empty(t, wrapper.Response, "wrapper should not duplicate the upstream response")
+		assert.NotEmpty(t, inner.Response, "the tool_call record keeps the response")
 	})
 
 	// Test 2: call_tool_write with matching intent
