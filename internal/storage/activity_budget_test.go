@@ -146,7 +146,8 @@ func TestStreamActivities_CancelReleasesStorageLock(t *testing.T) {
 		}
 	}()
 	<-ch
-	time.Sleep(50 * time.Millisecond)
+	require.Eventually(t, func() bool { return len(ch) == cap(ch) }, 2*time.Second, 5*time.Millisecond,
+		"producer should fill the buffer and block on send")
 	cancel()
 
 	done := make(chan error, 1)

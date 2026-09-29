@@ -192,6 +192,7 @@ func (m *Manager) SetActivityByteBudget(maxBytes int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.activityMaxBytes = maxBytes
+	m.invalidateActivityBytesLocked()
 }
 
 // activityBudgetTrimTarget is the fraction of the budget a write-path trim
@@ -427,6 +428,10 @@ func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <
 
 			cursor := bucket.Cursor()
 			for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+				if ctx.Err() != nil {
+					return nil
+				}
+
 				var record ActivityRecord
 				if err := record.UnmarshalBinary(v); err != nil {
 					continue
