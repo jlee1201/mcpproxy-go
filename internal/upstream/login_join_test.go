@@ -39,7 +39,7 @@ func TestStartOrJoinLogin_NoFlowActive_StartsOwnFlow(t *testing.T) {
 	coordinator := oauth.GetGlobalCoordinator()
 	var calls int32
 
-	result, err := startOrJoinLogin(coordinator, serverName, time.Second, fakeStart(coordinator, serverName, &calls), func() bool { return false })
+	result, err := startOrJoinLogin(coordinator, serverName, time.Second, fakeStart(coordinator, serverName, &calls))
 
 	require.NoError(t, err)
 	assert.False(t, result.JoinedExistingFlow)
@@ -51,19 +51,17 @@ func TestStartOrJoinLogin_JoinsInFlightFlowThatSucceeds(t *testing.T) {
 	serverName := "test-join-inflight-success"
 	coordinator := oauth.GetGlobalCoordinator()
 	flow := seedFlow(t, coordinator, serverName)
-	var tokenStored atomic.Bool
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		tokenStored.Store(true)
 		coordinator.EndFlow(serverName, flow.CorrelationID, true, nil)
 	}()
 	var calls int32
 
-	result, err := startOrJoinLogin(coordinator, serverName, 3*time.Second, fakeStart(coordinator, serverName, &calls), tokenStored.Load)
+	result, err := startOrJoinLogin(coordinator, serverName, 3*time.Second, fakeStart(coordinator, serverName, &calls))
 
 	require.NoError(t, err, "a login that lands on an in-flight sign-in must wait for it, not fail")
 	assert.True(t, result.JoinedExistingFlow)
-	assert.EqualValues(t, 1, calls, "must not open a second browser flow when the joined one produced a token")
+	assert.EqualValues(t, 1, calls, "must not open a second browser flow when the joined one succeeded")
 }
 
 func TestStartOrJoinLogin_JoinedFlowFails_StartsFreshFlow(t *testing.T) {
@@ -76,7 +74,7 @@ func TestStartOrJoinLogin_JoinedFlowFails_StartsFreshFlow(t *testing.T) {
 	}()
 	var calls int32
 
-	result, err := startOrJoinLogin(coordinator, serverName, 3*time.Second, fakeStart(coordinator, serverName, &calls), func() bool { return false })
+	result, err := startOrJoinLogin(coordinator, serverName, 3*time.Second, fakeStart(coordinator, serverName, &calls))
 
 	require.NoError(t, err)
 	assert.False(t, result.JoinedExistingFlow, "the result is from our own fresh flow")
@@ -84,36 +82,73 @@ func TestStartOrJoinLogin_JoinedFlowFails_StartsFreshFlow(t *testing.T) {
 	assert.EqualValues(t, 2, calls)
 }
 
-// The sibling ends between our failed start and WaitForFlow registering, so
-// WaitForFlow returns nil without telling us the outcome.
-func TestStartOrJoinLogin_FlowEndsBeforeWaiterRegisters_UsesTokenToDecide(t *testing.T) {
+// The sibling ends between our failed start and JoinFlow registering, so its
+// outcome is unknown. A stored token is not proof it succeeded (it may be the
+// revoked one that triggered the flow), so a fresh flow must be started.
+func TestStartOrJoinLogin_FlowEndsBeforeWaiterRegisters_StartsFreshFlow(t *testing.T) {
 	coordinator := oauth.GetGlobalCoordinator()
-	for _, tc := range []struct {
-		name       string
-		tokenValid bool
-		wantJoined bool
-		wantCalls  int32
-	}{
-		{"token present", true, true, 1},
-		{"no token", false, false, 2},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			serverName := "test-join-race-" + tc.name
-			var calls int32
-			start := func() (*core.OAuthStartResult, error) {
-				if atomic.AddInt32(&calls, 1) == 1 {
-					return &core.OAuthStartResult{}, fmt.Errorf("in progress: %w", oauth.ErrFlowInProgress)
-				}
-				return &core.OAuthStartResult{BrowserOpened: true}, nil
-			}
-
-			result, err := startOrJoinLogin(coordinator, serverName, time.Second, start, func() bool { return tc.tokenValid })
-
-			require.NoError(t, err)
-			assert.Equal(t, tc.wantJoined, result.JoinedExistingFlow)
-			assert.Equal(t, tc.wantCalls, calls)
-		})
+	serverName := "test-join-race-ended"
+	var calls int32
+	start := func() (*core.OAuthStartResult, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return &core.OAuthStartResult{}, fmt.Errorf("in progress: %w", oauth.ErrFlowInProgress)
+		}
+		return &core.OAuthStartResult{BrowserOpened: true}, nil
 	}
+
+	result, err := startOrJoinLogin(coordinator, serverName, time.Second, start)
+
+	require.NoError(t, err)
+	assert.False(t, result.JoinedExistingFlow)
+	assert.EqualValues(t, 2, calls)
+}
+
+// Auto-reconnect grabs the lock again right after the first joined flow fails;
+// the login keeps joining instead of surfacing a 409 straight away.
+func TestStartOrJoinLogin_LockRegrabbedAfterFailure_JoinsAgain(t *testing.T) {
+	serverName := "test-join-regrab"
+	coordinator := oauth.GetGlobalCoordinator()
+	first := seedFlow(t, coordinator, serverName)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		coordinator.EndFlow(serverName, first.CorrelationID, false, errors.New("token rejected"))
+	}()
+	var calls int32
+	start := func() (*core.OAuthStartResult, error) {
+		if atomic.AddInt32(&calls, 1) == 2 {
+			// Reconnect wins the race for the lock just before our second start.
+			second, err := coordinator.StartFlow(serverName)
+			require.NoError(t, err)
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				coordinator.EndFlow(serverName, second.CorrelationID, true, nil)
+			}()
+		}
+		return fakeStart(coordinator, serverName, new(int32))()
+	}
+
+	result, err := startOrJoinLogin(coordinator, serverName, 3*time.Second, start)
+
+	require.NoError(t, err)
+	assert.True(t, result.JoinedExistingFlow)
+	assert.EqualValues(t, 2, calls)
+}
+
+func TestStartOrJoinLogin_StartKeepsReportingInProgress_GivesUpAfterAttemptCap(t *testing.T) {
+	serverName := "test-join-attempt-cap"
+	coordinator := oauth.GetGlobalCoordinator()
+	var calls int32
+	start := func() (*core.OAuthStartResult, error) {
+		atomic.AddInt32(&calls, 1)
+		return &core.OAuthStartResult{}, fmt.Errorf("in progress: %w", oauth.ErrFlowInProgress)
+	}
+
+	begin := time.Now()
+	_, err := startOrJoinLogin(coordinator, serverName, 5*time.Second, start)
+
+	require.ErrorIs(t, err, ErrLoginFlowStillInProgress)
+	assert.EqualValues(t, maxLoginStartAttempts, calls)
+	assert.Less(t, time.Since(begin), time.Second)
 }
 
 func TestStartOrJoinLogin_InFlightFlowOutlastsTimeout_ReturnsStillInProgress(t *testing.T) {
@@ -123,14 +158,15 @@ func TestStartOrJoinLogin_InFlightFlowOutlastsTimeout_ReturnsStillInProgress(t *
 	var calls int32
 
 	start := time.Now()
-	_, err := startOrJoinLogin(coordinator, serverName, 200*time.Millisecond, fakeStart(coordinator, serverName, &calls), func() bool { return false })
+	_, err := startOrJoinLogin(coordinator, serverName, 200*time.Millisecond, fakeStart(coordinator, serverName, &calls))
 
 	require.ErrorIs(t, err, ErrLoginFlowStillInProgress)
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.True(t, coordinator.IsFlowActive(serverName), "must not disturb the flow it was waiting on")
 }
 
-func TestLoginJoinTimeout_StaysUnderHTTPWriteTimeout(t *testing.T) {
-	// internal/server/server.go sets WriteTimeout: 120s on the API server.
-	assert.Less(t, loginJoinTimeout, 120*time.Second)
+func TestLoginJoinTimeout_LeavesHeadroomUnderHTTPWriteTimeout(t *testing.T) {
+	// internal/server/server.go sets WriteTimeout: 120s on the API server; the
+	// final start() after a failed join needs time of its own.
+	assert.LessOrEqual(t, loginJoinTimeout, 60*time.Second)
 }

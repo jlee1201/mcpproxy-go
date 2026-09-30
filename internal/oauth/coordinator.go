@@ -27,9 +27,24 @@ var ErrFlowInProgress = errors.New("OAuth flow already in progress")
 
 // flowWaiter represents a goroutine waiting for an OAuth flow to complete.
 type flowWaiter struct {
-	done   chan struct{}
-	result error
+	done    chan struct{}
+	result  error
+	success bool
 }
+
+// JoinOutcome reports how a JoinFlow wait ended.
+type JoinOutcome int
+
+const (
+	// JoinNoFlow: no flow was active when the waiter tried to register, so its outcome is unknown.
+	JoinNoFlow JoinOutcome = iota
+	JoinSucceeded
+	// JoinFailed covers EndFlow(success=false) and flows reaped at their expiry.
+	JoinFailed
+	// JoinTimedOut: the caller's own timeout elapsed while the flow was still running.
+	JoinTimedOut
+	JoinCanceled
+)
 
 // OAuthFlowCoordinator coordinates OAuth flows to ensure only one flow runs per server.
 // This prevents race conditions where multiple reconnection attempts trigger concurrent OAuth flows.
@@ -214,6 +229,7 @@ func (c *OAuthFlowCoordinator) EndFlow(serverName, correlationID string, success
 	// Notify all waiters
 	for _, waiter := range waiters {
 		waiter.result = err
+		waiter.success = success
 		close(waiter.done)
 	}
 }
@@ -279,13 +295,62 @@ func (c *OAuthFlowCoordinator) WaitForFlow(ctx context.Context, serverName strin
 	case <-waiter.done:
 		return waiter.result
 	case <-time.After(timeout):
+		c.removeWaiter(serverName, waiter)
 		c.logger.Warn("Timeout waiting for OAuth flow",
 			zap.String("server", serverName),
 			zap.Duration("timeout", timeout),
 		)
 		return ErrFlowTimeout
 	case <-ctx.Done():
+		c.removeWaiter(serverName, waiter)
 		return ctx.Err()
+	}
+}
+
+// JoinFlow waits for the server's active flow like WaitForFlow, but reports the
+// outcome explicitly instead of overloading a nil error for both "succeeded"
+// and "no flow to wait for".
+func (c *OAuthFlowCoordinator) JoinFlow(ctx context.Context, serverName string, timeout time.Duration) JoinOutcome {
+	if timeout == 0 {
+		timeout = DefaultFlowTimeout
+	}
+
+	c.mu.Lock()
+	if _, exists := c.activeFlows[serverName]; !exists {
+		c.mu.Unlock()
+		return JoinNoFlow
+	}
+	waiter := &flowWaiter{done: make(chan struct{})}
+	c.waiters[serverName] = append(c.waiters[serverName], waiter)
+	c.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-waiter.done:
+		if waiter.success {
+			return JoinSucceeded
+		}
+		return JoinFailed
+	case <-timer.C:
+		c.removeWaiter(serverName, waiter)
+		return JoinTimedOut
+	case <-ctx.Done():
+		c.removeWaiter(serverName, waiter)
+		return JoinCanceled
+	}
+}
+
+// removeWaiter drops a waiter that gave up, so abandoned waits don't pile up on a long flow.
+func (c *OAuthFlowCoordinator) removeWaiter(serverName string, target *flowWaiter) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	waiters := c.waiters[serverName]
+	for i, w := range waiters {
+		if w == target {
+			c.waiters[serverName] = append(waiters[:i], waiters[i+1:]...)
+			return
+		}
 	}
 }
 

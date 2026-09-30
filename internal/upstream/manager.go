@@ -1905,7 +1905,7 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 	result, err := startOrJoinLogin(coordinator, cfg.Name, loginJoinTimeout, func() (*core.OAuthStartResult, error) {
 		coreClient.ClearOAuthState()
 		return coreClient.StartOAuthFlowQuick(ctx)
-	}, signedIn)
+	})
 	if err != nil || result.JoinedExistingFlow {
 		// A joined flow's owner handles its own reconnect.
 		cancel()
@@ -1915,17 +1915,20 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 	go func() {
 		defer cancel()
 
-		// Waits on the flow StartOAuthFlowQuick registered; the coordinator reaps
-		// abandoned flows at StaleFlowTimeout, which bounds this goroutine.
-		if waitErr := coordinator.WaitForFlow(context.Background(), cfg.Name, 30*time.Minute); waitErr != nil {
+		// Bounded by ctx; the flow itself ends within the callback timeout.
+		switch outcome := coordinator.JoinFlow(ctx, cfg.Name, 30*time.Minute); outcome {
+		case oauth.JoinSucceeded:
+		case oauth.JoinNoFlow:
+			// The flow finished before we registered; storage tells us how it went.
+			if !signedIn() {
+				m.logger.Info("OAuth flow ended without a token; skipping reconnect",
+					zap.String("server", cfg.Name))
+				return
+			}
+		default:
 			m.logger.Info("OAuth flow did not complete; skipping reconnect",
 				zap.String("server", cfg.Name),
-				zap.Error(waitErr))
-			return
-		}
-		if !signedIn() {
-			m.logger.Info("OAuth flow ended without a token; skipping reconnect",
-				zap.String("server", cfg.Name))
+				zap.Int("join_outcome", int(outcome)))
 			return
 		}
 		m.logger.Info("OAuth completed, triggering reconnect",

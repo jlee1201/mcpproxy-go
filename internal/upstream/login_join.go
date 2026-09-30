@@ -10,49 +10,52 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
 )
 
-// loginJoinTimeout bounds how long a login request waits on another in-flight
-// flow; it must stay under the API server's 120s WriteTimeout or the response is dropped.
-var loginJoinTimeout = 90 * time.Second
+// loginJoinTimeout bounds how long a login request waits on other in-flight
+// flows. It leaves headroom under the API server's 120s WriteTimeout for the
+// final start() (metadata check plus client start), or the response is dropped.
+var loginJoinTimeout = 60 * time.Second
+
+// maxLoginStartAttempts caps start() calls, so a lock re-grabbed by auto-reconnect
+// right after each joined flow fails can't spin until the deadline.
+const maxLoginStartAttempts = 3
 
 // ErrLoginFlowStillInProgress means another sign-in for the server was still
 // running when the login request gave up waiting on it. Retrying is safe.
 var ErrLoginFlowStillInProgress = errors.New("oauth_flow_in_progress")
 
 // startOrJoinLogin runs start; if another flow already holds the server's
-// coordinator lock, it waits (up to timeout) for that flow instead of failing.
-// A joined flow that leaves a valid token counts as this login's success;
-// otherwise start runs once more to open a fresh flow.
+// coordinator lock, it waits (within timeout overall) for that flow instead of
+// failing. A joined flow that succeeds counts as this login's success. A joined
+// flow that fails, or one that ended before we could observe its outcome, is
+// followed by another start so the user gets a fresh flow, not a guessed result.
 func startOrJoinLogin(
 	coordinator *oauth.OAuthFlowCoordinator,
 	serverName string,
 	timeout time.Duration,
 	start func() (*core.OAuthStartResult, error),
-	tokenValid func() bool,
 ) (*core.OAuthStartResult, error) {
-	result, err := start()
-	if !errors.Is(err, oauth.ErrFlowInProgress) {
-		return result, err
-	}
-
-	// nil is ambiguous here: the flow succeeded, or it ended before we registered
-	// as a waiter. Either way the stored token is what decides.
-	waitErr := coordinator.WaitForFlow(context.Background(), serverName, timeout)
-	if errors.Is(waitErr, oauth.ErrFlowTimeout) && coordinator.IsFlowActive(serverName) {
-		return result, fmt.Errorf("%w: another sign-in for %s is still running after %s", ErrLoginFlowStillInProgress, serverName, timeout)
-	}
-	if waitErr == nil && tokenValid() {
-		if result == nil {
-			result = &core.OAuthStartResult{}
+	deadline := time.Now().Add(timeout)
+	for attempt := 1; ; attempt++ {
+		result, err := start()
+		if !errors.Is(err, oauth.ErrFlowInProgress) {
+			return result, err
 		}
-		result.JoinedExistingFlow = true
-		return result, nil
-	}
+		remaining := time.Until(deadline)
+		if attempt >= maxLoginStartAttempts || remaining <= 0 {
+			return result, fmt.Errorf("%w: another sign-in for %s is still running: %v", ErrLoginFlowStillInProgress, serverName, err)
+		}
 
-	result, err = start()
-	if errors.Is(err, oauth.ErrFlowInProgress) {
-		return result, fmt.Errorf("%w: %v", ErrLoginFlowStillInProgress, err)
+		switch coordinator.JoinFlow(context.Background(), serverName, remaining) {
+		case oauth.JoinSucceeded:
+			if result == nil {
+				result = &core.OAuthStartResult{}
+			}
+			result.JoinedExistingFlow = true
+			return result, nil
+		case oauth.JoinTimedOut:
+			return result, fmt.Errorf("%w: another sign-in for %s is still running after %s", ErrLoginFlowStillInProgress, serverName, timeout)
+		}
 	}
-	return result, err
 }
 
 // storedTokenValid reports whether storage holds an unexpired access token for the server.
