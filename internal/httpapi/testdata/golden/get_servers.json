@@ -13,6 +13,7 @@
         "enabled": true,
         "id": "test-server",
         "name": "test-server",
+        "oauth_flow_active": false,
         "protocol": "stdio",
         "quarantined": false,
         "reconnect_count": 0,

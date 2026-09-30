@@ -25,6 +25,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/storage"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/transport"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/updatecheck"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
 )
 
@@ -1371,6 +1372,12 @@ func (s *Server) handleServerLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// The body keeps the "oauth_flow_in_progress" marker so callers can tell "retry" from a real failure.
+		if errors.Is(err, upstream.ErrLoginFlowStillInProgress) {
+			s.writeError(w, r, http.StatusConflict, err.Error())
+			return
+		}
+
 		// Map errors to HTTP status codes (T019)
 		if strings.Contains(err.Error(), "management disabled") || strings.Contains(err.Error(), "read-only") {
 			s.writeError(w, r, http.StatusForbidden, err.Error())
@@ -1404,15 +1411,20 @@ func (s *Server) handleServerLogin(w http.ResponseWriter, r *http.Request) {
 	if !browserOpened && authURL != "" {
 		message = fmt.Sprintf("Could not open browser automatically. Please open this URL manually: %s", authURL)
 	}
+	joined := result != nil && result.JoinedExistingFlow
+	if joined {
+		message = fmt.Sprintf("OAuth sign-in for server '%s' was already in progress; waited for it and it completed.", serverID)
+	}
 
 	response := contracts.OAuthStartResponse{
-		Success:       true,
-		ServerName:    serverID,
-		CorrelationID: correlationID,
-		BrowserOpened: browserOpened,
-		AuthURL:       authURL,
-		BrowserError:  browserError,
-		Message:       message,
+		Success:            true,
+		ServerName:         serverID,
+		CorrelationID:      correlationID,
+		BrowserOpened:      browserOpened,
+		AuthURL:            authURL,
+		BrowserError:       browserError,
+		Message:            message,
+		JoinedExistingFlow: joined,
 	}
 
 	s.writeSuccess(w, response)

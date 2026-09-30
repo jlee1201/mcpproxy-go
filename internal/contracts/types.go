@@ -29,6 +29,7 @@ type Server struct {
 	Quarantined       bool              `json:"quarantined"`
 	Connected         bool              `json:"connected"`
 	Connecting        bool              `json:"connecting"`
+	OAuthFlowActive   bool              `json:"oauth_flow_active"` // A sign-in holds this server's OAuth flow lock; a login request joins it
 	Status            string            `json:"status"`
 	LastError         string            `json:"last_error,omitempty"`
 	ConnectedAt       *time.Time        `json:"connected_at,omitempty"`
@@ -385,6 +386,9 @@ type OAuthStartResponse struct {
 	BrowserOpened bool   `json:"browser_opened"`          // Whether browser launch succeeded
 	BrowserError  string `json:"browser_error,omitempty"` // Error message if browser launch failed
 	Message       string `json:"message"`                 // Human-readable status message
+	// JoinedExistingFlow is true when this login waited on a sign-in that was
+	// already running for the server and that sign-in succeeded.
+	JoinedExistingFlow bool `json:"joined_existing_flow,omitempty"`
 }
 
 // OAuthValidationError is returned for pre-flight validation failures before OAuth is attempted.

@@ -1691,23 +1691,24 @@ func (r *Runtime) GetAllServers() ([]map[string]interface{}, error) {
 		}
 
 		serverMap := map[string]interface{}{
-			"name":            serverStatus.Name,
-			"url":             url,
-			"command":         command,
-			"protocol":        protocol,
-			"enabled":         serverStatus.Enabled,
-			"quarantined":     serverStatus.Quarantined,
-			"created":         created,
-			"connected":       connected,
-			"connecting":      connecting,
-			"tool_count":      serverStatus.ToolCount,
-			"last_error":      serverStatus.LastError,
-			"status":          status,
-			"should_retry":    false,
-			"retry_count":     serverStatus.RetryCount,
-			"last_retry_time": nil,
-			"oauth":           oauthConfig,
-			"authenticated":   authenticated,
+			"name":              serverStatus.Name,
+			"url":               url,
+			"command":           command,
+			"protocol":          protocol,
+			"enabled":           serverStatus.Enabled,
+			"quarantined":       serverStatus.Quarantined,
+			"created":           created,
+			"connected":         connected,
+			"connecting":        connecting,
+			"oauth_flow_active": oauth.GetGlobalCoordinator().IsFlowActive(serverStatus.Name),
+			"tool_count":        serverStatus.ToolCount,
+			"last_error":        serverStatus.LastError,
+			"status":            status,
+			"should_retry":      false,
+			"retry_count":       serverStatus.RetryCount,
+			"last_retry_time":   nil,
+			"oauth":             oauthConfig,
+			"authenticated":     authenticated,
 		}
 
 		// Add OAuth status fields if available
@@ -1830,17 +1831,18 @@ func (r *Runtime) getAllServersLegacy() ([]map[string]interface{}, error) {
 	result := make([]map[string]interface{}, 0, len(servers))
 	for _, srv := range servers {
 		serverInfo := map[string]interface{}{
-			"name":        srv.Name,
-			"url":         srv.URL,
-			"command":     srv.Command,
-			"protocol":    srv.Protocol,
-			"enabled":     srv.Enabled,
-			"quarantined": srv.Quarantined,
-			"created":     srv.Created,
-			"connected":   false,
-			"connecting":  false,
-			"tool_count":  0,
-			"status":      "unknown",
+			"name":              srv.Name,
+			"url":               srv.URL,
+			"command":           srv.Command,
+			"protocol":          srv.Protocol,
+			"enabled":           srv.Enabled,
+			"quarantined":       srv.Quarantined,
+			"created":           srv.Created,
+			"connected":         false,
+			"connecting":        false,
+			"oauth_flow_active": oauth.GetGlobalCoordinator().IsFlowActive(srv.Name),
+			"tool_count":        0,
+			"status":            "unknown",
 		}
 
 		// Try to get connection status

@@ -12,6 +12,7 @@ import (
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/contracts"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/reqcontext"
+	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream"
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/upstream/core"
 
 	"github.com/stretchr/testify/assert"
@@ -393,6 +394,38 @@ func (m *mockLoginController) GetCurrentConfig() any {
 
 func (m *mockLoginController) GetManagementService() interface{} {
 	return m.mgmtSvc
+}
+
+func TestHandleServerLogin_InFlightFlow(t *testing.T) {
+	serve := func(t *testing.T, svc *mockOAuthManagementService) *httptest.ResponseRecorder {
+		t.Helper()
+		srv := NewServer(&mockLoginController{apiKey: "test-key", mgmtSvc: svc}, zap.NewNop().Sugar(), nil)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/servers/test-server/login", nil)
+		req.Header.Set("X-API-Key", "test-key")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("still-in-progress after the join wait is a 409 with a stable marker", func(t *testing.T) {
+		err := fmt.Errorf("failed to start OAuth flow: %w", fmt.Errorf("%w: another sign-in for test-server is still running after 90s", upstream.ErrLoginFlowStillInProgress))
+		w := serve(t, &mockOAuthManagementService{triggerError: err})
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+		assert.Contains(t, w.Body.String(), "oauth_flow_in_progress")
+	})
+
+	t.Run("a joined flow is reported as such", func(t *testing.T) {
+		w := serve(t, &mockOAuthManagementService{triggerResult: &core.OAuthStartResult{JoinedExistingFlow: true}})
+
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp struct {
+			Data contracts.OAuthStartResponse `json:"data"`
+		}
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.True(t, resp.Data.JoinedExistingFlow)
+		assert.Contains(t, resp.Data.Message, "already in progress")
+	})
 }
 
 // TestHandleServerLogin_OAuthStartResponse tests the POST /api/v1/servers/{id}/login endpoint

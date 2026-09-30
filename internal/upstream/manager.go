@@ -1896,53 +1896,44 @@ func (m *Manager) StartManualOAuthQuick(serverName string) (*core.OAuthStartResu
 	// Use a long-running context for the OAuth callback (30 minutes)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 
-	// Clear OAuth state for fresh flow
-	coreClient.ClearOAuthState()
+	coordinator := oauth.GetGlobalCoordinator()
+	tokenManager := oauth.GetTokenStoreManager()
+	signedIn := func() bool {
+		return tokenManager.HasRecentOAuthCompletion(cfg.Name) || m.storedTokenValid(cfg.Name, cfg.URL)
+	}
 
-	// Start the quick OAuth flow - this returns immediately with browser status
-	result, err := coreClient.StartOAuthFlowQuick(ctx)
-	if err != nil {
+	result, err := startOrJoinLogin(coordinator, cfg.Name, loginJoinTimeout, func() (*core.OAuthStartResult, error) {
+		coreClient.ClearOAuthState()
+		return coreClient.StartOAuthFlowQuick(ctx)
+	}, signedIn)
+	if err != nil || result.JoinedExistingFlow {
+		// A joined flow's owner handles its own reconnect.
 		cancel()
 		return result, err
 	}
 
-	// Set up reconnection after OAuth completes (in background)
 	go func() {
 		defer cancel()
 
-		// Wait a bit for OAuth to complete (the callback handling runs in background)
-		// Then trigger reconnect
-		time.Sleep(2 * time.Second)
-
-		// Check if OAuth completed by looking for token
-		if m.storage != nil {
-			serverKey := oauth.GenerateServerKey(cfg.Name, cfg.URL)
-			token, _ := m.storage.GetOAuthToken(serverKey)
-			if token != nil && token.AccessToken != "" {
-				m.logger.Info("OAuth token obtained, triggering reconnect",
-					zap.String("server", cfg.Name))
-				if err := m.RetryConnection(cfg.Name); err != nil {
-					m.logger.Warn("Failed to trigger reconnect after OAuth",
-						zap.String("server", cfg.Name),
-						zap.Error(err))
-				}
-			}
+		// Waits on the flow StartOAuthFlowQuick registered; the coordinator reaps
+		// abandoned flows at StaleFlowTimeout, which bounds this goroutine.
+		if waitErr := coordinator.WaitForFlow(context.Background(), cfg.Name, 30*time.Minute); waitErr != nil {
+			m.logger.Info("OAuth flow did not complete; skipping reconnect",
+				zap.String("server", cfg.Name),
+				zap.Error(waitErr))
+			return
 		}
-
-		// Also set up a watcher for OAuth completion
-		tokenManager := oauth.GetTokenStoreManager()
-		for i := 0; i < 60; i++ { // Check for 2 minutes
-			if tokenManager.HasRecentOAuthCompletion(cfg.Name) {
-				m.logger.Info("OAuth completion detected, triggering reconnect",
-					zap.String("server", cfg.Name))
-				if err := m.RetryConnection(cfg.Name); err != nil {
-					m.logger.Warn("Failed to trigger reconnect after OAuth completion",
-						zap.String("server", cfg.Name),
-						zap.Error(err))
-				}
-				return
-			}
-			time.Sleep(2 * time.Second)
+		if !signedIn() {
+			m.logger.Info("OAuth flow ended without a token; skipping reconnect",
+				zap.String("server", cfg.Name))
+			return
+		}
+		m.logger.Info("OAuth completed, triggering reconnect",
+			zap.String("server", cfg.Name))
+		if err := m.RetryConnection(cfg.Name); err != nil {
+			m.logger.Warn("Failed to trigger reconnect after OAuth completion",
+				zap.String("server", cfg.Name),
+				zap.Error(err))
 		}
 	}()
 

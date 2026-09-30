@@ -103,6 +103,9 @@ type OAuthStartResult struct {
 	BrowserOpened bool   // Whether the browser was successfully opened
 	BrowserError  string // Error message if browser opening failed
 	CorrelationID string // Unique ID for tracking this OAuth flow
+	// JoinedExistingFlow is true when the login waited on another in-flight
+	// flow for this server instead of opening its own browser flow.
+	JoinedExistingFlow bool
 }
 
 // parseOAuthError extracts structured error information from OAuth provider responses
@@ -3014,7 +3017,7 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 		c.logger.Warn("⚠️ OAuth authorization already in progress",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", result.CorrelationID))
-		return result, fmt.Errorf("OAuth authorization already in progress for %s", c.config.Name)
+		return result, fmt.Errorf("OAuth authorization already in progress for %s: %w", c.config.Name, oauth.ErrFlowInProgress)
 	}
 
 	// Cross-instance/cross-path guard: fail fast (never block) if the global
@@ -3022,14 +3025,15 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 	// automatic reconnect via tryOAuthAuth, or another manual call. This is
 	// the login API's synchronous path, so unlike ForceOAuthFlowWithResult it
 	// must not wait on WaitForFlow; it fails the same way isOAuthInProgress
-	// above already does.
+	// above already does. Manager.StartManualOAuthQuick does the (bounded)
+	// join by matching oauth.ErrFlowInProgress.
 	coordinator := oauth.GetGlobalCoordinator()
 	flowCtx, startErr := coordinator.StartFlow(c.config.Name)
 	if startErr != nil {
 		c.logger.Warn("⚠️ OAuth authorization already in progress (coordinator)",
 			zap.String("server", c.config.Name),
 			zap.String("correlation_id", result.CorrelationID))
-		return result, fmt.Errorf("OAuth authorization already in progress for %s", c.config.Name)
+		return result, fmt.Errorf("OAuth authorization already in progress for %s: %w", c.config.Name, oauth.ErrFlowInProgress)
 	}
 
 	// flowCtx.CorrelationID is the coordinator's own flow-ownership token -

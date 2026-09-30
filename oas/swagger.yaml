@@ -1018,6 +1018,11 @@ components:
         correlation_id:
           description: UUID for tracking this flow
           type: string
+        joined_existing_flow:
+          description: |-
+            JoinedExistingFlow is true when this login waited on a sign-in that was
+            already running for the server and that sign-in succeeded.
+          type: boolean
         message:
           description: Human-readable status message
           type: string
@@ -1207,6 +1212,10 @@ components:
           type: string
         oauth:
           $ref: '#/components/schemas/contracts.OAuthConfig'
+        oauth_flow_active:
+          description: A sign-in holds this server's OAuth flow lock; a login request
+            joins it
+          type: boolean
         oauth_status:
           description: 'OAuth status: "authenticated", "expired", "error", "none",
             "unknown"'
