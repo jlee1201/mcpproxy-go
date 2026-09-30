@@ -178,6 +178,7 @@ func TestStartOAuthFlowQuick_FastFailsOnActiveSibling_WithoutDisturbingIt(t *tes
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "must fail fast rather than start a second, racing flow")
+	assert.ErrorIs(t, err, oauth.ErrFlowInProgress, "callers join the sibling by matching this sentinel")
 	assert.Less(t, elapsed, 500*time.Millisecond, "must fail fast, not wait on the sibling (this is the synchronous login-API path)")
 
 	active := coordinator.GetActiveFlow(serverName)

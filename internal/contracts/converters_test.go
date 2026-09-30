@@ -169,3 +169,14 @@ func TestConvertGenericServersToTyped_FreshnessFieldsAbsentWhenNotSet(t *testing
 	assert.Nil(t, server.LastSuccessAt)
 	assert.Nil(t, server.LastAuthFailureAt)
 }
+
+func TestConvertGenericServersToTyped_OAuthFlowActive(t *testing.T) {
+	servers := ConvertGenericServersToTyped([]map[string]interface{}{
+		{"name": "signing-in", "oauth_flow_active": true},
+		{"name": "idle"},
+	})
+
+	require.Len(t, servers, 2)
+	assert.True(t, servers[0].OAuthFlowActive)
+	assert.False(t, servers[1].OAuthFlowActive)
+}

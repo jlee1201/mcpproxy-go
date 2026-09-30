@@ -216,6 +216,9 @@ func (s *service) ListServers(ctx context.Context) ([]*contracts.Server, *contra
 		if connecting, ok := srvRaw["connecting"].(bool); ok {
 			srv.Connecting = connecting
 		}
+		if flowActive, ok := srvRaw["oauth_flow_active"].(bool); ok {
+			srv.OAuthFlowActive = flowActive
+		}
 		if quarantined, ok := srvRaw["quarantined"].(bool); ok {
 			srv.Quarantined = quarantined
 		}

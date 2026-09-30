@@ -175,6 +175,9 @@ func ConvertGenericServersToTyped(genericServers []map[string]interface{}) []Ser
 		if connecting, ok := generic["connecting"].(bool); ok {
 			server.Connecting = connecting
 		}
+		if flowActive, ok := generic["oauth_flow_active"].(bool); ok {
+			server.OAuthFlowActive = flowActive
+		}
 		if status, ok := generic["status"].(string); ok {
 			server.Status = status
 		}

@@ -124,6 +124,22 @@ func TestListServers(t *testing.T) {
 		assert.Equal(t, 1, stats.QuarantinedServers)
 	})
 
+	t.Run("carries oauth_flow_active through", func(t *testing.T) {
+		runtime := newMockRuntime()
+		runtime.servers = []map[string]interface{}{
+			{"id": "a", "name": "signing-in", "oauth_flow_active": true},
+			{"id": "b", "name": "idle", "oauth_flow_active": false},
+		}
+
+		svc := NewService(runtime, cfg, emitter, nil, logger)
+		servers, _, err := svc.ListServers(context.Background())
+
+		require.NoError(t, err)
+		require.Len(t, servers, 2)
+		assert.True(t, servers[0].OAuthFlowActive)
+		assert.False(t, servers[1].OAuthFlowActive)
+	})
+
 	t.Run("runtime error", func(t *testing.T) {
 		runtime := newMockRuntime()
 		runtime.getAllError = fmt.Errorf("runtime error")

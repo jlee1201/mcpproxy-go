@@ -30,6 +30,7 @@ export interface Server {
   quarantined: boolean
   connected: boolean
   connecting: boolean
+  oauth_flow_active?: boolean
   authenticated?: boolean
   tool_count: number
   last_error?: string
