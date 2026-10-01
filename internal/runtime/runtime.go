@@ -56,6 +56,12 @@ type Runtime struct {
 	mu      sync.RWMutex
 	running bool
 
+	// toggleMu serializes server state toggles (enable/quarantine/bulk enable). Each one
+	// writes storage, snapshots storage into the config (SaveConfiguration), then pushes the
+	// config back into storage (LoadConfiguredServers). Two unserialized toggles of different
+	// servers can interleave so one's stale snapshot overwrites the other's write.
+	toggleMu sync.Mutex
+
 	statusMu sync.RWMutex
 	status   Status
 	statusCh chan Status
