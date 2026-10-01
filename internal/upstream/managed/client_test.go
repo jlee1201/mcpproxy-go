@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,14 +92,71 @@ func TestGetConfig_DoesNotBlockBehindHeldMutex(t *testing.T) {
 	}
 }
 
-// TestSetConfig_VisibleToGetConfig checks the swap is observed by readers.
-func TestSetConfig_VisibleToGetConfig(t *testing.T) {
-	mc, err := NewClient("test-swap", &config.ServerConfig{Name: "test-swap"}, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+// TestGetConfig_DoesNotBlockBehindPendingSetConfig pins SetConfig's lock order
+// (mu, then cfgMu). If SetConfig took cfgMu first, a SetConfig queued behind an
+// in-flight Connect would hold cfgMu and stall every GetConfig for the whole connect.
+func TestGetConfig_DoesNotBlockBehindPendingSetConfig(t *testing.T) {
+	orig := &config.ServerConfig{Name: "test-order"}
+	mc, err := NewClient("test-order", orig, zap.NewNop(), nil, nil, nil, secret.NewResolver())
 	require.NoError(t, err)
 
-	next := &config.ServerConfig{Name: "test-swap", Enabled: true}
-	mc.SetConfig(next)
+	mc.mu.Lock() // simulate Connect() in flight
+	next := &config.ServerConfig{Name: "test-order", Enabled: true}
+	setDone := make(chan struct{})
+	go func() {
+		mc.SetConfig(next)
+		close(setDone)
+	}()
+	time.Sleep(50 * time.Millisecond) // let SetConfig reach its first lock
+
+	got := make(chan *config.ServerConfig, 1)
+	go func() { got <- mc.GetConfig() }()
+	select {
+	case cfg := <-got:
+		assert.Same(t, orig, cfg)
+	case <-time.After(2 * time.Second):
+		mc.mu.Unlock()
+		t.Fatal("GetConfig() blocked behind a SetConfig waiting on mc.mu -- SetConfig must take mu before cfgMu")
+	}
+
+	mc.mu.Unlock()
+	<-setDone
 	assert.Same(t, next, mc.GetConfig())
+}
+
+// TestConfigAccess_RaceFree exercises GetConfig, mu-held reads and SetConfig
+// concurrently so -race checks the locking.
+func TestConfigAccess_RaceFree(t *testing.T) {
+	mc, err := NewClient("test-race", &config.ServerConfig{Name: "test-race"}, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(muHolder bool) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if muHolder {
+					mc.mu.RLock()
+					_ = mc.Config.Name
+					mc.mu.RUnlock()
+				} else {
+					_ = mc.GetConfig().Name
+				}
+			}
+		}(i%2 == 0)
+	}
+	for i := 0; i < 200; i++ {
+		mc.SetConfig(&config.ServerConfig{Name: "test-race", Enabled: i%2 == 0})
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // TestLockFreeAccessors_DoNotBlockBehindHeldMutex is the fix side of the

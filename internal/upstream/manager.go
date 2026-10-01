@@ -241,7 +241,7 @@ func (m *Manager) AddServerConfig(id string, serverConfig *config.ServerConfig) 
 	// Check if existing client exists and if config has changed
 	var clientToDisconnect *managed.Client
 	if existingClient, exists := m.clients[id]; exists {
-		existingConfig := existingClient.Config
+		existingConfig := existingClient.GetConfig()
 
 		// Compare configurations to determine if reconnection is needed
 		configChanged := existingConfig.URL != serverConfig.URL ||

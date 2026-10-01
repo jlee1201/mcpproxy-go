@@ -172,9 +172,10 @@ func (p *ActorPoolSimple) ConnectAll(ctx context.Context) error {
 // Config/Enabled/Quarantined. This is the sole caller-facing accessor used on
 // the hot event-consumption path (Supervisor.updateSnapshotFromEvent, which
 // only reads ToolCount and ConnectionInfo from the result -- verified as the
-// only production call site). client.GetConfig() takes mc.mu.RLock(), and
-// managed.Client.Connect()/Disconnect() hold that same mutex for the whole
-// call including network I/O. During an OAuth reconnect burst, that meant
+// only production call site). client.GetConfig() used to take mc.mu.RLock(),
+// and managed.Client.Connect()/Disconnect() hold that same mutex for the whole
+// call including network I/O. (GetConfig now uses its own cfgMu and no longer
+// waits on Connect.) During an OAuth reconnect burst, that meant
 // this method blocked -- on the single event-forwarder goroutine -- for
 // however long a concurrent Connect() took, stalling delivery for every
 // other server's events too and overflowing the 50-slot channel upstream
@@ -222,15 +223,19 @@ func (p *ActorPoolSimple) GetAllStates() map[string]*ServerState {
 
 	for name, client := range clients {
 		connected := client.IsConnected()
+		cfg := client.GetConfig()
+		if cfg == nil {
+			continue
+		}
 
 		state := &ServerState{
 			Name:      name,
-			Config:    client.Config,
-			Enabled:   client.Config.Enabled,
+			Config:    cfg,
+			Enabled:   cfg.Enabled,
 			Connected: connected,
 		}
 
-		if client.Config.Quarantined {
+		if cfg.Quarantined {
 			state.Quarantined = true
 		}
 
