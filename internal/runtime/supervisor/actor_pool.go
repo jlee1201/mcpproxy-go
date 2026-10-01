@@ -168,22 +168,16 @@ func (p *ActorPoolSimple) ConnectAll(ctx context.Context) error {
 // GetServerState returns the current state of a server from the manager.
 // Phase 7.1 FIX: Fetches tools for the specific server to avoid blocking all servers.
 //
-// Deliberately does NOT call client.GetConfig() and does not populate
-// Config/Enabled/Quarantined. This is the sole caller-facing accessor used on
-// the hot event-consumption path (Supervisor.updateSnapshotFromEvent, which
-// only reads ToolCount and ConnectionInfo from the result -- verified as the
-// only production call site). client.GetConfig() used to take mc.mu.RLock(),
-// and managed.Client.Connect()/Disconnect() hold that same mutex for the whole
-// call including network I/O. (GetConfig now uses its own cfgMu and no longer
-// waits on Connect.) During an OAuth reconnect burst, that meant
-// this method blocked -- on the single event-forwarder goroutine -- for
-// however long a concurrent Connect() took, stalling delivery for every
-// other server's events too and overflowing the 50-slot channel upstream
-// ("Event channel full, dropping event"). IsConnected()/GetConnectionInfo()/
-// GetCachedToolCountNonBlocking() are all StateManager-/cache-scoped and
-// never touch mc.mu. If a future caller needs Config/Enabled/Quarantined
-// from this method, populate them explicitly and re-audit every caller for
-// this same blocking risk -- don't just add GetConfig() back in.
+// Does not populate Config/Enabled/Quarantined. This is the sole caller-facing
+// accessor used on the hot event-consumption path (Supervisor.updateSnapshotFromEvent,
+// which only reads ToolCount and ConnectionInfo from the result -- verified as the
+// only production call site). It originally avoided client.GetConfig() because that
+// took mc.mu.RLock(), which Connect()/Disconnect() hold across network I/O; during an
+// OAuth reconnect burst this method then blocked the single event-forwarder goroutine
+// and overflowed the 50-slot channel upstream ("Event channel full, dropping event").
+// GetConfig now uses its own cfgMu and is safe to call here. Anything else added to
+// this method must likewise never touch mc.mu. IsConnected()/GetConnectionInfo()/
+// GetCachedToolCountNonBlocking() are StateManager-/cache-scoped and never do.
 func (p *ActorPoolSimple) GetServerState(name string) (*ServerState, error) {
 	client, exists := p.manager.GetClient(name)
 	if !exists {

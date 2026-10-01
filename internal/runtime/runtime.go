@@ -65,7 +65,7 @@ type Runtime struct {
 	// it; that is fine because event publishing never blocks.)
 	// Known gap: every other caller of SaveConfiguration/LoadConfiguredServers does not take
 	// it yet, including handleQuarantineUpstream (which bypasses QuarantineServer), the MCP
-	// add/update/patch/remove handlers, SetListenAddress, ReloadConfiguration,
+	// add/update/patch/remove handlers, Server.AddServer/RemoveServer, SetListenAddress, ReloadConfiguration,
 	// backgroundInitialization and ApplyConfig's reload goroutine.
 	toggleMu sync.Mutex
 
