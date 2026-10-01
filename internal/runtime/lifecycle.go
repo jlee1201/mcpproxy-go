@@ -871,6 +871,7 @@ func (r *Runtime) EnableServer(serverName string, enabled bool) error {
 		return err
 	}
 
+	// Outside toggleMu on purpose (see Runtime.toggleMu).
 	// Wait for the server to start connecting (LoadConfiguredServers spawns goroutines)
 	// This ensures callers don't race with connection establishment
 	// The goroutine needs time to spawn and then AddServer needs to initiate connection
@@ -998,14 +999,11 @@ func (r *Runtime) persistQuarantineState(serverName string, quarantined bool) er
 // storage/config save to avoid repeated file writes. Returns a map of per-server
 // errors for operations that could not be applied.
 func (r *Runtime) BulkEnableServers(serverNames []string, enabled bool) (map[string]error, error) {
-	resultErrs := make(map[string]error)
 	if len(serverNames) == 0 {
-		return resultErrs, nil
+		return make(map[string]error), nil
 	}
 
-	r.toggleMu.Lock()
-	resultErrs, changed, err := r.persistBulkEnabledState(serverNames, enabled, resultErrs)
-	r.toggleMu.Unlock()
+	resultErrs, changed, err := r.persistBulkEnabledState(serverNames, enabled)
 	if err != nil {
 		return resultErrs, err
 	}
@@ -1023,10 +1021,14 @@ func (r *Runtime) BulkEnableServers(serverNames []string, enabled bool) (map[str
 	return resultErrs, nil
 }
 
-// persistBulkEnabledState applies the bulk toggle to storage, then saves and reloads once.
-// Caller must hold toggleMu. Returns BulkEnableServers' per-server error map, the names
-// changed, and any operation-level error.
-func (r *Runtime) persistBulkEnabledState(serverNames []string, enabled bool, resultErrs map[string]error) (map[string]error, []string, error) {
+// persistBulkEnabledState applies the bulk toggle to storage, then saves and reloads once,
+// under toggleMu. Returns BulkEnableServers' per-server error map, the names changed, and
+// any operation-level error.
+func (r *Runtime) persistBulkEnabledState(serverNames []string, enabled bool) (map[string]error, []string, error) {
+	r.toggleMu.Lock()
+	defer r.toggleMu.Unlock()
+
+	resultErrs := make(map[string]error)
 	servers, err := r.storageManager.ListUpstreamServers()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to list servers: %w", err)

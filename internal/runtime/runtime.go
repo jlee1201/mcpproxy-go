@@ -56,10 +56,14 @@ type Runtime struct {
 	mu      sync.RWMutex
 	running bool
 
-	// toggleMu serializes server state toggles (enable/quarantine/bulk enable). Each one
-	// writes storage, snapshots storage into the config (SaveConfiguration), then pushes the
-	// config back into storage (LoadConfiguredServers). Two unserialized toggles of different
-	// servers can interleave so one's stale snapshot overwrites the other's write.
+	// toggleMu is held by EnableServer, QuarantineServer and BulkEnableServers across their
+	// storage write -> SaveConfiguration (storage -> config) -> LoadConfiguredServers
+	// (config -> storage) sequence. Unserialized, two toggles of different servers can
+	// interleave so one's stale snapshot overwrites the other's write. Hold it only for that
+	// sequence, never across the post-enable wait, event emission or
+	// HandleUpstreamServerChange, or toggles queue behind each other's sleep.
+	// Known gap: the add/update/patch/remove server paths in internal/server,
+	// ReloadConfiguration and ApplyConfig's reload goroutine do not take it yet.
 	toggleMu sync.Mutex
 
 	statusMu sync.RWMutex
