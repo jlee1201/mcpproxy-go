@@ -21,7 +21,10 @@ import (
 
 // Client wraps a core client with state management, concurrency control, and background recovery
 type Client struct {
-	id           string
+	id string
+	// Config is the current server configuration. SetConfig swaps the pointer
+	// concurrently, so read it via GetConfig() unless mc.mu is held, and treat
+	// the result as read-only.
 	Config       *config.ServerConfig // Public field for compatibility with existing code
 	coreClient   *core.Client
 	logger       *zap.Logger
@@ -34,6 +37,12 @@ type Client struct {
 
 	// Connection state protection
 	mu sync.RWMutex
+
+	// cfgMu guards Config for GetConfig/SetConfig. It is separate from mu
+	// because Connect/Disconnect hold mu across network I/O, and config reads
+	// must not wait on that. SetConfig takes mu then cfgMu, so code holding
+	// either lock reads Config race-free.
+	cfgMu sync.RWMutex
 
 	// ListTools concurrency control
 	listToolsMu         sync.Mutex
@@ -300,17 +309,21 @@ func (mc *Client) GetConnectionInfo() types.ConnectionInfo {
 	return mc.StateManager.GetConnectionInfo()
 }
 
-// GetConfig returns a thread-safe copy of the server configuration
+// GetConfig returns the current server configuration snapshot. It never waits
+// on an in-flight Connect/Disconnect. The result is shared: treat it as read-only.
 func (mc *Client) GetConfig() *config.ServerConfig {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
+	mc.cfgMu.RLock()
+	defer mc.cfgMu.RUnlock()
 	return mc.Config
 }
 
-// SetConfig updates the server configuration in a thread-safe manner
+// SetConfig swaps in a new server configuration. It takes mu as well as cfgMu
+// so code that reads mc.Config while holding mu stays race-free.
 func (mc *Client) SetConfig(config *config.ServerConfig) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
+	mc.cfgMu.Lock()
+	defer mc.cfgMu.Unlock()
 	mc.Config = config
 }
 

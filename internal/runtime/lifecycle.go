@@ -867,23 +867,11 @@ func (r *Runtime) EnableServer(serverName string, enabled bool) error {
 		zap.String("server", serverName),
 		zap.Bool("enabled", enabled))
 
-	if err := r.storageManager.EnableUpstreamServer(serverName, enabled); err != nil {
-		r.logger.Error("Failed to update server enabled state in storage", zap.Error(err))
-		return fmt.Errorf("failed to update server '%s' in storage: %w", serverName, err)
+	if err := r.persistEnabledState(serverName, enabled); err != nil {
+		return err
 	}
 
-	// Save configuration synchronously to ensure changes are persisted before returning
-	if err := r.SaveConfiguration(); err != nil {
-		r.logger.Error("Failed to save configuration after state change", zap.Error(err))
-		return fmt.Errorf("failed to save configuration: %w", err)
-	}
-
-	// Reload configuration synchronously to ensure server state is updated before returning
-	if err := r.LoadConfiguredServers(nil); err != nil {
-		r.logger.Error("Failed to synchronize runtime after enable toggle", zap.Error(err))
-		return fmt.Errorf("failed to reload configuration: %w", err)
-	}
-
+	// Outside toggleMu on purpose (see Runtime.toggleMu).
 	// Wait for the server to start connecting (LoadConfiguredServers spawns goroutines)
 	// This ensures callers don't race with connection establishment
 	// The goroutine needs time to spawn and then AddServer needs to initiate connection
@@ -911,6 +899,30 @@ func (r *Runtime) EnableServer(serverName string, enabled bool) error {
 	return nil
 }
 
+// persistEnabledState writes the enabled flag, saves, and reloads under toggleMu.
+func (r *Runtime) persistEnabledState(serverName string, enabled bool) error {
+	r.toggleMu.Lock()
+	defer r.toggleMu.Unlock()
+
+	if err := r.storageManager.EnableUpstreamServer(serverName, enabled); err != nil {
+		r.logger.Error("Failed to update server enabled state in storage", zap.Error(err))
+		return fmt.Errorf("failed to update server '%s' in storage: %w", serverName, err)
+	}
+
+	// Save configuration synchronously to ensure changes are persisted before returning
+	if err := r.SaveConfiguration(); err != nil {
+		r.logger.Error("Failed to save configuration after state change", zap.Error(err))
+		return fmt.Errorf("failed to save configuration: %w", err)
+	}
+
+	// Reload configuration synchronously to ensure server state is updated before returning
+	if err := r.LoadConfiguredServers(nil); err != nil {
+		r.logger.Error("Failed to synchronize runtime after enable toggle", zap.Error(err))
+		return fmt.Errorf("failed to reload configuration: %w", err)
+	}
+	return nil
+}
+
 // QuarantineServer updates the quarantine state and persists the change.
 // Security: When quarantining a server, all its tools are removed from the index
 // to prevent Tool Poisoning Attacks (TPA) from exposing potentially malicious tool descriptions.
@@ -918,6 +930,37 @@ func (r *Runtime) QuarantineServer(serverName string, quarantined bool) error {
 	r.logger.Info("Request to change server quarantine state",
 		zap.String("server", serverName),
 		zap.Bool("quarantined", quarantined))
+
+	if err := r.persistQuarantineState(serverName, quarantined); err != nil {
+		return err
+	}
+
+	r.emitServersChanged("quarantine_toggle", map[string]any{
+		"server":      serverName,
+		"quarantined": quarantined,
+	})
+
+	// Emit activity event for quarantine state change
+	reason := "Server unquarantined by administrator"
+	if quarantined {
+		reason = "Server quarantined for security review"
+	}
+	r.EmitActivityQuarantineChange(serverName, quarantined, reason)
+
+	r.HandleUpstreamServerChange(r.AppContext())
+
+	r.logger.Info("Successfully persisted server quarantine state change",
+		zap.String("server", serverName),
+		zap.Bool("quarantined", quarantined))
+
+	return nil
+}
+
+// persistQuarantineState writes the quarantine flag, drops quarantined tools from the
+// index, saves, and reloads under toggleMu.
+func (r *Runtime) persistQuarantineState(serverName string, quarantined bool) error {
+	r.toggleMu.Lock()
+	defer r.toggleMu.Unlock()
 
 	if err := r.storageManager.QuarantineUpstreamServer(serverName, quarantined); err != nil {
 		r.logger.Error("Failed to update server quarantine state in storage", zap.Error(err))
@@ -949,25 +992,6 @@ func (r *Runtime) QuarantineServer(serverName string, quarantined bool) error {
 		r.logger.Error("Failed to synchronize runtime after quarantine toggle", zap.Error(err))
 		return fmt.Errorf("failed to reload configuration: %w", err)
 	}
-
-	r.emitServersChanged("quarantine_toggle", map[string]any{
-		"server":      serverName,
-		"quarantined": quarantined,
-	})
-
-	// Emit activity event for quarantine state change
-	reason := "Server unquarantined by administrator"
-	if quarantined {
-		reason = "Server quarantined for security review"
-	}
-	r.EmitActivityQuarantineChange(serverName, quarantined, reason)
-
-	r.HandleUpstreamServerChange(r.AppContext())
-
-	r.logger.Info("Successfully persisted server quarantine state change",
-		zap.String("server", serverName),
-		zap.Bool("quarantined", quarantined))
-
 	return nil
 }
 
@@ -975,14 +999,39 @@ func (r *Runtime) QuarantineServer(serverName string, quarantined bool) error {
 // storage/config save to avoid repeated file writes. Returns a map of per-server
 // errors for operations that could not be applied.
 func (r *Runtime) BulkEnableServers(serverNames []string, enabled bool) (map[string]error, error) {
-	resultErrs := make(map[string]error)
 	if len(serverNames) == 0 {
+		return make(map[string]error), nil
+	}
+
+	resultErrs, changed, err := r.persistBulkEnabledState(serverNames, enabled)
+	if err != nil {
+		return resultErrs, err
+	}
+	if len(changed) == 0 {
 		return resultErrs, nil
 	}
 
+	r.emitServersChanged("bulk_enable_toggle", map[string]any{
+		"enabled": enabled,
+		"count":   len(changed),
+	})
+
+	r.HandleUpstreamServerChange(r.AppContext())
+
+	return resultErrs, nil
+}
+
+// persistBulkEnabledState applies the bulk toggle to storage, then saves and reloads once,
+// under toggleMu. Returns BulkEnableServers' per-server error map, the names changed, and
+// any operation-level error.
+func (r *Runtime) persistBulkEnabledState(serverNames []string, enabled bool) (map[string]error, []string, error) {
+	r.toggleMu.Lock()
+	defer r.toggleMu.Unlock()
+
+	resultErrs := make(map[string]error)
 	servers, err := r.storageManager.ListUpstreamServers()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list servers: %w", err)
+		return nil, nil, fmt.Errorf("failed to list servers: %w", err)
 	}
 	serversByName := make(map[string]*config.ServerConfig, len(servers))
 	for _, srv := range servers {
@@ -1011,26 +1060,19 @@ func (r *Runtime) BulkEnableServers(serverNames []string, enabled bool) (map[str
 
 	// Nothing changed; return collected errors (if any)
 	if len(changed) == 0 {
-		return resultErrs, nil
+		return resultErrs, nil, nil
 	}
 
 	// Persist once and reload once for all changes
 	if err := r.SaveConfiguration(); err != nil {
-		return resultErrs, fmt.Errorf("failed to save configuration: %w", err)
+		return resultErrs, changed, fmt.Errorf("failed to save configuration: %w", err)
 	}
 
 	if err := r.LoadConfiguredServers(nil); err != nil {
-		return resultErrs, fmt.Errorf("failed to reload configuration: %w", err)
+		return resultErrs, changed, fmt.Errorf("failed to reload configuration: %w", err)
 	}
 
-	r.emitServersChanged("bulk_enable_toggle", map[string]any{
-		"enabled": enabled,
-		"count":   len(changed),
-	})
-
-	r.HandleUpstreamServerChange(r.AppContext())
-
-	return resultErrs, nil
+	return resultErrs, changed, nil
 }
 
 // RestartServer restarts an upstream server by disconnecting and reconnecting it.

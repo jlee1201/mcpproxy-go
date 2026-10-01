@@ -241,7 +241,7 @@ func (m *Manager) AddServerConfig(id string, serverConfig *config.ServerConfig) 
 	// Check if existing client exists and if config has changed
 	var clientToDisconnect *managed.Client
 	if existingClient, exists := m.clients[id]; exists {
-		existingConfig := existingClient.Config
+		existingConfig := existingClient.GetConfig()
 
 		// Compare configurations to determine if reconnection is needed
 		configChanged := existingConfig.URL != serverConfig.URL ||
@@ -790,14 +790,18 @@ func (m *Manager) DiscoverTools(ctx context.Context) ([]*config.ToolMetadata, er
 	for id, client := range m.clients {
 		name := ""
 		quarantined := false
-		if client != nil && client.Config != nil {
-			name = client.Config.Name
-			quarantined = client.Config.Quarantined
+		var cfg *config.ServerConfig
+		if client != nil {
+			cfg = client.GetConfig()
+		}
+		if cfg != nil {
+			name = cfg.Name
+			quarantined = cfg.Quarantined
 		}
 		snapshots = append(snapshots, clientSnapshot{
 			id:          id,
 			name:        name,
-			enabled:     client != nil && client.Config != nil && client.Config.Enabled,
+			enabled:     cfg != nil && cfg.Enabled,
 			quarantined: quarantined,
 			client:      client,
 		})
@@ -1242,6 +1246,7 @@ func (m *Manager) GetStats() map[string]interface{} {
 
 		// Get detailed connection info from state manager
 		connectionInfo := client.GetConnectionInfo()
+		cfg := client.GetConfig()
 
 		status := map[string]interface{}{
 			"state":        connectionInfo.State.String(),
@@ -1249,9 +1254,9 @@ func (m *Manager) GetStats() map[string]interface{} {
 			"connecting":   client.IsConnecting(),
 			"retry_count":  connectionInfo.RetryCount,
 			"should_retry": client.ShouldRetry(),
-			"name":         client.Config.Name,
-			"url":          client.Config.URL,
-			"protocol":     client.Config.Protocol,
+			"name":         cfg.Name,
+			"url":          cfg.URL,
+			"protocol":     cfg.Protocol,
 		}
 
 		if connectionInfo.State == types.StateReady {
@@ -1312,7 +1317,10 @@ func (m *Manager) GetTotalToolCount() int {
 	// Now process clients without holding lock
 	totalTools := 0
 	for _, client := range clientsCopy {
-		if client == nil || client.Config == nil || !client.Config.Enabled || !client.IsConnected() {
+		if client == nil {
+			continue
+		}
+		if cfg := client.GetConfig(); cfg == nil || !cfg.Enabled || !client.IsConnected() {
 			continue
 		}
 

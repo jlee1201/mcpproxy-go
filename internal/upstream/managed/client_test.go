@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,39 +65,98 @@ func TestZombieInvalidation_PostConnectAuthFailureFlipsState(t *testing.T) {
 		"last_auth_failure_at must be recorded after last_success_at -- that ordering is the zombie's proof")
 }
 
-// TestGetConfig_BlocksBehindHeldMutex documents *why* the actor-pool fix
-// (2026-08-13) stopped calling GetConfig() from the hot event-consumption
-// path: Connect()/Disconnect() hold mc.mu for their entire duration
-// (including network I/O), and GetConfig() takes mc.mu.RLock(), so a
-// concurrent GetConfig() call blocks for as long as a connect attempt is in
-// flight. This is the actual mechanism that stalled
-// Supervisor.updateSnapshotFromEvent (the sole caller of ActorPoolSimple's
-// GetServerState, which used to call GetConfig()) for however long a
-// concurrent Connect() took, overflowing the 50-slot event channel upstream
-// during an OAuth reconnect burst ("Event channel full, dropping event").
-func TestGetConfig_BlocksBehindHeldMutex(t *testing.T) {
+// TestGetConfig_DoesNotBlockBehindHeldMutex guards the reason GetConfig has
+// its own cfgMu: Connect()/Disconnect() hold mc.mu for their entire duration
+// (including network I/O). When GetConfig took mc.mu.RLock(), any caller
+// stalled for as long as a connect attempt was in flight -- first seen
+// 2026-08-13, when it stalled Supervisor.updateSnapshotFromEvent and
+// overflowed the 50-slot event channel during an OAuth reconnect burst, and
+// again in Manager.DiscoverTools/GetStats/GetTotalToolCount, which read
+// config via GetConfig() to avoid a data race with SetConfig.
+func TestGetConfig_DoesNotBlockBehindHeldMutex(t *testing.T) {
 	cfg := &config.ServerConfig{Name: "test-lock"}
 	mc, err := NewClient("test-lock", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
 	require.NoError(t, err)
 
-	const holdTime = 200 * time.Millisecond
-
 	// Simulate Connect() holding mc.mu across a slow network call.
 	mc.mu.Lock()
-	unlocked := make(chan struct{})
+	defer mc.mu.Unlock()
+
+	done := make(chan *config.ServerConfig, 1)
+	go func() { done <- mc.GetConfig() }()
+	select {
+	case got := <-done:
+		assert.Same(t, cfg, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetConfig() blocked behind a held mc.mu -- it must only take cfgMu")
+	}
+}
+
+// TestGetConfig_DoesNotBlockBehindPendingSetConfig pins SetConfig's lock order
+// (mu, then cfgMu). If SetConfig took cfgMu first, a SetConfig queued behind an
+// in-flight Connect would hold cfgMu and stall every GetConfig for the whole connect.
+func TestGetConfig_DoesNotBlockBehindPendingSetConfig(t *testing.T) {
+	orig := &config.ServerConfig{Name: "test-order"}
+	mc, err := NewClient("test-order", orig, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	mc.mu.Lock() // simulate Connect() in flight
+	next := &config.ServerConfig{Name: "test-order", Enabled: true}
+	setDone := make(chan struct{})
 	go func() {
-		time.Sleep(holdTime)
-		mc.mu.Unlock()
-		close(unlocked)
+		mc.SetConfig(next)
+		close(setDone)
 	}()
+	time.Sleep(50 * time.Millisecond) // let SetConfig reach its first lock
 
-	start := time.Now()
-	_ = mc.GetConfig()
-	elapsed := time.Since(start)
-	<-unlocked
+	got := make(chan *config.ServerConfig, 1)
+	go func() { got <- mc.GetConfig() }()
+	select {
+	case cfg := <-got:
+		assert.Same(t, orig, cfg)
+	case <-time.After(2 * time.Second):
+		mc.mu.Unlock()
+		t.Fatal("GetConfig() blocked behind a SetConfig waiting on mc.mu -- SetConfig must take mu before cfgMu")
+	}
 
-	assert.GreaterOrEqual(t, elapsed, holdTime-10*time.Millisecond,
-		"GetConfig() should block for the full mutex hold -- this is the mechanism, not a flake to tolerate")
+	mc.mu.Unlock()
+	<-setDone
+	assert.Same(t, next, mc.GetConfig())
+}
+
+// TestConfigAccess_RaceFree exercises GetConfig, mu-held reads and SetConfig
+// concurrently so -race checks the locking.
+func TestConfigAccess_RaceFree(t *testing.T) {
+	mc, err := NewClient("test-race", &config.ServerConfig{Name: "test-race"}, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(muHolder bool) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if muHolder {
+					mc.mu.RLock()
+					_ = mc.Config.Name
+					mc.mu.RUnlock()
+				} else {
+					_ = mc.GetConfig().Name
+				}
+			}
+		}(i%2 == 0)
+	}
+	for i := 0; i < 200; i++ {
+		mc.SetConfig(&config.ServerConfig{Name: "test-race", Enabled: i%2 == 0})
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // TestLockFreeAccessors_DoNotBlockBehindHeldMutex is the fix side of the
