@@ -64,39 +64,41 @@ func TestZombieInvalidation_PostConnectAuthFailureFlipsState(t *testing.T) {
 		"last_auth_failure_at must be recorded after last_success_at -- that ordering is the zombie's proof")
 }
 
-// TestGetConfig_BlocksBehindHeldMutex documents *why* the actor-pool fix
-// (2026-08-13) stopped calling GetConfig() from the hot event-consumption
-// path: Connect()/Disconnect() hold mc.mu for their entire duration
-// (including network I/O), and GetConfig() takes mc.mu.RLock(), so a
-// concurrent GetConfig() call blocks for as long as a connect attempt is in
-// flight. This is the actual mechanism that stalled
-// Supervisor.updateSnapshotFromEvent (the sole caller of ActorPoolSimple's
-// GetServerState, which used to call GetConfig()) for however long a
-// concurrent Connect() took, overflowing the 50-slot event channel upstream
-// during an OAuth reconnect burst ("Event channel full, dropping event").
-func TestGetConfig_BlocksBehindHeldMutex(t *testing.T) {
+// TestGetConfig_DoesNotBlockBehindHeldMutex guards the reason GetConfig has
+// its own cfgMu: Connect()/Disconnect() hold mc.mu for their entire duration
+// (including network I/O). When GetConfig took mc.mu.RLock(), any caller
+// stalled for as long as a connect attempt was in flight -- first seen
+// 2026-08-13, when it stalled Supervisor.updateSnapshotFromEvent and
+// overflowed the 50-slot event channel during an OAuth reconnect burst, and
+// again in Manager.DiscoverTools/GetStats/GetTotalToolCount, which read
+// config via GetConfig() to avoid a data race with SetConfig.
+func TestGetConfig_DoesNotBlockBehindHeldMutex(t *testing.T) {
 	cfg := &config.ServerConfig{Name: "test-lock"}
 	mc, err := NewClient("test-lock", cfg, zap.NewNop(), nil, nil, nil, secret.NewResolver())
 	require.NoError(t, err)
 
-	const holdTime = 200 * time.Millisecond
-
 	// Simulate Connect() holding mc.mu across a slow network call.
 	mc.mu.Lock()
-	unlocked := make(chan struct{})
-	go func() {
-		time.Sleep(holdTime)
-		mc.mu.Unlock()
-		close(unlocked)
-	}()
+	defer mc.mu.Unlock()
 
-	start := time.Now()
-	_ = mc.GetConfig()
-	elapsed := time.Since(start)
-	<-unlocked
+	done := make(chan *config.ServerConfig, 1)
+	go func() { done <- mc.GetConfig() }()
+	select {
+	case got := <-done:
+		assert.Same(t, cfg, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetConfig() blocked behind a held mc.mu -- it must only take cfgMu")
+	}
+}
 
-	assert.GreaterOrEqual(t, elapsed, holdTime-10*time.Millisecond,
-		"GetConfig() should block for the full mutex hold -- this is the mechanism, not a flake to tolerate")
+// TestSetConfig_VisibleToGetConfig checks the swap is observed by readers.
+func TestSetConfig_VisibleToGetConfig(t *testing.T) {
+	mc, err := NewClient("test-swap", &config.ServerConfig{Name: "test-swap"}, zap.NewNop(), nil, nil, nil, secret.NewResolver())
+	require.NoError(t, err)
+
+	next := &config.ServerConfig{Name: "test-swap", Enabled: true}
+	mc.SetConfig(next)
+	assert.Same(t, next, mc.GetConfig())
 }
 
 // TestLockFreeAccessors_DoNotBlockBehindHeldMutex is the fix side of the
