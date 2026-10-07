@@ -1363,7 +1363,13 @@ func (m *Manager) RetryConnection(serverName string) error {
 	// If the client is already connected or connecting, do not force a
 	// reconnect. This prevents Ready→Disconnected flapping when duplicate
 	// OAuth completion events arrive.
-	if client.IsConnected() {
+	// A Ready client with no server info never finished initialize (the old
+	// "joined another goroutine's OAuth flow" path produced these); it cannot serve
+	// calls, so fall through and reconnect it instead of trusting the state.
+	if client.IsConnected() && client.GetServerInfo() == nil {
+		m.logger.Warn("Client is Ready but never initialized; reconnecting",
+			zap.String("server", serverName))
+	} else if client.IsConnected() {
 		m.logger.Info("Skipping retry: client already connected",
 			zap.String("server", serverName),
 			zap.String("state", client.GetState().String()))
