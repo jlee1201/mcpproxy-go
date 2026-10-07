@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -313,6 +314,9 @@ func TestRecordLog_DropGroupAndGroupAccounting(t *testing.T) {
 }
 
 func TestRecordLog_LoadAfterSegmentDeletedReturnsErrRecordGone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("cannot unlink the open active segment on Windows")
+	}
 	dir := t.TempDir()
 	l := openTestLog(t, dir, 0)
 	defer l.close()
@@ -445,6 +449,9 @@ func TestNewManager_DropsLegacyHistoryBucketsButKeepsDiagnostics(t *testing.T) {
 }
 
 func TestNewManager_DroppingLegacyBucketsLetsCompactionShrinkConfigDB(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("online compaction renames over the open db file, unsupported on Windows")
+	}
 	dir := t.TempDir()
 	seedLegacyBuckets(t, dir)
 	dbPath := filepath.Join(dir, "config.db")
