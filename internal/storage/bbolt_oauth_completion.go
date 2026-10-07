@@ -9,7 +9,7 @@ import (
 
 // SaveOAuthCompletionEvent saves an OAuth completion event to the database
 func (s *BoltDB) SaveOAuthCompletionEvent(event *OAuthCompletionEvent) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+	return s.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(OAuthCompletionBucket))
 		if err != nil {
 			return fmt.Errorf("failed to create oauth completion bucket: %w", err)
@@ -29,7 +29,7 @@ func (s *BoltDB) SaveOAuthCompletionEvent(event *OAuthCompletionEvent) error {
 func (s *BoltDB) GetUnprocessedOAuthCompletionEvents() ([]*OAuthCompletionEvent, error) {
 	var events []*OAuthCompletionEvent
 
-	err := s.db.View(func(tx *bbolt.Tx) error {
+	err := s.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthCompletionBucket))
 		if bucket == nil {
 			return nil // No events yet
@@ -54,7 +54,7 @@ func (s *BoltDB) GetUnprocessedOAuthCompletionEvents() ([]*OAuthCompletionEvent,
 
 // MarkOAuthCompletionEventProcessed marks an OAuth completion event as processed
 func (s *BoltDB) MarkOAuthCompletionEventProcessed(serverName string, completedAt time.Time) error {
-	return s.db.Update(func(tx *bbolt.Tx) error {
+	return s.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthCompletionBucket))
 		if bucket == nil {
 			return fmt.Errorf("oauth completion bucket not found")
@@ -87,7 +87,7 @@ func (s *BoltDB) MarkOAuthCompletionEventProcessed(serverName string, completedA
 func (s *BoltDB) CleanupOldOAuthCompletionEvents() error {
 	cutoff := time.Now().Add(-24 * time.Hour)
 
-	return s.db.Update(func(tx *bbolt.Tx) error {
+	return s.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthCompletionBucket))
 		if bucket == nil {
 			return nil

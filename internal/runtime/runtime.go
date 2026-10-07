@@ -119,6 +119,13 @@ func New(cfg *config.Config, cfgPath string, logger *zap.Logger) (*Runtime, erro
 		return nil, fmt.Errorf("failed to initialize storage manager: %w", err)
 	}
 
+	// Startup compaction loses the lock race against a still-shutting-down
+	// predecessor daemon, and bbolt never shrinks the file on its own; the
+	// online compactor reclaims free pages while running. Stopped by
+	// storageManager.Close. Daemon bootstrap only: CLI standalone commands
+	// share NewManager and must not compact.
+	storageManager.StartOnlineCompaction(storage.DefaultOnlineCompactionOptions())
+
 	// Close any stale sessions from previous runs
 	if err := storageManager.CloseAllActiveSessions(); err != nil {
 		logger.Warn("Failed to close stale sessions on startup", zap.Error(err))

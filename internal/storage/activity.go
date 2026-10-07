@@ -160,7 +160,7 @@ func (m *Manager) SaveActivity(record *ActivityRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(ActivityRecordsBucket))
 		if err != nil {
 			return fmt.Errorf("failed to create activity bucket: %w", err)
@@ -258,7 +258,7 @@ func (m *Manager) GetActivity(id string) (*ActivityRecord, error) {
 
 	var record *ActivityRecord
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil // No activities yet
@@ -298,7 +298,7 @@ func (m *Manager) ListActivities(filter ActivityFilter) ([]*ActivityRecord, int,
 	var records []*ActivityRecord
 	var total int
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil // No activities yet
@@ -367,7 +367,7 @@ func (m *Manager) DeleteActivity(id string) error {
 	defer m.mu.Unlock()
 	m.invalidateActivityBytesLocked()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil // No activities yet
@@ -392,7 +392,7 @@ func (m *Manager) CountActivities() (int, error) {
 
 	var count int
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil
@@ -420,7 +420,7 @@ func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <
 		m.mu.RLock()
 		defer m.mu.RUnlock()
 
-		err := m.db.db.View(func(tx *bbolt.Tx) error {
+		err := m.db.View(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 			if bucket == nil {
 				return nil
@@ -471,7 +471,7 @@ func (m *Manager) PruneOldActivities(maxAge time.Duration) (int, error) {
 
 	var deleted int
 
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil
@@ -527,7 +527,7 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 
 	var deleted int
 
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil
@@ -588,7 +588,7 @@ func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
 
 	var deleted int
 
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
 		if bucket == nil {
 			return nil

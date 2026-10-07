@@ -80,15 +80,13 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-// GetDB returns the underlying BBolt database for direct access
-func (m *Manager) GetDB() *bbolt.DB {
+// GetDB returns the database as a transaction runner. It deliberately does
+// not expose the raw *bbolt.DB: online compaction replaces that handle, so a
+// caller holding it would write to a closed file after the swap.
+func (m *Manager) GetDB() *BoltDB {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	if m.db != nil {
-		return m.db.db
-	}
-	return nil
+	return m.db
 }
 
 // GetBoltDB returns the wrapped BoltDB instance for higher-level operations
@@ -412,7 +410,7 @@ func (m *Manager) SaveDockerRecoveryState(state *DockerRecoveryState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(MetaBucket))
 		if err != nil {
 			return fmt.Errorf("failed to create meta bucket: %w", err)
@@ -434,7 +432,7 @@ func (m *Manager) LoadDockerRecoveryState() (*DockerRecoveryState, error) {
 
 	var state DockerRecoveryState
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(MetaBucket))
 		if bucket == nil {
 			return bboltErrors.ErrBucketNotFound
@@ -464,7 +462,7 @@ func (m *Manager) ClearDockerRecoveryState() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(MetaBucket))
 		if bucket == nil {
 			// No bucket, nothing to clear
@@ -624,7 +622,7 @@ func (m *Manager) ListServerIdentities() ([]*ServerIdentity, error) {
 func (m *Manager) listServerIdentitiesLocked() ([]*ServerIdentity, error) {
 	var identities []*ServerIdentity
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte("server_identities"))
 		if bucket == nil {
 			return nil // No identities yet
@@ -847,7 +845,7 @@ func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
 	bucketName := fmt.Sprintf("server_%s_tool_calls", record.ServerID)
 	key := fmt.Sprintf("%d_%s", record.Timestamp.UnixNano(), record.ID)
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -933,7 +931,7 @@ func (m *Manager) GetServerToolCalls(serverID string, limit int) ([]*ToolCallRec
 	var records []*ToolCallRecord
 	bucketName := fmt.Sprintf("server_%s_tool_calls", serverID)
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		if bucket == nil {
 			return nil // No calls yet
@@ -972,7 +970,7 @@ func (m *Manager) RecordServerDiagnostic(record *DiagnosticRecord) error {
 	bucketName := fmt.Sprintf("server_%s_diagnostics", record.ServerID)
 	key := fmt.Sprintf("%d_%s_%s", record.Timestamp.UnixNano(), record.Type, record.Category)
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -1000,7 +998,7 @@ func (m *Manager) GetServerDiagnostics(serverID string, limit int) ([]*Diagnosti
 	var records []*DiagnosticRecord
 	bucketName := fmt.Sprintf("server_%s_diagnostics", serverID)
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		if bucket == nil {
 			return nil // No diagnostics yet
@@ -1113,7 +1111,7 @@ func (m *Manager) trimServerBucketsToBudget(serverID string) (int, error) {
 	defer m.mu.Unlock()
 
 	trimmedBuckets := 0
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		toolCallsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_tool_calls", serverID)))
 		if toolCallsBucket != nil {
 			n, trimErr := trimBucketToByteBudget(toolCallsBucket, DefaultToolCallsBucketMaxBytes, nil)
@@ -1152,7 +1150,7 @@ func (m *Manager) UpdateServerStatistics(stats *ServerStatistics) error {
 	bucketName := "server_statistics"
 	key := stats.ServerID
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -1176,7 +1174,7 @@ func (m *Manager) GetServerStatistics(serverID string) (*ServerStatistics, error
 	var stats ServerStatistics
 	bucketName := "server_statistics"
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		if bucket == nil {
 			return nil // No stats yet
@@ -1296,7 +1294,7 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 	staleDecisionTime := time.Now()
 
 	cleanedCount := 0
-	err = m.db.db.Update(func(tx *bbolt.Tx) error {
+	err = m.db.Update(func(tx *bbolt.Tx) error {
 		for _, identity := range staleIdentities {
 			serverID := identity.ID
 
@@ -1395,7 +1393,7 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 func (m *Manager) getServerIdentityByID(serverID string) (*ServerIdentity, error) {
 	var identity ServerIdentity
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte("server_identities"))
 		if bucket == nil {
 			return bboltErrors.ErrBucketNotFound
@@ -1417,7 +1415,7 @@ func (m *Manager) getServerIdentityByID(serverID string) (*ServerIdentity, error
 }
 
 func (m *Manager) saveServerIdentity(identity *ServerIdentity) error {
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte("server_identities"))
 		if err != nil {
 			return err
@@ -1456,7 +1454,7 @@ func (m *Manager) CreateSession(session *SessionRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(SessionsBucket))
 		if err != nil {
 			return fmt.Errorf("failed to create sessions bucket: %w", err)
@@ -1525,7 +1523,7 @@ func (m *Manager) CloseSession(sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return fmt.Errorf("sessions bucket not found")
@@ -1576,7 +1574,7 @@ func (m *Manager) GetRecentSessions(limit int) ([]*SessionRecord, int, error) {
 	var sessions []*SessionRecord
 	var total int
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return nil // No sessions yet
@@ -1611,7 +1609,7 @@ func (m *Manager) GetSessionByID(sessionID string) (*SessionRecord, error) {
 
 	var session *SessionRecord
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return fmt.Errorf("session not found: %s", sessionID)
@@ -1644,7 +1642,7 @@ func (m *Manager) CloseAllActiveSessions() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return nil // No sessions bucket yet
@@ -1693,7 +1691,7 @@ func (m *Manager) UpdateSessionStats(sessionID string, tokens int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	return m.db.db.Update(func(tx *bbolt.Tx) error {
+	return m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return fmt.Errorf("sessions bucket not found")
@@ -1741,7 +1739,7 @@ func (m *Manager) CloseInactiveSessions(inactivityTimeout time.Duration) (int, e
 
 	var closedCount int
 
-	err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(SessionsBucket))
 		if bucket == nil {
 			return nil // No sessions bucket yet
@@ -1807,7 +1805,7 @@ func (m *Manager) GetToolCallsBySession(sessionID string, limit, offset int) ([]
 	var toolCalls []*ToolCallRecord
 	var total int
 
-	err := m.db.db.View(func(tx *bbolt.Tx) error {
+	err := m.db.View(func(tx *bbolt.Tx) error {
 		// We need to iterate all server tool call buckets
 		return tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
 			bucketName := string(name)
@@ -1909,7 +1907,7 @@ func (m *Manager) ClearOAuthState(serverName string) error {
 		cleared++
 	}
 
-	if err := m.db.db.Update(func(tx *bbolt.Tx) error {
+	if err := m.db.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		if bucket == nil {
 			return fmt.Errorf("oauth token bucket not found")

@@ -15,7 +15,7 @@ func activityBucketBytes(t *testing.T, m *Manager) (int64, int) {
 	t.Helper()
 	var size int64
 	var n int
-	require.NoError(t, m.db.db.View(func(tx *bbolt.Tx) error {
+	require.NoError(t, m.db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket([]byte(ActivityRecordsBucket))
 		if b == nil {
 			return nil
