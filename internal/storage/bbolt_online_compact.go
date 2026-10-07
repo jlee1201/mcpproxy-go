@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goruntime "runtime"
@@ -36,7 +38,7 @@ func DefaultOnlineCompactionOptions() OnlineCompactionOptions {
 		MinFileBytes:    compactionThresholdBytes,
 		MinReclaimBytes: compactionMinReclaimableBytes,
 		MinReclaimRatio: 0.30,
-		MaxLiveBytes:    256 * 1024 * 1024,
+		MaxLiveBytes:    64 * 1024 * 1024,
 		MinGap:          time.Hour,
 		LockWait:        30 * time.Second,
 	}
@@ -52,6 +54,9 @@ type compactorState struct {
 	done   chan struct{}
 
 	lastCompact time.Time // guarded by BoltDB.mu write lock / loop goroutine only
+	lastFailure time.Time // same guard; failed passes back off by MinGap too
+
+	warnedLiveTooLarge atomic.Bool // log the MaxLiveBytes skip once, not every interval
 }
 
 // StartOnlineCompaction launches the background compactor. It is a no-op if
@@ -67,6 +72,12 @@ func (b *BoltDB) StartOnlineCompaction(opts OnlineCompactionOptions) {
 	b.compactor.mu.Lock()
 	defer b.compactor.mu.Unlock()
 	if b.compactor.cancel != nil {
+		return
+	}
+	b.mu.RLock()
+	closed := b.closed
+	b.mu.RUnlock()
+	if closed {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -145,7 +156,11 @@ func (b *BoltDB) compactOnline(ctx context.Context, opts OnlineCompactionOptions
 	if b.closed || ctx.Err() != nil {
 		return false, nil
 	}
-	return true, b.swapCompactedLocked()
+	err := b.swapCompactedLocked()
+	if err != nil {
+		b.compactor.lastFailure = time.Now()
+	}
+	return true, err
 }
 
 // shouldCompactOnline is the cheap gate, evaluated under a shared lock.
@@ -156,6 +171,9 @@ func (b *BoltDB) shouldCompactOnline(opts OnlineCompactionOptions) bool {
 		return false
 	}
 	if !b.compactor.lastCompact.IsZero() && time.Since(b.compactor.lastCompact) < opts.MinGap {
+		return false
+	}
+	if !b.compactor.lastFailure.IsZero() && time.Since(b.compactor.lastFailure) < opts.MinGap {
 		return false
 	}
 	info, err := os.Stat(b.path)
@@ -172,8 +190,10 @@ func (b *BoltDB) shouldCompactOnline(opts OnlineCompactionOptions) bool {
 		return false
 	}
 	if live := size - free; live > opts.MaxLiveBytes {
-		b.logger.Warnw("Online compaction skipped: live data too large to compact while holding the database lock",
-			"live_bytes", live, "max_live_bytes", opts.MaxLiveBytes)
+		if b.compactor.warnedLiveTooLarge.CompareAndSwap(false, true) {
+			b.logger.Warnw("Online compaction skipped: live data too large to compact while holding the database lock",
+				"live_bytes", live, "max_live_bytes", opts.MaxLiveBytes)
+		}
 		return false
 	}
 	return true
@@ -191,7 +211,13 @@ func (b *BoltDB) shouldCompactOnline(opts OnlineCompactionOptions) bool {
 func (b *BoltDB) swapCompactedLocked() error {
 	start := time.Now()
 	tmpPath := fmt.Sprintf("%s.compact-tmp.%d", b.path, os.Getpid())
-	_ = os.Remove(tmpPath) // stale leftover from a crashed pass; we hold the source flock
+	// Stale leftovers from a crashed pass (any PID); we hold the source flock,
+	// so no other process is compacting this file.
+	if stale, _ := filepath.Glob(b.path + ".compact-tmp.*"); len(stale) > 0 {
+		for _, f := range stale {
+			_ = os.Remove(f)
+		}
+	}
 
 	beforeInfo, err := os.Stat(b.path)
 	if err != nil {

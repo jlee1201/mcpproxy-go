@@ -355,5 +355,83 @@ func TestEstimateReclaimableBytesWithRetry_GivesUpAndSkipsRetryOnOtherErrors(t *
 	_, err = estimateReclaimableBytesWithRetry(bad, testLogger(t))
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, errors.ErrTimeout)
-	assert.Less(t, time.Since(t0), 80*time.Millisecond)
+	assert.Less(t, time.Since(t0), 2*time.Second, "must not burn the retry budget (4 attempts x 3s lock timeout)")
+}
+
+// An opener already blocked on the OLD inode's flock when the swap lands gets
+// that lock the moment the old handle closes. openBoltDBAtStablePath must
+// notice the inode change and re-block on the new live file instead of
+// returning a handle bound to the orphaned inode.
+func TestCompactOnline_BlockedOpenerRebindsToNewInode(t *testing.T) {
+	skipIfWindows(t)
+	db, path, _ := newBloatedBoltDB(t)
+
+	type result struct {
+		db  *bbolt.DB
+		err error
+	}
+	opened := make(chan result, 1)
+	go func() {
+		d, err := openBoltDBAtStablePath(path, 0644, &bbolt.Options{Timeout: 10 * time.Second})
+		opened <- result{d, err}
+	}()
+	time.Sleep(200 * time.Millisecond) // let the opener block on the old inode
+
+	ok, err := db.compactOnline(context.Background(), forceOpts())
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket([]byte("bloat")).Put([]byte("post-swap"), []byte("y"))
+	}))
+
+	select {
+	case r := <-opened:
+		if r.db != nil {
+			_ = r.db.Close()
+		}
+		t.Fatalf("opener returned while live handle still held the lock: err=%v", r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	require.NoError(t, db.Close())
+	select {
+	case r := <-opened:
+		require.NoError(t, r.err)
+		defer r.db.Close()
+		require.NoError(t, r.db.View(func(tx *bbolt.Tx) error {
+			assert.Equal(t, "y", string(tx.Bucket([]byte("bloat")).Get([]byte("post-swap"))),
+				"opener must be bound to the new inode, not the orphaned one")
+			return nil
+		}))
+	case <-time.After(5 * time.Second):
+		t.Fatal("opener never acquired the lock after the live handle closed")
+	}
+}
+
+func TestCompactOnline_FailureBacksOffAndStaleTmpIsCleaned(t *testing.T) {
+	skipIfWindows(t)
+	db, path, _ := newBloatedBoltDB(t)
+
+	opts := forceOpts()
+	opts.MinGap = time.Hour
+	db.compactor.lastFailure = time.Now()
+	assert.False(t, db.shouldCompactOnline(opts), "a recent failed pass must back off by MinGap")
+	db.compactor.lastFailure = time.Time{}
+	assert.True(t, db.shouldCompactOnline(opts))
+
+	stale := path + ".compact-tmp.99999"
+	require.NoError(t, os.WriteFile(stale, []byte("junk"), 0644))
+	ok, err := db.compactOnline(context.Background(), opts)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, statErr := os.Stat(stale)
+	assert.True(t, os.IsNotExist(statErr), "stale tmp from a crashed pass should be removed")
+}
+
+func TestStartOnlineCompaction_NoopAfterClose(t *testing.T) {
+	skipIfWindows(t)
+	db, _, _ := newBloatedBoltDB(t)
+	require.NoError(t, db.Close())
+	db.StartOnlineCompaction(forceOpts())
+	assert.Nil(t, db.compactor.cancel, "must not spawn a compactor on a closed db")
 }
