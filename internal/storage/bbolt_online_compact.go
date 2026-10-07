@@ -295,9 +295,12 @@ func (b *BoltDB) swapCompactedLocked() error {
 // 2026-10-07: 16KB pages, 5 free pages, 46MB allocated for ~12MB in use).
 // It takes its own read transaction.
 func compactionEstimate(db *bbolt.DB) (allocated, live int64, err error) {
-	var inuse int64
+	var inuse, pageSize int64
 	err = db.View(func(tx *bbolt.Tx) error {
 		allocated = tx.Size()
+		// Info() reads the mmap pointer; only safe while a read tx holds
+		// bbolt's mmap lock, or it races a concurrent writer's remap.
+		pageSize = int64(db.Info().PageSize)
 		return tx.ForEach(func(_ []byte, b *bbolt.Bucket) error {
 			st := b.Stats() // aggregates nested buckets
 			inuse += int64(st.BranchInuse + st.LeafInuse)
@@ -308,5 +311,5 @@ func compactionEstimate(db *bbolt.DB) (allocated, live int64, err error) {
 		return 0, 0, err
 	}
 	const overheadPages = 8 // 2 meta + freelist + bucket-root pages, rounded up
-	return allocated, inuse + overheadPages*int64(db.Info().PageSize), nil
+	return allocated, inuse + overheadPages*pageSize, nil
 }
