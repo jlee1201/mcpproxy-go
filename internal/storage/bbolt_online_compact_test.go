@@ -437,8 +437,8 @@ func TestStartOnlineCompaction_NoopAfterClose(t *testing.T) {
 }
 
 // Retention deletes leave pages allocated but sparsely filled, with an almost
-// empty freelist. The gate must key off in-use bytes, not freelist size
-// (2026-10-07: a 62MB config.db with 5 free pages never compacted).
+// empty freelist. The gate must key off waste inside allocated pages, not
+// freelist size (2026-10-07: a 62MB config.db with 5 free pages never compacted).
 func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
 	skipIfWindows(t)
 	dir := t.TempDir()
@@ -447,10 +447,14 @@ func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	path := filepath.Join(dir, configDBFilename)
 
-	// FillPercent at its minimum splits pages ~10% full, in sequential order:
-	// lots of allocated-but-sparse pages and (almost) nothing on the freelist.
-	val := make([]byte, 1024)
-	const keys = 3000
+	// Values are pageSize/8 so that bbolt's 2-keys-per-page minimum leaves
+	// pages ~25% full at ANY page size (4KB on linux, 16KB on darwin/arm64);
+	// FillPercent 0.1 makes sequential inserts split as early as allowed.
+	db.mu.RLock()
+	pageSize := db.db.Info().PageSize
+	db.mu.RUnlock()
+	val := make([]byte, pageSize/8)
+	keys := (3 << 20) / len(val) // ~3MB of data
 	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte("sparse"))
 		if err != nil {
@@ -472,7 +476,7 @@ func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
 	opts := OnlineCompactionOptions{
 		MinFileBytes:    1 << 20,
 		MinReclaimBytes: 1 << 20,
-		MinReclaimRatio: 0.30,
+		MinReclaimRatio: 0.50,
 		MaxLiveBytes:    1 << 40,
 		LockWait:        5 * time.Second,
 	}
@@ -492,10 +496,16 @@ func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
 	}))
 	assert.Equal(t, keys, n)
 
-	// Estimator tracks reality: within 25% of the file it actually produced.
+	// The estimator tracks reality: in-use estimate is within 25% of the
+	// allocated bytes the compacted file actually has.
 	db.mu.RLock()
-	est, err := estimateCompactedBytes(db.db)
+	allocated, est, err := compactionEstimate(db.db)
 	db.mu.RUnlock()
 	require.NoError(t, err)
-	assert.InDelta(t, float64(after), float64(est), 0.25*float64(after), "est=%d actual=%d", est, after)
+	assert.InDelta(t, float64(allocated), float64(est), 0.25*float64(allocated), "est=%d allocated=%d", est, allocated)
+
+	// No refire: with MinGap out of the picture, an immediately repeated gate
+	// check must say no (bbolt's growth slack and bad page packing must not
+	// read as reclaimable forever).
+	assert.False(t, db.shouldCompactOnline(opts), "freshly compacted db must not look reclaimable again")
 }
