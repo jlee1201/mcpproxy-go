@@ -149,7 +149,7 @@ func (l *recordLog[T]) loadExisting() error {
 	}
 	// Segments whose every record was tombstoned or pruned carry no value.
 	for seg, info := range l.segs {
-		if info.live == 0 && !(len(segs) > 0 && seg == segs[len(segs)-1]) {
+		if info.live == 0 && (len(segs) == 0 || seg != segs[len(segs)-1]) {
 			_ = os.Remove(l.segPath(seg))
 			delete(l.segs, seg)
 		}
@@ -263,7 +263,7 @@ func (l *recordLog[T]) removeLocked(e *logEntry[T]) {
 	}
 	if info := l.segs[e.seg]; info != nil {
 		info.live--
-		if info.live <= 0 && !(l.active != nil && e.seg == l.activeSeg) {
+		if info.live <= 0 && (l.active == nil || e.seg != l.activeSeg) {
 			_ = os.Remove(l.segPath(e.seg))
 			delete(l.segs, e.seg)
 		}
