@@ -87,6 +87,9 @@ Examples:
 	authTimeout    time.Duration
 	authAll        bool
 	authForce      bool
+	authWait       bool
+	authNoWait     bool
+	authWaitTime   time.Duration
 )
 
 // GetAuthCommand returns the auth command for adding to the root command
@@ -107,6 +110,9 @@ func init() {
 	authLoginCmd.Flags().StringVarP(&authLogLevel, "log-level", "l", "info", "Log level (trace, debug, info, warn, error)")
 	authLoginCmd.Flags().StringVarP(&authConfigPath, "config", "c", "", "Path to MCP configuration file (default: ~/.mcpproxy/mcp_config.json)")
 	authLoginCmd.Flags().DurationVar(&authTimeout, "timeout", 5*time.Minute, "Authentication timeout")
+	authLoginCmd.Flags().BoolVar(&authWait, "wait", true, "Wait until the server is connected and answering tools/list before returning (default)")
+	authLoginCmd.Flags().BoolVar(&authNoWait, "no-wait", false, "Return as soon as the OAuth flow is initiated, without waiting for the server to connect")
+	authLoginCmd.Flags().DurationVar(&authWaitTime, "wait-timeout", 2*time.Minute, "How long --wait waits for the server to become ready after the login is initiated")
 
 	// Define flags for auth status command
 	authStatusCmd.Flags().StringVarP(&authServerName, "server", "s", "", "Server name to check status for (optional)")
@@ -281,7 +287,11 @@ func runAuthLoginAll(ctx context.Context, dataDir string) error {
 	for i, serverName := range serversNeedingAuth {
 		fmt.Printf("[%d/%d] Authenticating %s...\n", i+1, len(serversNeedingAuth), serverName)
 
-		if err := client.TriggerOAuthLogin(ctx, serverName); err != nil {
+		err := client.TriggerOAuthLogin(ctx, serverName)
+		if err == nil && authShouldWait() {
+			err = waitForServerReady(ctx, client, serverName, authWaitTime, authWaitPollInterval)
+		}
+		if err != nil {
 			fmt.Printf("  ❌ Failed: %v\n", err)
 			failed++
 			failedServers[serverName] = err.Error()
@@ -681,11 +691,59 @@ func runAuthLoginClientMode(ctx context.Context, dataDir, serverName string) err
 		return cliError("failed to trigger OAuth login via daemon", err)
 	}
 
+	if authShouldWait() {
+		fmt.Printf("⏳ Waiting for %s to finish connecting (up to %v)...\n", serverName, authWaitTime)
+		if err := waitForServerReady(ctx, client, serverName, authWaitTime, authWaitPollInterval); err != nil {
+			return cliError(fmt.Sprintf("server %s did not become ready after login (use --no-wait to skip this check)", serverName), err)
+		}
+		fmt.Printf("✅ OAuth login complete and %s is connected and answering tools/list\n", serverName)
+		return nil
+	}
+
 	fmt.Printf("✅ OAuth authentication flow initiated successfully for server: %s\n", serverName)
 	fmt.Println("   The daemon will handle the OAuth callback and update server state.")
 	fmt.Println("   Check 'mcpproxy upstream list' to verify authentication status.")
 
 	return nil
+}
+
+// authWaitPollInterval is how often --wait re-probes the server.
+const authWaitPollInterval = 2 * time.Second
+
+// authShouldWait reports whether login should block until the server is ready.
+// --wait is the default; --no-wait is the opt-out and wins if both are given.
+func authShouldWait() bool {
+	return authWait && !authNoWait
+}
+
+// toolDiscoverer is the slice of the daemon client waitForServerReady needs.
+type toolDiscoverer interface {
+	DiscoverServerTools(ctx context.Context, serverName string) error
+}
+
+// waitForServerReady polls a live tools/list until it succeeds or timeout elapses.
+// Success means the upstream is connected AND initialized, which is stronger than
+// the daemon reporting a Ready state or a stored token being valid.
+func waitForServerReady(ctx context.Context, c toolDiscoverer, serverName string, timeout, interval time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	for {
+		probeCtx, probeCancel := context.WithTimeout(waitCtx, 30*time.Second)
+		err := c.DiscoverServerTools(probeCtx, serverName)
+		probeCancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timed out after %v waiting for %s: last probe error: %w", timeout, serverName, lastErr)
+		case <-time.After(interval):
+		}
+	}
 }
 
 // runAuthLoginStandalone executes OAuth login in standalone mode (original behavior).

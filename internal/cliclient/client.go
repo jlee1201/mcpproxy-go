@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"net/url"
 	"time"
 
@@ -721,6 +722,32 @@ func (c *Client) GetServerTools(ctx context.Context, serverName string) ([]map[s
 	}
 
 	return apiResp.Data.Tools, nil
+}
+
+// DiscoverServerTools asks the daemon to run a live tools/list against the server
+// (and re-index it). It succeeds only when the upstream connection is initialized
+// and answering, so it doubles as a readiness probe.
+func (c *Client) DiscoverServerTools(ctx context.Context, serverName string) error {
+	url := fmt.Sprintf("%s/api/v1/servers/%s/discover-tools", c.baseURL, serverName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to call discover-tools API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("discover-tools returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+	}
+	return nil
 }
 
 // TriggerOAuthLogin initiates OAuth authentication flow for a server.

@@ -290,6 +290,19 @@ func (c *Client) Connect(ctx context.Context) error {
 	// All authentication strategies (tryNoAuth, tryHeadersAuth, tryOAuthAuth) now test
 	// both client.Start() AND c.initialize() to ensure OAuth errors are properly detected
 
+	// An HTTP/SSE strategy that reports success must have run initialize(); no server
+	// info means we would advertise Ready for a client that cannot serve calls.
+	if (c.transportType == transportHTTP || c.transportType == transportHTTPStreamable || c.transportType == transportSSE) && c.serverInfo == nil {
+		if c.client != nil {
+			c.client.Close()
+			c.client = nil
+		}
+		c.logger.Error("Connection reported success but MCP initialize did not complete",
+			zap.String("server", c.config.Name),
+			zap.String("transport", c.transportType))
+		return fmt.Errorf("connection established but MCP initialization did not complete for %s", c.config.Name)
+	}
+
 	c.connected = true
 
 	// If we had an OAuth flow in progress and connection succeeded, mark OAuth as complete
@@ -1062,6 +1075,13 @@ func (c *Client) tryNoAuth(ctx context.Context) error {
 
 // tryOAuthAuth attempts OAuth authentication
 func (c *Client) tryOAuthAuth(ctx context.Context) error {
+	return c.tryOAuthAuthOnce(ctx, false)
+}
+
+// tryOAuthAuthOnce is tryOAuthAuth with a one-shot retry guard. When another
+// goroutine's OAuth flow finishes while we wait, we run once more (as flow owner,
+// so it picks up the fresh token and runs initialize) instead of reporting success.
+func (c *Client) tryOAuthAuthOnce(ctx context.Context, afterJoinedFlow bool) error {
 	// Use the global OAuth flow coordinator to prevent race conditions
 	coordinator := oauth.GetGlobalCoordinator()
 
@@ -1069,6 +1089,9 @@ func (c *Client) tryOAuthAuth(ctx context.Context) error {
 	flowCtx, err := coordinator.StartFlow(c.config.Name)
 	if err != nil {
 		if err == oauth.ErrFlowInProgress {
+			if afterJoinedFlow {
+				return fmt.Errorf("another OAuth flow started for %s while retrying after a joined flow: %w", c.config.Name, err)
+			}
 			// Another flow is already in progress for this server
 			// Wait for it to complete instead of starting a new one
 			c.logger.Info("⏳ OAuth flow already in progress for this server, waiting for completion",
@@ -1079,10 +1102,12 @@ func (c *Client) tryOAuthAuth(ctx context.Context) error {
 				return fmt.Errorf("waiting for OAuth flow failed: %w", waitErr)
 			}
 
-			// Flow completed, try to connect with the new tokens
+			// Flow completed, connect with the new tokens. Returning nil here would
+			// report success with no started or initialized client (Ready with no
+			// server info), so run the strategy again as the flow owner.
 			c.logger.Info("✅ OAuth flow completed by another goroutine, retrying connection",
 				zap.String("server", c.config.Name))
-			return nil // The caller will retry the connection
+			return c.tryOAuthAuthOnce(ctx, true)
 		}
 		return fmt.Errorf("failed to start OAuth flow: %w", err)
 	}
@@ -1540,6 +1565,11 @@ func (c *Client) trySSENoAuth(ctx context.Context) error {
 
 // trySSEOAuthAuth attempts SSE OAuth authentication
 func (c *Client) trySSEOAuthAuth(ctx context.Context) error {
+	return c.trySSEOAuthAuthOnce(ctx, false)
+}
+
+// trySSEOAuthAuthOnce is trySSEOAuthAuth with the same one-shot retry guard as tryOAuthAuthOnce.
+func (c *Client) trySSEOAuthAuthOnce(ctx context.Context, afterJoinedFlow bool) error {
 	// Use the global OAuth flow coordinator to prevent race conditions
 	coordinator := oauth.GetGlobalCoordinator()
 
@@ -1547,6 +1577,9 @@ func (c *Client) trySSEOAuthAuth(ctx context.Context) error {
 	flowCtx, err := coordinator.StartFlow(c.config.Name)
 	if err != nil {
 		if err == oauth.ErrFlowInProgress {
+			if afterJoinedFlow {
+				return fmt.Errorf("another SSE OAuth flow started for %s while retrying after a joined flow: %w", c.config.Name, err)
+			}
 			// Another flow is already in progress for this server
 			// Wait for it to complete instead of starting a new one
 			c.logger.Info("⏳ SSE OAuth flow already in progress for this server, waiting for completion",
@@ -1557,10 +1590,10 @@ func (c *Client) trySSEOAuthAuth(ctx context.Context) error {
 				return fmt.Errorf("waiting for SSE OAuth flow failed: %w", waitErr)
 			}
 
-			// Flow completed, try to connect with the new tokens
+			// Flow completed, connect with the new tokens (see tryOAuthAuthOnce).
 			c.logger.Info("✅ SSE OAuth flow completed by another goroutine, retrying connection",
 				zap.String("server", c.config.Name))
-			return nil // The caller will retry the connection
+			return c.trySSEOAuthAuthOnce(ctx, true)
 		}
 		return fmt.Errorf("failed to start SSE OAuth flow: %w", err)
 	}

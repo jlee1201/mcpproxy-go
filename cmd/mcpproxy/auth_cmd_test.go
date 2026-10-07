@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/socket"
 
@@ -260,4 +262,50 @@ func TestFilterOAuthServers(t *testing.T) {
 			assert.Equal(t, tt.expected, len(result), "filterOAuthServers should return correct number of OAuth servers")
 		})
 	}
+}
+
+type fakeDiscoverer struct {
+	failFirst int
+	calls     int
+}
+
+func (f *fakeDiscoverer) DiscoverServerTools(_ context.Context, _ string) error {
+	f.calls++
+	if f.calls <= f.failFirst {
+		return errors.New("ListTools: server info not available")
+	}
+	return nil
+}
+
+func TestWaitForServerReady_SucceedsAfterRetries(t *testing.T) {
+	f := &fakeDiscoverer{failFirst: 3}
+	err := waitForServerReady(context.Background(), f, "dxgusto", 5*time.Second, time.Millisecond)
+	require.NoError(t, err)
+	assert.Equal(t, 4, f.calls)
+}
+
+func TestWaitForServerReady_TimesOutWithLastError(t *testing.T) {
+	f := &fakeDiscoverer{failFirst: 1 << 30}
+	err := waitForServerReady(context.Background(), f, "dxgusto", 50*time.Millisecond, 5*time.Millisecond)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dxgusto")
+	assert.Contains(t, err.Error(), "server info not available")
+	assert.Greater(t, f.calls, 1)
+}
+
+func TestAuthShouldWait_DefaultAndOptOut(t *testing.T) {
+	origWait, origNoWait := authWait, authNoWait
+	defer func() { authWait, authNoWait = origWait, origNoWait }()
+
+	f := authLoginCmd.Flags().Lookup("wait")
+	require.NotNil(t, f)
+	assert.Equal(t, "true", f.DefValue, "--wait must be the default")
+	require.NotNil(t, authLoginCmd.Flags().Lookup("no-wait"))
+
+	authWait, authNoWait = true, false
+	assert.True(t, authShouldWait())
+	authWait, authNoWait = true, true
+	assert.False(t, authShouldWait(), "--no-wait wins")
+	authWait, authNoWait = false, false
+	assert.False(t, authShouldWait(), "--wait=false disables waiting")
 }
