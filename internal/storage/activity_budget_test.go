@@ -8,24 +8,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.etcd.io/bbolt"
 )
 
+// activityBucketBytes reports the live record bytes and count in the activity
+// history log, recomputed from the index rather than from the log's counters.
 func activityBucketBytes(t *testing.T, m *Manager) (int64, int) {
 	t.Helper()
 	var size int64
 	var n int
-	require.NoError(t, m.db.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket([]byte(ActivityRecordsBucket))
-		if b == nil {
-			return nil
-		}
-		return b.ForEach(func(_, v []byte) error {
-			size += int64(len(v))
-			n++
-			return nil
-		})
-	}))
+	for _, e := range m.activityLog.snapshot(nil) {
+		size += int64(e.n)
+		n++
+	}
 	return size, n
 }
 
@@ -60,7 +54,7 @@ func TestSaveActivity_EnforcesByteBudgetOnWrite(t *testing.T) {
 
 	size, n := activityBucketBytes(t, m)
 	assert.Less(t, n, 100, "older records should have been trimmed")
-	assert.Equal(t, size, m.activityBytes, "tracked size should match the bucket exactly after writes")
+	assert.Equal(t, size, m.activityLog.bytesLive(), "tracked size should match the log exactly after writes")
 
 	got, err := m.GetActivity(last.ID)
 	require.NoError(t, err)
@@ -119,7 +113,7 @@ func TestSaveActivity_BudgetStaysAccurateAfterDeletes(t *testing.T) {
 
 	saveSizedActivity(t, m, base.Add(time.Minute), 10*1024)
 	size, _ := activityBucketBytes(t, m)
-	assert.Equal(t, size, m.activityBytes, "tracked size should be rescanned after deletes")
+	assert.Equal(t, size, m.activityLog.bytesLive(), "tracked size should stay exact after deletes")
 
 	for i := 0; i < 40; i++ {
 		saveSizedActivity(t, m, base.Add(2*time.Minute+time.Duration(i)*time.Second), 10*1024)

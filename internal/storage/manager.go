@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/smart-mcp-proxy/mcpproxy-go/internal/config"
@@ -38,13 +41,12 @@ type Manager struct {
 	logger   *zap.SugaredLogger
 	asyncMgr *AsyncManager
 
-	// activity_records byte budget enforced on write (see SaveActivity);
-	// 0 disables it. activityBytes is an upper bound on the bucket's value
-	// bytes, valid only while activityBytesKnown -- deletes just clear the
-	// flag so the next write rescans. Guarded by mu.
-	activityMaxBytes   int64
-	activityBytes      int64
-	activityBytesKnown bool
+	// Request/response history (activity + tool calls) lives in rotated
+	// files, not config.db. See recordLog.
+	activityLog *recordLog[ActivityRecord]
+	toolCallLog *recordLog[ToolCallRecord]
+	// History byte budget SaveActivity enforces on every write (0 = off).
+	activityMaxBytes atomic.Int64
 }
 
 // NewManager creates a new storage manager
@@ -54,14 +56,31 @@ func NewManager(dataDir string, logger *zap.SugaredLogger) (*Manager, error) {
 		return nil, fmt.Errorf("failed to create bolt database: %w", err)
 	}
 
+	historyDir := filepath.Join(filepath.Dir(db.path), HistoryDirName)
+	activityLog, err := openRecordLog(historyDir, activityLogSpec(), DefaultLogSegmentBytes, logger)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to open activity history: %w", err)
+	}
+	toolCallLog, err := openRecordLog(historyDir, toolCallLogSpec(), DefaultLogSegmentBytes, logger)
+	if err != nil {
+		_ = activityLog.close()
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to open tool call history: %w", err)
+	}
+
 	asyncMgr := NewAsyncManager(db, logger)
 	asyncMgr.Start()
 
-	return &Manager{
-		db:       db,
-		logger:   logger,
-		asyncMgr: asyncMgr,
-	}, nil
+	m := &Manager{
+		db:          db,
+		logger:      logger,
+		asyncMgr:    asyncMgr,
+		activityLog: activityLog,
+		toolCallLog: toolCallLog,
+	}
+	m.dropLegacyHistoryBuckets()
+	return m, nil
 }
 
 // Close closes the storage manager
@@ -74,10 +93,17 @@ func (m *Manager) Close() error {
 		m.asyncMgr.Stop()
 	}
 
-	if m.db != nil {
-		return m.db.Close()
+	var errs []error
+	if m.activityLog != nil {
+		errs = append(errs, m.activityLog.close())
 	}
-	return nil
+	if m.toolCallLog != nil {
+		errs = append(errs, m.toolCallLog.close())
+	}
+	if m.db != nil {
+		errs = append(errs, m.db.Close())
+	}
+	return errors.Join(errs...)
 }
 
 // GetDB returns the database as a transaction runner. It deliberately does
@@ -646,34 +672,23 @@ func (m *Manager) listServerIdentitiesLocked() ([]*ServerIdentity, error) {
 	return identities, nil
 }
 
-// DefaultToolCallsBucketMaxBytes bounds how much data each per-server
-// tool_calls bucket may retain. Without this, RecordToolCall grew every
-// bucket forever for actively-used servers (see config.db bloat
-// investigation): the only cleanup path, CleanupStaleServerData, only ran
-// for servers that had gone stale, so a server used every day never had its
-// tool_calls bucket pruned.
-//
-// Known limitation, deliberately out of scope for this PR: this budget is
-// per-server, not aggregate. N configured servers can each legitimately sit
-// at DefaultToolCallsBucketMaxBytes, so config.db's tool-calls footprint has
-// no cross-server ceiling and scales with server count (N * 5MB, plus N *
-// MaxDiagnosticRecordBytes for diagnostics). Capping the aggregate would need
-// a new cross-server LRU-eviction invariant layered on top of the existing
-// per-bucket trim, which is a meaningfully larger and riskier change than
-// this PR's bounded-retention fix -- tracked as follow-up, not folded in here.
+// DefaultToolCallsBucketMaxBytes bounds how much tool-call history each server
+// may retain in the history log. The budget is per-server, not aggregate: N
+// configured servers can each sit at this size, so total on-disk history scales
+// with server count (N * 5MB). It is plain files under <data-dir>/history, not
+// config.db, so it no longer inflates the bbolt file; capping the aggregate
+// would need a cross-server eviction invariant and is left as follow-up.
 const DefaultToolCallsBucketMaxBytes = 5 * 1024 * 1024
 
-// DefaultDiagnosticsBucketMaxBytes bounds each per-server diagnostics bucket.
-// Same unbounded-growth shape as tool_calls, just not yet observed to have
-// fired in practice. Same aggregate-budget limitation as
+// DefaultDiagnosticsBucketMaxBytes bounds each per-server diagnostics bucket
+// (still stored in config.db). Same per-server, non-aggregate limitation as
 // DefaultToolCallsBucketMaxBytes above applies here too.
 const DefaultDiagnosticsBucketMaxBytes = 2 * 1024 * 1024
 
 // MaxToolCallRecordBytes caps the marshaled size of a single tool call
-// record before it's written. trimBucketToByteBudget never evicts the
-// just-written record (see its doc comment), so without this cap one
-// oversized response could alone exceed the whole bucket budget and stay
-// there forever, defeating the eviction the budget is meant to guarantee.
+// record before it's written. Budget trimming never evicts the just-written
+// record, so without this cap one oversized response could alone exceed the
+// whole per-server budget and stay there until newer calls displaced it.
 const MaxToolCallRecordBytes = DefaultToolCallsBucketMaxBytes / 5 // 1MB
 
 // MaxDiagnosticRecordBytes mirrors MaxToolCallRecordBytes for diagnostics.
@@ -836,33 +851,79 @@ func truncateDiagnosticRecordToFit(record *DiagnosticRecord, maxBytes int) ([]by
 	return data, nil
 }
 
-// RecordToolCall records a tool call for a server, then trims the bucket
-// back to DefaultToolCallsBucketMaxBytes if the new record pushed it over.
-func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// HistoryDirName is the directory under the data dir holding the rotated
+// activity and tool-call history files.
+const HistoryDirName = "history"
 
-	bucketName := fmt.Sprintf("server_%s_tool_calls", record.ServerID)
-	key := fmt.Sprintf("%d_%s", record.Timestamp.UnixNano(), record.ID)
+// toolCallLogSpec indexes ToolCallRecords for the history log, grouped by
+// server so each server keeps its own byte budget.
+func toolCallLogSpec() recordLogSpec[ToolCallRecord] {
+	return recordLogSpec[ToolCallRecord]{
+		prefix: "toolcalls",
+		identify: func(r *ToolCallRecord) (string, time.Time, string) {
+			return r.ID, r.Timestamp, r.ServerID
+		},
+		lighten: func(r *ToolCallRecord) *ToolCallRecord {
+			light := *r
+			light.Arguments = nil
+			light.Response = nil
+			return &light
+		},
+	}
+}
 
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
-		if err != nil {
+// dropLegacyHistoryBuckets deletes the activity_records and per-server
+// tool_calls buckets that older versions kept in config.db. That history now
+// lives in rotated files; the old copy is discarded rather than migrated
+// because it is disposable. Deleting it is what lets compaction finally
+// shrink the file.
+func (m *Manager) dropLegacyHistoryBuckets() {
+	var dropped []string
+	err := m.db.Update(func(tx *bbolt.Tx) error {
+		var names []string
+		if err := tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+			n := string(name)
+			if n == ActivityRecordsBucket || (strings.HasPrefix(n, "server_") && strings.HasSuffix(n, "_tool_calls")) {
+				names = append(names, n)
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
-
-		data, err := truncateToolCallRecordToFit(record, MaxToolCallRecordBytes)
-		if err != nil {
-			return err
+		for _, n := range names {
+			if err := tx.DeleteBucket([]byte(n)); err != nil {
+				return err
+			}
 		}
-
-		if err := bucket.Put([]byte(key), data); err != nil {
-			return err
-		}
-
-		_, err = trimBucketToByteBudget(bucket, DefaultToolCallsBucketMaxBytes, []byte(key))
-		return err
+		dropped = names
+		return nil
 	})
+	if err != nil {
+		m.logger.Warnw("Failed to drop legacy history buckets from config.db", "error", err)
+		return
+	}
+	if len(dropped) > 0 {
+		m.logger.Infow("Dropped legacy activity/tool-call history from config.db; history now lives in rotated files",
+			"buckets", len(dropped), "history_dir", filepath.Join(filepath.Dir(m.db.path), HistoryDirName))
+	}
+}
+
+// RecordToolCall appends a tool call to the history log, then trims that
+// server's history back to DefaultToolCallsBucketMaxBytes.
+func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
+	data, err := truncateToolCallRecordToFit(record, MaxToolCallRecordBytes)
+	if err != nil {
+		return err
+	}
+	var stored ToolCallRecord
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return err
+	}
+	if err := m.toolCallLog.append(&stored, data); err != nil {
+		return err
+	}
+	m.toolCallLog.trimToBudget(record.ServerID, false, DefaultToolCallsBucketMaxBytes, record.ID)
+	return nil
 }
 
 // trimBucketToByteBudget deletes the oldest entries in bucket (keys must
@@ -923,41 +984,29 @@ func trimBucketToByteBudgetKept(bucket *bbolt.Bucket, maxBytes int64, protectedK
 	return len(keysToDelete), exempt + cumulative - deletedBytes, nil
 }
 
-// GetServerToolCalls gets tool calls for a server
+// GetServerToolCalls gets tool calls for a server, newest first.
 func (m *Manager) GetServerToolCalls(serverID string, limit int) ([]*ToolCallRecord, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var records []*ToolCallRecord
-	bucketName := fmt.Sprintf("server_%s_tool_calls", serverID)
-
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(bucketName))
-		if bucket == nil {
-			return nil // No calls yet
-		}
-
-		// Get keys in reverse order (most recent first)
-		cursor := bucket.Cursor()
-		count := 0
-		for k, v := cursor.Last(); k != nil && count < limit; k, v = cursor.Prev() {
-			var record ToolCallRecord
-			if err := json.Unmarshal(v, &record); err != nil {
-				m.logger.Warnw("Failed to unmarshal tool call record", "key", string(k), "error", err)
-				continue
-			}
-			records = append(records, &record)
-			count++
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to get server tool calls: %w", err)
+	matches := m.toolCallLog.snapshot(func(r *ToolCallRecord) bool { return r.ServerID == serverID })
+	if limit >= 0 && len(matches) > limit {
+		matches = matches[:limit]
 	}
+	return m.loadToolCalls(matches), nil
+}
 
-	return records, nil
+func (m *Manager) loadToolCalls(entries []logEntry[ToolCallRecord]) []*ToolCallRecord {
+	var records []*ToolCallRecord
+	for _, e := range entries {
+		record, err := m.toolCallLog.load(e)
+		if errors.Is(err, errRecordGone) {
+			continue
+		}
+		if err != nil {
+			m.logger.Warnw("Failed to load tool call record", "id", e.id, "error", err)
+			continue
+		}
+		records = append(records, record)
+	}
+	return records
 }
 
 // RecordServerDiagnostic records a diagnostic event for a server, then
@@ -1084,8 +1133,15 @@ func (m *Manager) TrimAllServerBuckets() (int, error) {
 
 	trimmedBuckets := 0
 	var errs []error
+	ids := make(map[string]bool, len(identities))
 	for _, identity := range identities {
-		n, err := m.trimServerBucketsToBudget(identity.ID)
+		ids[identity.ID] = true
+	}
+	for _, g := range m.toolCallLog.groups() {
+		ids[g] = true
+	}
+	for id := range ids {
+		n, err := m.trimServerBucketsToBudget(id)
 		if err != nil {
 			// Collect and continue (round-6 fix-round): each server's trim
 			// is already its own independent transaction (see doc comment
@@ -1094,7 +1150,7 @@ func (m *Manager) TrimAllServerBuckets() (int, error) {
 			// meant a single failing server permanently starved every
 			// server sorted after it, on every hourly pass, of budget
 			// enforcement.
-			errs = append(errs, fmt.Errorf("server %s: %w", identity.ID, err))
+			errs = append(errs, fmt.Errorf("server %s: %w", id, err))
 			continue
 		}
 		trimmedBuckets += n
@@ -1107,22 +1163,14 @@ func (m *Manager) TrimAllServerBuckets() (int, error) {
 // buckets in a single transaction, holding m.mu only for that duration. See
 // TrimAllServerBuckets's doc comment for why this is split out per-server.
 func (m *Manager) trimServerBucketsToBudget(serverID string) (int, error) {
+	trimmedBuckets := 0
+	if m.toolCallLog.trimToBudget(serverID, false, DefaultToolCallsBucketMaxBytes, "") > 0 {
+		trimmedBuckets++
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	trimmedBuckets := 0
 	err := m.db.Update(func(tx *bbolt.Tx) error {
-		toolCallsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_tool_calls", serverID)))
-		if toolCallsBucket != nil {
-			n, trimErr := trimBucketToByteBudget(toolCallsBucket, DefaultToolCallsBucketMaxBytes, nil)
-			if trimErr != nil {
-				return trimErr
-			}
-			if n > 0 {
-				trimmedBuckets++
-			}
-		}
-
 		diagnosticsBucket := tx.Bucket([]byte(fmt.Sprintf("server_%s_diagnostics", serverID)))
 		if diagnosticsBucket != nil {
 			n, trimErr := trimBucketToByteBudget(diagnosticsBucket, DefaultDiagnosticsBucketMaxBytes, nil)
@@ -1294,6 +1342,7 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 	staleDecisionTime := time.Now()
 
 	cleanedCount := 0
+	var cleanedServerIDs []string
 	err = m.db.Update(func(tx *bbolt.Tx) error {
 		for _, identity := range staleIdentities {
 			serverID := identity.ID
@@ -1339,9 +1388,9 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 				bucket.Delete([]byte(serverID))
 			}
 
-			// Remove tool calls
-			toolCallsBucket := fmt.Sprintf("server_%s_tool_calls", serverID)
-			tx.DeleteBucket([]byte(toolCallsBucket))
+			// Tool-call history is in the file-backed log, not a bucket;
+			// dropped after the transaction commits.
+			cleanedServerIDs = append(cleanedServerIDs, serverID)
 
 			// Remove diagnostics
 			diagnosticsBucket := fmt.Sprintf("server_%s_diagnostics", serverID)
@@ -1383,6 +1432,9 @@ func (m *Manager) CleanupStaleServerData(threshold time.Duration, configuredServ
 	})
 	if err != nil {
 		return cleanedCount, err
+	}
+	for _, id := range cleanedServerIDs {
+		m.toolCallLog.dropGroup(id)
 	}
 
 	return cleanedCount, nil
@@ -1797,48 +1849,22 @@ func (m *Manager) CloseInactiveSessions(inactivityTimeout time.Duration) (int, e
 	return closedCount, err
 }
 
-// GetToolCallsBySession retrieves tool calls filtered by session ID
+// GetToolCallsBySession retrieves tool calls filtered by session ID, newest
+// first, with the total number of matches.
 func (m *Manager) GetToolCallsBySession(sessionID string, limit, offset int) ([]*ToolCallRecord, int, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var toolCalls []*ToolCallRecord
-	var total int
-
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		// We need to iterate all server tool call buckets
-		return tx.ForEach(func(name []byte, b *bbolt.Bucket) error {
-			bucketName := string(name)
-			// Check if this is a tool calls bucket
-			if len(bucketName) < 18 || bucketName[:7] != "server_" || bucketName[len(bucketName)-11:] != "_tool_calls" {
-				return nil
-			}
-
-			c := b.Cursor()
-			for k, v := c.Last(); k != nil; k, v = c.Prev() {
-				var record ToolCallRecord
-				if err := json.Unmarshal(v, &record); err != nil {
-					continue
-				}
-
-				// Filter by session ID
-				if record.MCPSessionID == sessionID {
-					total++
-					if total > offset && len(toolCalls) < limit {
-						toolCalls = append(toolCalls, &record)
-					}
-				}
-			}
-			return nil
-		})
-	})
-
-	// Sort by timestamp descending
-	sort.Slice(toolCalls, func(i, j int) bool {
-		return toolCalls[i].Timestamp.After(toolCalls[j].Timestamp)
-	})
-
-	return toolCalls, total, err
+	matches := m.toolCallLog.snapshot(func(r *ToolCallRecord) bool { return r.MCPSessionID == sessionID })
+	total := len(matches)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return nil, total, nil
+	}
+	page := matches[offset:]
+	if limit >= 0 && len(page) > limit {
+		page = page[:limit]
+	}
+	return m.loadToolCalls(page), total, nil
 }
 
 // enforceSessionRetention deletes oldest sessions if count exceeds limit
