@@ -184,12 +184,16 @@ func (b *BoltDB) shouldCompactOnline(opts OnlineCompactionOptions) bool {
 	if size < opts.MinFileBytes {
 		return false
 	}
-	stats := b.db.Stats()
-	free := int64(stats.FreePageN+stats.PendingPageN) * int64(b.db.Info().PageSize)
+	live, err := estimateCompactedBytes(b.db)
+	if err != nil {
+		b.logger.Warnw("Online compaction skipped: could not estimate compacted size", "error", err)
+		return false
+	}
+	free := size - live
 	if free < opts.MinReclaimBytes || float64(free) < opts.MinReclaimRatio*float64(size) {
 		return false
 	}
-	if live := size - free; live > opts.MaxLiveBytes {
+	if live > opts.MaxLiveBytes {
 		if b.compactor.warnedLiveTooLarge.CompareAndSwap(false, true) {
 			b.logger.Warnw("Online compaction skipped: live data too large to compact while holding the database lock",
 				"live_bytes", live, "max_live_bytes", opts.MaxLiveBytes)
@@ -261,4 +265,30 @@ func (b *BoltDB) swapCompactedLocked() error {
 		"reclaimed_bytes", beforeInfo.Size()-after,
 		"db_paused_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// estimateCompactedBytes estimates how large the file would be after a
+// compaction: the bytes actually in use across all buckets (bbolt.Compact
+// repacks pages full) plus a few pages of meta/freelist/root overhead.
+//
+// Free-list size is the wrong measure of reclaimable space. Retention deletes
+// leave leaf pages sparsely filled but still allocated, so a 62MB file can
+// hold ~12MB of data with only a handful of pages on the freelist (observed
+// 2026-10-07: 16KB pages, 5 free pages, 46MB of allocated bucket pages for
+// ~12MB in use, plus 16MB of unused tail). Callers must hold a lock that keeps
+// db open; this takes its own read transaction.
+func estimateCompactedBytes(db *bbolt.DB) (int64, error) {
+	var inuse int64
+	err := db.View(func(tx *bbolt.Tx) error {
+		return tx.ForEach(func(_ []byte, b *bbolt.Bucket) error {
+			st := b.Stats() // aggregates nested buckets
+			inuse += int64(st.BranchInuse + st.LeafInuse)
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+	const overheadPages = 8 // 2 meta + freelist + bucket-root pages, rounded up
+	return inuse + overheadPages*int64(db.Info().PageSize), nil
 }

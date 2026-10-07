@@ -772,8 +772,20 @@ func estimateReclaimableBytes(dbPath string, lockTimeout time.Duration) (int64, 
 	}
 	defer func() { _ = db.Close() }()
 
-	stats := db.Stats()
-	return int64(stats.FreePageN) * int64(db.Info().PageSize), nil
+	// In-use bytes, not freelist size: sparse-but-allocated pages are the
+	// bulk of the waste and never appear on the freelist.
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		return 0, err
+	}
+	compacted, err := estimateCompactedBytes(db)
+	if err != nil {
+		return 0, err
+	}
+	if reclaimable := info.Size() - compacted; reclaimable > 0 {
+		return reclaimable, nil
+	}
+	return 0, nil
 }
 
 // Startup estimate retry budget: attempts x (lockTimeout + delay) is roughly

@@ -435,3 +435,67 @@ func TestStartOnlineCompaction_NoopAfterClose(t *testing.T) {
 	db.StartOnlineCompaction(forceOpts())
 	assert.Nil(t, db.compactor.cancel, "must not spawn a compactor on a closed db")
 }
+
+// Retention deletes leave pages allocated but sparsely filled, with an almost
+// empty freelist. The gate must key off in-use bytes, not freelist size
+// (2026-10-07: a 62MB config.db with 5 free pages never compacted).
+func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	db, err := NewBoltDB(dir, testLogger(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	path := filepath.Join(dir, configDBFilename)
+
+	// FillPercent at its minimum splits pages ~10% full, in sequential order:
+	// lots of allocated-but-sparse pages and (almost) nothing on the freelist.
+	val := make([]byte, 1024)
+	const keys = 3000
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("sparse"))
+		if err != nil {
+			return err
+		}
+		b.FillPercent = 0.1
+		for i := 0; i < keys; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("k%06d", i)), val); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	db.mu.RLock()
+	free := db.db.Stats().FreePageN
+	db.mu.RUnlock()
+	require.Less(t, free, 20, "fixture must leave the freelist nearly empty")
+
+	opts := OnlineCompactionOptions{
+		MinFileBytes:    1 << 20,
+		MinReclaimBytes: 1 << 20,
+		MinReclaimRatio: 0.30,
+		MaxLiveBytes:    1 << 40,
+		LockWait:        5 * time.Second,
+	}
+	before := fileSize(t, path)
+	require.True(t, db.shouldCompactOnline(opts), "sparse pages must count as reclaimable")
+
+	ok, err := db.compactOnline(context.Background(), opts)
+	require.NoError(t, err)
+	require.True(t, ok)
+	after := fileSize(t, path)
+	assert.Less(t, after, before/2, "before=%d after=%d", before, after)
+
+	var n int
+	require.NoError(t, db.View(func(tx *bbolt.Tx) error {
+		n = tx.Bucket([]byte("sparse")).Stats().KeyN
+		return nil
+	}))
+	assert.Equal(t, keys, n)
+
+	// Estimator tracks reality: within 25% of the file it actually produced.
+	db.mu.RLock()
+	est, err := estimateCompactedBytes(db.db)
+	db.mu.RUnlock()
+	require.NoError(t, err)
+	assert.InDelta(t, float64(after), float64(est), 0.25*float64(after), "est=%d actual=%d", est, after)
+}
