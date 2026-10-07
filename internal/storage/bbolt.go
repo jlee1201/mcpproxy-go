@@ -2,11 +2,13 @@ package storage
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
+	"sync"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -30,8 +32,16 @@ func (e *DatabaseLockedError) Unwrap() error {
 
 // BoltDB wraps bolt database operations
 type BoltDB struct {
+	// db is swapped by online compaction (see bbolt_online_compact.go), so
+	// it must only be reached through Update/View/Stats/Close, which hold
+	// mu.RLock for the duration of the call. Never cache the raw pointer.
 	db     *bbolt.DB
+	mu     sync.RWMutex
+	closed bool
+	path   string
 	logger *zap.SugaredLogger
+
+	compactor compactorState
 }
 
 // compactionThresholdBytes is the minimum config.db size before a startup
@@ -132,6 +142,7 @@ func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
 
 	boltDB := &BoltDB{
 		db:     db,
+		path:   dbPath,
 		logger: logger,
 	}
 
@@ -146,12 +157,43 @@ func NewBoltDB(dataDir string, logger *zap.SugaredLogger) (*BoltDB, error) {
 
 // Close closes the database
 func (b *BoltDB) Close() error {
+	b.stopCompactor()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
 	return b.db.Close()
+}
+
+// Update runs fn in a read-write transaction. It holds a shared lock so an
+// online compaction swap (which takes the lock exclusively) can never
+// replace the handle mid-transaction. fn must not call back into this
+// BoltDB: re-entering would take the shared lock recursively.
+func (b *BoltDB) Update(fn func(*bbolt.Tx) error) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return errors.ErrDatabaseNotOpen
+	}
+	return b.db.Update(fn)
+}
+
+// View runs fn in a read-only transaction; see Update for the locking contract.
+func (b *BoltDB) View(fn func(*bbolt.Tx) error) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return errors.ErrDatabaseNotOpen
+	}
+	return b.db.View(fn)
 }
 
 // initBuckets creates required buckets and sets up schema
 func (b *BoltDB) initBuckets() error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		// Create buckets
 		buckets := []string{
 			UpstreamsBucket,
@@ -179,7 +221,7 @@ func (b *BoltDB) initBuckets() error {
 // GetSchemaVersion returns the current schema version
 func (b *BoltDB) GetSchemaVersion() (uint64, error) {
 	var version uint64
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(MetaBucket))
 		if bucket == nil {
 			return fmt.Errorf("meta bucket not found")
@@ -204,7 +246,7 @@ func (b *BoltDB) GetSchemaVersion() (uint64, error) {
 func (b *BoltDB) SaveUpstream(record *UpstreamRecord) error {
 	record.Updated = time.Now()
 
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(UpstreamsBucket))
 		data, err := record.MarshalBinary()
 		if err != nil {
@@ -218,7 +260,7 @@ func (b *BoltDB) SaveUpstream(record *UpstreamRecord) error {
 func (b *BoltDB) GetUpstream(id string) (*UpstreamRecord, error) {
 	var record *UpstreamRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(UpstreamsBucket))
 		data := bucket.Get([]byte(id))
 		if data == nil {
@@ -236,7 +278,7 @@ func (b *BoltDB) GetUpstream(id string) (*UpstreamRecord, error) {
 func (b *BoltDB) ListUpstreams() ([]*UpstreamRecord, error) {
 	var records []*UpstreamRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(UpstreamsBucket))
 		return bucket.ForEach(func(_, v []byte) error {
 			record := &UpstreamRecord{}
@@ -253,7 +295,7 @@ func (b *BoltDB) ListUpstreams() ([]*UpstreamRecord, error) {
 
 // DeleteUpstream deletes an upstream server record
 func (b *BoltDB) DeleteUpstream(id string) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(UpstreamsBucket))
 		return bucket.Delete([]byte(id))
 	})
@@ -263,7 +305,7 @@ func (b *BoltDB) DeleteUpstream(id string) error {
 
 // IncrementToolStats increments the usage count for a tool
 func (b *BoltDB) IncrementToolStats(toolName string) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolStatsBucket))
 
 		// Get existing record
@@ -295,7 +337,7 @@ func (b *BoltDB) IncrementToolStats(toolName string) error {
 func (b *BoltDB) GetToolStats(toolName string) (*ToolStatRecord, error) {
 	var record *ToolStatRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolStatsBucket))
 		data := bucket.Get([]byte(toolName))
 		if data == nil {
@@ -313,7 +355,7 @@ func (b *BoltDB) GetToolStats(toolName string) (*ToolStatRecord, error) {
 func (b *BoltDB) ListToolStats() ([]*ToolStatRecord, error) {
 	var records []*ToolStatRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolStatsBucket))
 		return bucket.ForEach(func(_, v []byte) error {
 			record := &ToolStatRecord{}
@@ -338,7 +380,7 @@ func (b *BoltDB) SaveToolHash(toolName, hash string) error {
 		Updated:  time.Now(),
 	}
 
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolHashBucket))
 		data, err := record.MarshalBinary()
 		if err != nil {
@@ -352,7 +394,7 @@ func (b *BoltDB) SaveToolHash(toolName, hash string) error {
 func (b *BoltDB) GetToolHash(toolName string) (string, error) {
 	var hash string
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolHashBucket))
 		data := bucket.Get([]byte(toolName))
 		if data == nil {
@@ -373,7 +415,7 @@ func (b *BoltDB) GetToolHash(toolName string) (string, error) {
 
 // DeleteToolHash deletes a tool hash
 func (b *BoltDB) DeleteToolHash(toolName string) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(ToolHashBucket))
 		return bucket.Delete([]byte(toolName))
 	})
@@ -383,13 +425,18 @@ func (b *BoltDB) DeleteToolHash(toolName string) error {
 
 // Backup creates a backup of the database
 func (b *BoltDB) Backup(destPath string) error {
-	return b.db.View(func(tx *bbolt.Tx) error {
+	return b.View(func(tx *bbolt.Tx) error {
 		return tx.CopyFile(destPath, 0644)
 	})
 }
 
 // Stats returns database statistics
 func (b *BoltDB) Stats() (*bbolt.Stats, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, errors.ErrDatabaseNotOpen
+	}
 	stats := b.db.Stats()
 	return &stats, nil
 }
@@ -427,7 +474,7 @@ func removeFile(path string) error {
 func (b *BoltDB) SaveOAuthToken(record *OAuthTokenRecord) error {
 	record.Updated = time.Now()
 
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data, err := record.MarshalBinary()
 		if err != nil {
@@ -441,7 +488,7 @@ func (b *BoltDB) SaveOAuthToken(record *OAuthTokenRecord) error {
 func (b *BoltDB) GetOAuthToken(serverName string) (*OAuthTokenRecord, error) {
 	var record *OAuthTokenRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverName))
 		if data == nil {
@@ -457,7 +504,7 @@ func (b *BoltDB) GetOAuthToken(serverName string) (*OAuthTokenRecord, error) {
 
 // DeleteOAuthToken deletes an OAuth token record
 func (b *BoltDB) DeleteOAuthToken(serverName string) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		return bucket.Delete([]byte(serverName))
 	})
@@ -467,7 +514,7 @@ func (b *BoltDB) DeleteOAuthToken(serverName string) error {
 // This is called after successful Dynamic Client Registration to persist the obtained client_id/secret
 // and the callback port used for the redirect_uri (Spec 022: OAuth Redirect URI Port Persistence)
 func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret string, callbackPort int) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverKey))
 
@@ -506,7 +553,7 @@ func (b *BoltDB) UpdateOAuthClientCredentials(serverKey, clientID, clientSecret 
 // GetOAuthClientCredentials retrieves the client credentials and callback port for token refresh
 // callbackPort returns 0 if not stored (legacy records or fresh records without DCR)
 func (b *BoltDB) GetOAuthClientCredentials(serverKey string) (clientID, clientSecret string, callbackPort int, err error) {
-	err = b.db.View(func(tx *bbolt.Tx) error {
+	err = b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverKey))
 		if data == nil {
@@ -529,7 +576,7 @@ func (b *BoltDB) GetOAuthClientCredentials(serverKey string) (clientID, clientSe
 // while preserving any existing token data. This is called when the callback port conflicts and
 // fresh DCR is required (Spec 022: OAuth Redirect URI Port Persistence)
 func (b *BoltDB) ClearOAuthClientCredentials(serverKey string) error {
-	return b.db.Update(func(tx *bbolt.Tx) error {
+	return b.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		data := bucket.Get([]byte(serverKey))
 		if data == nil {
@@ -560,7 +607,7 @@ func (b *BoltDB) ClearOAuthClientCredentials(serverKey string) error {
 func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	var records []*OAuthTokenRecord
 
-	err := b.db.View(func(tx *bbolt.Tx) error {
+	err := b.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(OAuthTokenBucket))
 		return bucket.ForEach(func(_, v []byte) error {
 			record := &OAuthTokenRecord{}
@@ -681,9 +728,9 @@ func maybeCompactOnStartupForGOOS(dbPath string, logger *zap.SugaredLogger, goos
 		return
 	}
 
-	reclaimable, err := estimateReclaimableBytes(dbPath)
+	reclaimable, err := estimateReclaimableBytesWithRetry(dbPath, logger)
 	if err != nil {
-		logger.Warnw("Failed to estimate reclaimable space before startup compaction, skipping",
+		logger.Warnw("Failed to estimate reclaimable space before startup compaction, skipping (online compaction will retry once the daemon is up)",
 			"path", dbPath, "error", err)
 		return
 	}
@@ -716,9 +763,9 @@ func maybeCompactOnStartupForGOOS(dbPath string, logger *zap.SugaredLogger, goos
 // take anyway; this function returns and closes before that ever runs, so
 // there is no meaningful added lock contention (this whole path is now
 // daemon-startup-only -- see CompactConfigDBIfNeeded's doc comment).
-func estimateReclaimableBytes(dbPath string) (int64, error) {
+func estimateReclaimableBytes(dbPath string, lockTimeout time.Duration) (int64, error) {
 	db, err := openBoltDBAtStablePath(dbPath, 0644, &bbolt.Options{
-		Timeout: 5 * time.Second,
+		Timeout: lockTimeout,
 	})
 	if err != nil {
 		return 0, err
@@ -727,6 +774,41 @@ func estimateReclaimableBytes(dbPath string) (int64, error) {
 
 	stats := db.Stats()
 	return int64(stats.FreePageN) * int64(db.Info().PageSize), nil
+}
+
+// Startup estimate retry budget: attempts x (lockTimeout + delay) is roughly
+// 14s. The usual lock holder at startup is the previous daemon still in
+// graceful shutdown (or a bridge-spawned daemon racing this one), and a single
+// 5s attempt lost that race on 2026-10-07, silently skipping compaction.
+// Bounded because the bridges wait on daemon startup; the online compactor
+// (bbolt_online_compact.go) is the backstop for anything this still misses.
+// Vars so tests can shrink them.
+var (
+	startupEstimateAttempts    = 4
+	startupEstimateLockTimeout = 3 * time.Second
+	startupEstimateRetryDelay  = 500 * time.Millisecond
+)
+
+// estimateReclaimableBytesWithRetry retries estimateReclaimableBytes only on
+// lock-acquisition timeouts; any other error is returned immediately.
+func estimateReclaimableBytesWithRetry(dbPath string, logger *zap.SugaredLogger) (int64, error) {
+	var lastErr error
+	for attempt := 1; attempt <= startupEstimateAttempts; attempt++ {
+		reclaimable, err := estimateReclaimableBytes(dbPath, startupEstimateLockTimeout)
+		if err == nil {
+			return reclaimable, nil
+		}
+		lastErr = err
+		if !stderrors.Is(err, errors.ErrTimeout) {
+			return 0, err
+		}
+		if attempt < startupEstimateAttempts {
+			logger.Debugw("config.db locked while estimating reclaimable space, retrying",
+				"path", dbPath, "attempt", attempt, "max_attempts", startupEstimateAttempts)
+			time.Sleep(startupEstimateRetryDelay)
+		}
+	}
+	return 0, lastErr
 }
 
 // compactDBFile compacts dbPath into a temp file and swaps it into place.

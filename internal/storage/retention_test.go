@@ -109,7 +109,7 @@ func TestTrimBucketToByteBudget(t *testing.T) {
 	const bucketName = "trim_test_bucket"
 	value := strings.Repeat("z", 100) // 100 bytes per entry
 
-	err := manager.db.db.Update(func(tx *bbolt.Tx) error {
+	err := manager.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -127,7 +127,7 @@ func TestTrimBucketToByteBudget(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+	err = manager.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		require.NotNil(t, bucket)
 
@@ -160,7 +160,7 @@ func TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe(t *testing.T) 
 	normalValue := strings.Repeat("n", 100) // 3 of these exactly fill the budget
 	hugeValue := strings.Repeat("h", 10_000) // dwarfs the budget by itself
 
-	err := manager.db.db.Update(func(tx *bbolt.Tx) error {
+	err := manager.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -182,7 +182,7 @@ func TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe(t *testing.T) 
 	})
 	require.NoError(t, err)
 
-	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+	err = manager.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		require.NotNil(t, bucket)
 
@@ -687,7 +687,7 @@ func TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites(t *testing.T) {
 	value := strings.Repeat("v", recordSize)
 	bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
 
-	err := manager.db.db.Update(func(tx *bbolt.Tx) error {
+	err := manager.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
 			return err
@@ -703,7 +703,7 @@ func TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites(t *testing.T) {
 	require.NoError(t, err)
 
 	var sizeBefore int
-	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+	err = manager.db.View(func(tx *bbolt.Tx) error {
 		sizeBefore = tx.Bucket([]byte(bucketName)).Stats().KeyN
 		return nil
 	})
@@ -714,7 +714,7 @@ func TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, trimmed, "the one oversized bucket should have been trimmed")
 
-	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+	err = manager.db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket([]byte(bucketName))
 		require.NotNil(t, bucket)
 		// trimBucketToByteBudget always exempts the single newest key from
@@ -753,7 +753,7 @@ func TestTrimAllServerBuckets_TrimsMultipleServersIndependently(t *testing.T) {
 		identities = append(identities, identity)
 
 		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
-		require.NoError(t, manager.db.db.Update(func(tx *bbolt.Tx) error {
+		require.NoError(t, manager.db.Update(func(tx *bbolt.Tx) error {
 			bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
 			if err != nil {
 				return err
@@ -774,7 +774,7 @@ func TestTrimAllServerBuckets_TrimsMultipleServersIndependently(t *testing.T) {
 
 	for _, identity := range identities {
 		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
-		err = manager.db.db.View(func(tx *bbolt.Tx) error {
+		err = manager.db.View(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket([]byte(bucketName))
 			require.NotNil(t, bucket)
 			assert.Less(t, bucket.Stats().KeyN, numRecords,
@@ -887,7 +887,7 @@ func TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup(t *tes
 	}
 	data, err := record.MarshalBinary()
 	require.NoError(t, err)
-	require.NoError(t, manager.db.db.Update(func(tx *bbolt.Tx) error {
+	require.NoError(t, manager.db.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(OAuthTokenBucket))
 		if err != nil {
 			return err
@@ -904,7 +904,7 @@ func TestCleanupStaleServerData_SkipsOAuthDeleteIfTokenSavedDuringCleanup(t *tes
 	// CleanupStaleServerData, before this update transaction) is before
 	// futureUpdated, so the guard must have skipped the entire identity's
 	// cleanup, atomically.
-	err = manager.db.db.View(func(tx *bbolt.Tx) error {
+	err = manager.db.View(func(tx *bbolt.Tx) error {
 		identitiesBucket := tx.Bucket([]byte("server_identities"))
 		require.NotNil(t, identitiesBucket)
 		assert.NotNil(t, identitiesBucket.Get([]byte(identity.ID)), "server identity must survive when its token was saved after staleness was decided")

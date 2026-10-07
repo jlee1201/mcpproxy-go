@@ -20,16 +20,24 @@ const (
 	CleanupInterval  = 10 * time.Minute
 )
 
+// DB is the transaction surface the cache needs. It is an interface (not
+// *bbolt.DB) because storage.BoltDB swaps its underlying handle during online
+// compaction; holding the raw handle would write to a closed file afterwards.
+type DB interface {
+	Update(fn func(*bbolt.Tx) error) error
+	View(fn func(*bbolt.Tx) error) error
+}
+
 // Manager handles cached tool responses
 type Manager struct {
-	db     *bbolt.DB
+	db     DB
 	logger *zap.Logger
 	stats  *Stats
 	stopCh chan struct{}
 }
 
 // NewManager creates a new cache manager
-func NewManager(db *bbolt.DB, logger *zap.Logger) (*Manager, error) {
+func NewManager(db DB, logger *zap.Logger) (*Manager, error) {
 	manager := &Manager{
 		db:     db,
 		logger: logger,
