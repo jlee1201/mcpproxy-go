@@ -201,7 +201,6 @@ func (b *BoltDB) initBuckets() error {
 			ToolHashBucket,
 			OAuthTokenBucket,
 			MetaBucket,
-			ActivityRecordsBucket,
 		}
 
 		for _, bucket := range buckets {

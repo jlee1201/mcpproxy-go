@@ -3,33 +3,15 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"go.etcd.io/bbolt"
 )
 
 // DefaultMaxResponseSize is the default maximum size for response truncation (64KB)
 const DefaultMaxResponseSize = 64 * 1024
-
-// activityKey generates a BBolt key for an activity record.
-// Key format: {timestamp_ns}_{ulid} for natural reverse-chronological ordering.
-// Using 20-digit nanosecond timestamp ensures consistent ordering.
-func activityKey(timestamp time.Time, id string) []byte {
-	return []byte(fmt.Sprintf("%020d_%s", timestamp.UnixNano(), id))
-}
-
-// parseActivityKey extracts the ULID from an activity key.
-// Returns empty string if key format is invalid.
-func parseActivityKey(key []byte) string {
-	keyStr := string(key)
-	// Key format: {20-digit timestamp}_{ulid}
-	if len(keyStr) < 22 { // 20 digits + underscore + at least 1 char for id
-		return ""
-	}
-	return keyStr[21:]
-}
 
 // truncateResponse truncates a response string if it exceeds maxSize.
 // Returns the (potentially truncated) string and whether truncation occurred.
@@ -140,8 +122,27 @@ func truncateActivityRecordToFit(record *ActivityRecord, maxBytes int) ([]byte, 
 	return data, nil
 }
 
-// SaveActivity stores an activity record in BBolt.
-// The record is stored with a composite key for efficient time-based queries.
+// activityLogSpec indexes ActivityRecords for the history log. The lightened
+// copy keeps everything ActivityFilter.Matches reads (including Metadata for
+// the intent filter) and drops the payloads that make records large.
+func activityLogSpec() recordLogSpec[ActivityRecord] {
+	return recordLogSpec[ActivityRecord]{
+		prefix: "activity",
+		identify: func(r *ActivityRecord) (string, time.Time, string) {
+			return r.ID, r.Timestamp, ""
+		},
+		lighten: func(r *ActivityRecord) *ActivityRecord {
+			light := *r
+			light.Arguments = nil
+			light.Response = ""
+			return &light
+		},
+	}
+}
+
+// SaveActivity appends an activity record to the history log. History lives in
+// rotated files under <data-dir>/history, not config.db: it is high-volume,
+// disposable, and bbolt never returns freed pages to the filesystem.
 func (m *Manager) SaveActivity(record *ActivityRecord) error {
 	if record == nil {
 		return fmt.Errorf("activity record cannot be nil")
@@ -157,94 +158,34 @@ func (m *Manager) SaveActivity(record *ActivityRecord) error {
 		record.Timestamp = time.Now().UTC()
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	err := m.db.Update(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte(ActivityRecordsBucket))
-		if err != nil {
-			return fmt.Errorf("failed to create activity bucket: %w", err)
-		}
-
-		data, err := truncateActivityRecordToFit(record, MaxActivityRecordBytes)
-		if err != nil {
-			return fmt.Errorf("failed to marshal activity record: %w", err)
-		}
-
-		key := activityKey(record.Timestamp, record.ID)
-		if err := bucket.Put(key, data); err != nil {
-			return fmt.Errorf("failed to store activity record: %w", err)
-		}
-
-		return m.enforceActivityBudgetLocked(bucket, key, int64(len(data)))
-	})
+	data, err := truncateActivityRecordToFit(record, MaxActivityRecordBytes)
 	if err != nil {
-		m.invalidateActivityBytesLocked()
+		return fmt.Errorf("failed to marshal activity record: %w", err)
 	}
-	return err
-}
-
-// SetActivityByteBudget sets the activity_records byte budget SaveActivity
-// enforces on every write (0 disables it). Without it the budget only
-// applied at the hourly retention sweep, so a burst of large responses could
-// grow config.db far past it in between -- and bbolt never shrinks the file.
-func (m *Manager) SetActivityByteBudget(maxBytes int64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.activityMaxBytes = maxBytes
-	m.invalidateActivityBytesLocked()
-}
-
-// activityBudgetTrimTarget is the fraction of the budget a write-path trim
-// cuts down to, so a bucket sitting at the budget doesn't rescan every write.
-const activityBudgetTrimTarget = 0.9
-
-// enforceActivityBudgetLocked trims the oldest records once the bucket's
-// tracked size passes the budget. Caller holds m.mu and has just Put key
-// (whose value is addedBytes long) in the same transaction. The full-bucket
-// walk only happens to seed the size or when over budget, not per write.
-func (m *Manager) enforceActivityBudgetLocked(bucket *bbolt.Bucket, key []byte, addedBytes int64) error {
-	if m.activityMaxBytes <= 0 {
-		return nil
+	// The stored form may have lost fields to the per-record cap; index that.
+	stored, err := ActivityRecordFromJSON(data)
+	if err != nil {
+		return err
+	}
+	if err := m.activityLog.append(stored, data); err != nil {
+		return fmt.Errorf("failed to store activity record: %w", err)
 	}
 
-	size := m.activityBytes + addedBytes
-	if !m.activityBytesKnown {
-		size = 0
-		if err := bucket.ForEach(func(_, v []byte) error {
-			size += int64(len(v))
-			return nil
-		}); err != nil {
-			return fmt.Errorf("failed to size activity bucket: %w", err)
-		}
+	if max := m.activityMaxBytes.Load(); max > 0 && m.activityLog.bytesLive() > max {
+		m.activityLog.trimToBudget("", true, int64(float64(max)*activityBudgetTrimTarget), record.ID)
 	}
-
-	if size > m.activityMaxBytes {
-		target := int64(float64(m.activityMaxBytes) * activityBudgetTrimTarget)
-		deleted, kept, err := trimBucketToByteBudgetKept(bucket, target, key)
-		if err != nil {
-			return fmt.Errorf("failed to trim activity bucket to budget: %w", err)
-		}
-		if deleted > 0 {
-			m.logger.Debugw("Trimmed activity records over byte budget on write",
-				"deleted", deleted,
-				"max_bytes", m.activityMaxBytes)
-		}
-		size = kept
-	}
-
-	// Only trusted once the transaction commits; SaveActivity's caller
-	// discards it on error via invalidateActivityBytesLocked.
-	m.activityBytes = size
-	m.activityBytesKnown = true
 	return nil
 }
 
-// invalidateActivityBytesLocked forces the next write to rescan the bucket
-// size. Caller holds m.mu.
-func (m *Manager) invalidateActivityBytesLocked() {
-	m.activityBytesKnown = false
+// SetActivityByteBudget sets the history byte budget SaveActivity enforces on
+// every write (0 disables it).
+func (m *Manager) SetActivityByteBudget(maxBytes int64) {
+	m.activityMaxBytes.Store(maxBytes)
 }
+
+// activityBudgetTrimTarget is the fraction of the budget a write-path trim
+// cuts down to, so a log sitting at the budget doesn't trim on every write.
+const activityBudgetTrimTarget = 0.9
 
 // GetActivity retrieves an activity record by ID.
 // Returns nil if the record is not found.
@@ -252,38 +193,15 @@ func (m *Manager) GetActivity(id string) (*ActivityRecord, error) {
 	if id == "" {
 		return nil, fmt.Errorf("activity ID cannot be empty")
 	}
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var record *ActivityRecord
-
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil // No activities yet
-		}
-
-		// Scan to find the record by ID (ID is in the key suffix)
-		cursor := bucket.Cursor()
-		for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-			if parseActivityKey(k) == id {
-				record = &ActivityRecord{}
-				if err := record.UnmarshalBinary(v); err != nil {
-					return fmt.Errorf("failed to unmarshal activity record: %w", err)
-				}
-				return nil
-			}
-		}
-
-		return nil // Not found
-	})
-
-	if err != nil {
-		return nil, err
+	e, ok := m.activityLog.lookup(id)
+	if !ok {
+		return nil, nil
 	}
-
-	return record, nil
+	record, err := m.activityLog.load(e)
+	if errors.Is(err, errRecordGone) {
+		return nil, nil
+	}
+	return record, err
 }
 
 // ListActivities returns paginated activity records matching the filter.
@@ -292,68 +210,29 @@ func (m *Manager) GetActivity(id string) (*ActivityRecord, error) {
 func (m *Manager) ListActivities(filter ActivityFilter) ([]*ActivityRecord, int, error) {
 	filter.Validate()
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	matches := m.activityLog.snapshot(func(r *ActivityRecord) bool { return filter.Matches(r) })
+	total := len(matches)
+	if filter.Offset >= total {
+		return nil, total, nil
+	}
+	page := matches[filter.Offset:]
+	if len(page) > filter.Limit {
+		page = page[:filter.Limit]
+	}
 
-	var records []*ActivityRecord
-	var total int
-
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil // No activities yet
+	records := make([]*ActivityRecord, 0, len(page))
+	for _, e := range page {
+		record, err := m.activityLog.load(e)
+		if errors.Is(err, errRecordGone) {
+			continue
 		}
-
-		// Iterate in reverse order (newest first)
-		cursor := bucket.Cursor()
-		skipped := 0
-
-		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
-			var record ActivityRecord
-			if err := record.UnmarshalBinary(v); err != nil {
-				m.logger.Warnw("Failed to unmarshal activity record",
-					"key", string(k),
-					"error", err)
-				continue
-			}
-
-			// Check if record matches filter
-			if !filter.Matches(&record) {
-				continue
-			}
-
-			total++
-
-			// Handle pagination
-			if skipped < filter.Offset {
-				skipped++
-				continue
-			}
-
-			if len(records) < filter.Limit {
-				records = append(records, &ActivityRecord{
-					ID:                record.ID,
-					Type:              record.Type,
-					ServerName:        record.ServerName,
-					ToolName:          record.ToolName,
-					Arguments:         record.Arguments,
-					Response:          record.Response,
-					ResponseTruncated: record.ResponseTruncated,
-					Status:            record.Status,
-					ErrorMessage:      record.ErrorMessage,
-					DurationMs:        record.DurationMs,
-					Timestamp:         record.Timestamp,
-					SessionID:         record.SessionID,
-					RequestID:         record.RequestID,
-					Metadata:          record.Metadata,
-				})
-			}
+		if err != nil {
+			m.logger.Warnw("Failed to load activity record", "id", e.id, "error", err)
+			continue
 		}
-
-		return nil
-	})
-
-	return records, total, err
+		records = append(records, record)
+	}
+	return records, total, nil
 }
 
 // DeleteActivity deletes an activity record by ID.
@@ -362,54 +241,20 @@ func (m *Manager) DeleteActivity(id string) error {
 	if id == "" {
 		return fmt.Errorf("activity ID cannot be empty")
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.invalidateActivityBytesLocked()
-
-	return m.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil // No activities yet
-		}
-
-		// Find and delete the record by ID
-		cursor := bucket.Cursor()
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			if parseActivityKey(k) == id {
-				return bucket.Delete(k)
-			}
-		}
-
-		return nil // Not found, not an error
-	})
+	_, err := m.activityLog.tombstone(id)
+	return err
 }
 
 // CountActivities returns the total number of activity records.
 func (m *Manager) CountActivities() (int, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	var count int
-
-	err := m.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil
-		}
-		count = bucket.Stats().KeyN
-		return nil
-	})
-
-	return count, err
+	return m.activityLog.count(), nil
 }
 
 // StreamActivities returns a channel that yields activity records matching the filter.
 // The channel is closed when all matching records have been sent or ctx is done.
 // This is useful for streaming large exports without loading all records into memory.
-// The producer holds a read transaction and m.mu.RLock until it finishes, so
-// a consumer that stops reading must cancel ctx: otherwise the producer
-// blocks on the send forever and every storage writer waits on m.mu behind it.
+// It holds no storage lock while sending, so a consumer that stops reading
+// only needs to cancel ctx to release the producer goroutine.
 func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <-chan *ActivityRecord {
 	filter.Validate()
 	ch := make(chan *ActivityRecord, 100)
@@ -417,42 +262,20 @@ func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <
 	go func() {
 		defer close(ch)
 
-		m.mu.RLock()
-		defer m.mu.RUnlock()
-
-		err := m.db.View(func(tx *bbolt.Tx) error {
-			bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-			if bucket == nil {
-				return nil
+		matches := m.activityLog.snapshot(func(r *ActivityRecord) bool { return filter.Matches(r) })
+		for _, e := range matches {
+			if ctx.Err() != nil {
+				return
 			}
-
-			cursor := bucket.Cursor()
-			for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
-				if ctx.Err() != nil {
-					return nil
-				}
-
-				var record ActivityRecord
-				if err := record.UnmarshalBinary(v); err != nil {
-					continue
-				}
-
-				if !filter.Matches(&record) {
-					continue
-				}
-
-				select {
-				case ch <- &record:
-				case <-ctx.Done():
-					return nil
-				}
+			record, err := m.activityLog.load(e)
+			if err != nil {
+				continue
 			}
-
-			return nil
-		})
-
-		if err != nil {
-			m.logger.Errorw("Error streaming activities", "error", err)
+			select {
+			case ch <- record:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -462,54 +285,12 @@ func (m *Manager) StreamActivities(ctx context.Context, filter ActivityFilter) <
 // PruneOldActivities deletes activity records older than the specified duration.
 // Returns the number of records deleted.
 func (m *Manager) PruneOldActivities(maxAge time.Duration) (int, error) {
-	cutoff := time.Now().UTC().Add(-maxAge)
-	cutoffKey := activityKey(cutoff, "")
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.invalidateActivityBytesLocked()
-
-	var deleted int
-
-	err := m.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil
-		}
-
-		var keysToDelete [][]byte
-		cursor := bucket.Cursor()
-
-		// Keys before cutoff (older records have smaller keys)
-		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
-			// Compare keys lexicographically
-			if string(k) < string(cutoffKey) {
-				keysToDelete = append(keysToDelete, append([]byte{}, k...))
-			} else {
-				break // Keys are sorted, no more old records
-			}
-		}
-
-		for _, key := range keysToDelete {
-			if err := bucket.Delete(key); err != nil {
-				return fmt.Errorf("failed to delete old activity: %w", err)
-			}
-			deleted++
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return deleted, err
-	}
-
+	deleted := m.activityLog.pruneOlderThan(time.Now().UTC().Add(-maxAge))
 	if deleted > 0 {
 		m.logger.Infow("Pruned old activity records",
 			"deleted", deleted,
 			"max_age", maxAge.String())
 	}
-
 	return deleted, nil
 }
 
@@ -520,98 +301,29 @@ func (m *Manager) PruneExcessActivities(maxRecords int, targetPercent float64) (
 	if targetPercent <= 0 || targetPercent > 1 {
 		targetPercent = 0.9 // Default to 90%
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.invalidateActivityBytesLocked()
-
-	var deleted int
-
-	err := m.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil
-		}
-
-		count := bucket.Stats().KeyN
-		if count <= maxRecords {
-			return nil
-		}
-
-		targetCount := int(float64(maxRecords) * targetPercent)
-		toDelete := count - targetCount
-
-		var keysToDelete [][]byte
-		cursor := bucket.Cursor()
-
-		// Delete oldest records (smallest keys)
-		for k, _ := cursor.First(); k != nil && len(keysToDelete) < toDelete; k, _ = cursor.Next() {
-			keysToDelete = append(keysToDelete, append([]byte{}, k...))
-		}
-
-		for _, key := range keysToDelete {
-			if err := bucket.Delete(key); err != nil {
-				return fmt.Errorf("failed to delete excess activity: %w", err)
-			}
-			deleted++
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return deleted, err
-	}
-
+	deleted := m.activityLog.pruneExcess(maxRecords, targetPercent)
 	if deleted > 0 {
 		m.logger.Infow("Pruned excess activity records",
 			"deleted", deleted,
 			"max_records", maxRecords)
 	}
-
 	return deleted, nil
 }
 
-// PruneActivitiesByBudget deletes the oldest activity records once the
-// bucket's total value bytes exceed maxBytes, via the same trim primitive
-// RecordToolCall/RecordServerDiagnostic use (see trimBucketToByteBudget):
-// the single most-recent record is always kept regardless of its own size,
-// so one oversized activity can't cascade into wiping the whole bucket.
-// This complements PruneOldActivities/PruneExcessActivities: a
-// 7-day/10,000-record cap still permits ~100MB of legitimate stored bytes
-// at ~10KB/record, so a byte budget is the cap that actually bounds
-// config.db size.
+// PruneActivitiesByBudget deletes the oldest activity records once the total
+// record bytes exceed maxBytes. The single most-recent record is always kept
+// regardless of its own size, so one oversized activity can't cascade into
+// wiping the whole log. This complements PruneOldActivities/
+// PruneExcessActivities: a 7-day/10,000-record cap still permits ~100MB of
+// legitimate stored bytes at ~10KB/record, so the byte budget is the cap that
+// actually bounds disk use.
 func (m *Manager) PruneActivitiesByBudget(maxBytes int64) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.invalidateActivityBytesLocked()
-
-	var deleted int
-
-	err := m.db.Update(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(ActivityRecordsBucket))
-		if bucket == nil {
-			return nil
-		}
-
-		var err error
-		deleted, err = trimBucketToByteBudget(bucket, maxBytes, nil)
-		if err != nil {
-			return fmt.Errorf("failed to delete over-budget activity: %w", err)
-		}
-		return nil
-	})
-
-	if err != nil {
-		return deleted, err
-	}
-
+	deleted := m.activityLog.trimToBudget("", true, maxBytes, "")
 	if deleted > 0 {
 		m.logger.Infow("Pruned activity records over byte budget",
 			"deleted", deleted,
 			"max_bytes", maxBytes)
 	}
-
 	return deleted, nil
 }
 
@@ -628,10 +340,9 @@ func (m *Manager) SaveActivityAsync(record *ActivityRecord) {
 	}()
 }
 
-// GetActivityByIDScan performs a full scan to find activity by ID.
-// This is less efficient than GetActivity but works when the timestamp is unknown.
+// GetActivityByIDScan finds an activity by ID.
 func (m *Manager) GetActivityByIDScan(id string) (*ActivityRecord, error) {
-	return m.GetActivity(id) // Our GetActivity already does a scan
+	return m.GetActivity(id)
 }
 
 // TruncateActivityResponse is a helper to truncate responses for storage.

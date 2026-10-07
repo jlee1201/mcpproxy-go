@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -666,106 +667,63 @@ func TestCleanupStaleServerData_DoesNotDeadlock(t *testing.T) {
 	}
 }
 
-// TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites is the
-// regression test for round-4's Finding 1: RecordToolCall only trims on its
-// OWN write, so a server that stays configured but goes quiet (no new tool
-// calls) never gets its pre-existing, already-bloated bucket trimmed -- and
-// CleanupStaleServerData intentionally leaves a still-configured server's
-// data alone too, since "still configured" means it isn't stale. This seeds
-// an oversized tool_calls bucket directly (bypassing RecordToolCall, which
-// would trim on the way in) to simulate a bucket that was already over
-// budget before this fix existed, then verifies TrimAllServerBuckets -- with
+// seedToolCallsOverBudget appends enough tool calls for serverID to exceed
+// DefaultToolCallsBucketMaxBytes straight into the history log, bypassing
+// RecordToolCall's own trim, and returns how many were written.
+func seedToolCallsOverBudget(t *testing.T, m *Manager, serverID string) int {
+	t.Helper()
+	const recordSize = 10 * 1024
+	n := int(DefaultToolCallsBucketMaxBytes/recordSize) + 100
+	payload := strings.Repeat("v", recordSize)
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < n; i++ {
+		rec := &ToolCallRecord{
+			ID:        fmt.Sprintf("seed-%s-%06d", serverID, i),
+			ServerID:  serverID,
+			ToolName:  "some_tool",
+			Response:  payload,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+		}
+		data, err := json.Marshal(rec)
+		require.NoError(t, err)
+		require.NoError(t, m.toolCallLog.append(rec, data))
+	}
+	return n
+}
+
+// TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites seeds an
+// oversized tool-call history for a server directly (bypassing RecordToolCall,
+// which would trim on the way in), then verifies TrimAllServerBuckets -- with
 // no write ever occurring for that server -- trims it down to budget.
 func TestTrimAllServerBuckets_TrimsQuietServerWithNoRecentWrites(t *testing.T) {
 	manager, cleanup := setupTestStorageForActivity(t)
 	defer cleanup()
 
 	identity := registerStaleIdentity(t, manager, "quiet-but-configured", 1*time.Hour)
-
-	const recordSize = 100
-	numRecords := (DefaultToolCallsBucketMaxBytes / recordSize) + 20 // well over budget
-	value := strings.Repeat("v", recordSize)
-	bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
-
-	err := manager.db.Update(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
-		if err != nil {
-			return err
-		}
-		for i := 0; i < numRecords; i++ {
-			key := fmt.Sprintf("%06d", i)
-			if err := bucket.Put([]byte(key), []byte(value)); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	require.NoError(t, err)
-
-	var sizeBefore int
-	err = manager.db.View(func(tx *bbolt.Tx) error {
-		sizeBefore = tx.Bucket([]byte(bucketName)).Stats().KeyN
-		return nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, numRecords, sizeBefore, "sanity check: bucket seeded above budget without going through RecordToolCall's own trim")
+	numRecords := seedToolCallsOverBudget(t, manager, identity.ID)
+	require.Equal(t, numRecords, len(manager.toolCallLog.snapshot(nil)), "sanity check: seeded above budget without RecordToolCall's own trim")
 
 	trimmed, err := manager.TrimAllServerBuckets()
 	require.NoError(t, err)
-	assert.Equal(t, 1, trimmed, "the one oversized bucket should have been trimmed")
+	assert.Equal(t, 1, trimmed, "the one oversized server should have been trimmed")
 
-	err = manager.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket([]byte(bucketName))
-		require.NotNil(t, bucket)
-		// trimBucketToByteBudget always exempts the single newest key from
-		// the cumulative-byte check regardless of budget (see its own
-		// doc comment / TestTrimBucketToByteBudget_OversizedRecordDoesNotCascadeWipe),
-		// so the surviving count is "however many fit within budget" plus
-		// that one always-protected key.
-		maxSurviving := DefaultToolCallsBucketMaxBytes/recordSize + 1
-		assert.LessOrEqual(t, bucket.Stats().KeyN, maxSurviving,
-			"bucket must be trimmed back down to budget even though no RecordToolCall write ever happened for this server")
-		assert.Less(t, bucket.Stats().KeyN, numRecords,
-			"trim must have actually removed records, not left the bucket untouched")
-		return nil
-	})
-	require.NoError(t, err)
+	assert.LessOrEqual(t, manager.toolCallLog.groupBytes(identity.ID), int64(DefaultToolCallsBucketMaxBytes)+16*1024,
+		"history must be trimmed back to budget (plus the always-kept newest record) with no write for this server")
+	assert.Less(t, len(manager.toolCallLog.snapshot(nil)), numRecords, "trim must have removed records")
 }
 
-// TestTrimAllServerBuckets_TrimsMultipleServersIndependently is the
-// regression test for round-5 finding #5's fix: TrimAllServerBuckets now
-// trims each server's buckets in its own transaction (releasing m.mu
-// between servers) instead of one giant transaction covering every server.
-// This verifies that refactor didn't break the aggregation across servers
-// -- every oversized server must still end up trimmed and counted, not
-// just the first or last one processed.
+// TestTrimAllServerBuckets_TrimsMultipleServersIndependently verifies every
+// oversized server is trimmed and counted, not just the first or last one.
 func TestTrimAllServerBuckets_TrimsMultipleServersIndependently(t *testing.T) {
 	manager, cleanup := setupTestStorageForActivity(t)
 	defer cleanup()
 
-	const recordSize = 100
-	numRecords := (DefaultToolCallsBucketMaxBytes / recordSize) + 20
-	value := strings.Repeat("v", recordSize)
-
 	var identities []*ServerIdentity
+	var numRecords int
 	for i := 0; i < 3; i++ {
 		identity := registerStaleIdentity(t, manager, fmt.Sprintf("quiet-server-%d", i), 1*time.Hour)
 		identities = append(identities, identity)
-
-		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
-		require.NoError(t, manager.db.Update(func(tx *bbolt.Tx) error {
-			bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
-			if err != nil {
-				return err
-			}
-			for j := 0; j < numRecords; j++ {
-				key := fmt.Sprintf("%06d", j)
-				if err := bucket.Put([]byte(key), []byte(value)); err != nil {
-					return err
-				}
-			}
-			return nil
-		}))
+		numRecords = seedToolCallsOverBudget(t, manager, identity.ID)
 	}
 
 	trimmed, err := manager.TrimAllServerBuckets()
@@ -773,15 +731,10 @@ func TestTrimAllServerBuckets_TrimsMultipleServersIndependently(t *testing.T) {
 	assert.Equal(t, 3, trimmed, "all three oversized servers must be trimmed and counted, not just one")
 
 	for _, identity := range identities {
-		bucketName := fmt.Sprintf("server_%s_tool_calls", identity.ID)
-		err = manager.db.View(func(tx *bbolt.Tx) error {
-			bucket := tx.Bucket([]byte(bucketName))
-			require.NotNil(t, bucket)
-			assert.Less(t, bucket.Stats().KeyN, numRecords,
-				"server %s's bucket must have actually been trimmed", identity.ServerName)
-			return nil
-		})
+		calls, err := manager.GetServerToolCalls(identity.ID, numRecords)
 		require.NoError(t, err)
+		assert.Less(t, len(calls), numRecords, "server %s's history must have actually been trimmed", identity.ServerName)
+		assert.NotEmpty(t, calls)
 	}
 }
 

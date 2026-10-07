@@ -16,16 +16,16 @@ const (
 	DefaultRetentionMaxAge = 7 * 24 * time.Hour
 	// DefaultRetentionMaxRecords is the default max number of records (10000)
 	DefaultRetentionMaxRecords = 10000
-	// DefaultRetentionMaxBytes is the default byte budget for activity_records
-	// (20MB). The age/count caps above permit up to ~100MB of legitimate
-	// stored bytes at typical record sizes; this is the cap that actually
-	// bounds config.db size. Enforced on every write (storage
+	// DefaultRetentionMaxBytes is the default byte budget for the activity
+	// history log (20MB). The age/count caps above permit up to ~100MB of
+	// legitimate stored bytes at typical record sizes; this is the cap that
+	// actually bounds on-disk history size. Enforced on every write (storage
 	// SetActivityByteBudget) and again at each retention sweep.
 	DefaultRetentionMaxBytes = 20 * 1024 * 1024
 	// DefaultRetentionCheckInterval is the default interval between retention checks (1 hour)
 	DefaultRetentionCheckInterval = 1 * time.Hour
 	// DefaultStaleServerThreshold is how long a server must be unseen before
-	// its identity/statistics/tool_calls/diagnostics data is fully removed.
+	// its identity/statistics/tool-call history/diagnostics data is fully removed.
 	DefaultStaleServerThreshold = 30 * 24 * time.Hour
 )
 
