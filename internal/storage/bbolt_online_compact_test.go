@@ -159,15 +159,19 @@ func TestCompactOnline_ConcurrentWritersLoseNothing(t *testing.T) {
 			}
 		}(w)
 	}
-	// Reader that nests View inside View, the pattern that would deadlock
-	// against a blocking writer lock.
+	// Reader that re-enters the BoltDB read lock, the pattern that would
+	// deadlock against a blocking writer lock (a pending Lock() queues new
+	// RLock calls). It nests only the wrapper's RWMutex, not two bbolt read
+	// transactions: nested bbolt read txs deadlock against a writer that needs
+	// to remap the file (bbolt's mmaplock), which is bbolt's own documented
+	// hazard and fires readily on 4KB-page Linux, independent of compaction.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for !stop.Load() {
-			_ = db.View(func(tx *bbolt.Tx) error {
-				return db.View(func(tx2 *bbolt.Tx) error { return nil })
-			})
+			db.mu.RLock()
+			_ = db.View(func(tx *bbolt.Tx) error { return nil })
+			db.mu.RUnlock()
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
