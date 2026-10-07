@@ -177,6 +177,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.connecting = false
 	}()
 
+	// Clear stale server info so the post-connect guard below only passes when
+	// THIS attempt ran initialize().
+	c.serverInfo = nil
+
 	// Reset connection state for fresh connection attempt
 	if c.connected {
 		c.logger.Info("🔄 Reconnecting after OAuth completion",

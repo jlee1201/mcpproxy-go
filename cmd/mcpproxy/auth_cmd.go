@@ -110,9 +110,9 @@ func init() {
 	authLoginCmd.Flags().StringVarP(&authLogLevel, "log-level", "l", "info", "Log level (trace, debug, info, warn, error)")
 	authLoginCmd.Flags().StringVarP(&authConfigPath, "config", "c", "", "Path to MCP configuration file (default: ~/.mcpproxy/mcp_config.json)")
 	authLoginCmd.Flags().DurationVar(&authTimeout, "timeout", 5*time.Minute, "Authentication timeout")
-	authLoginCmd.Flags().BoolVar(&authWait, "wait", true, "Wait until the server is connected and answering tools/list before returning (default)")
+	authLoginCmd.Flags().BoolVar(&authWait, "wait", true, "Wait until the server is connected and answering tools/list before returning (daemon client mode only; ignored in standalone mode)")
 	authLoginCmd.Flags().BoolVar(&authNoWait, "no-wait", false, "Return as soon as the OAuth flow is initiated, without waiting for the server to connect")
-	authLoginCmd.Flags().DurationVar(&authWaitTime, "wait-timeout", 2*time.Minute, "How long --wait waits for the server to become ready after the login is initiated")
+	authLoginCmd.Flags().DurationVar(&authWaitTime, "wait-timeout", 3*time.Minute, "How long --wait waits for the server to become ready after the login is initiated (daemon client mode only; ignored in standalone mode)")
 
 	// Define flags for auth status command
 	authStatusCmd.Flags().StringVarP(&authServerName, "server", "s", "", "Server name to check status for (optional)")
@@ -287,10 +287,14 @@ func runAuthLoginAll(ctx context.Context, dataDir string) error {
 	for i, serverName := range serversNeedingAuth {
 		fmt.Printf("[%d/%d] Authenticating %s...\n", i+1, len(serversNeedingAuth), serverName)
 
-		err := client.TriggerOAuthLogin(ctx, serverName)
+		// Per-server budget: with --wait each login can take minutes, so a single
+		// shared deadline would starve the later servers in a large batch.
+		serverCtx, serverCancel := context.WithTimeout(context.Background(), authTimeout)
+		err := client.TriggerOAuthLogin(serverCtx, serverName)
 		if err == nil && authShouldWait() {
-			err = waitForServerReady(ctx, client, serverName, authWaitTime, authWaitPollInterval)
+			err = waitForServerReady(serverCtx, client, serverName, authWaitTime, authWaitPollInterval)
 		}
+		serverCancel()
 		if err != nil {
 			fmt.Printf("  ❌ Failed: %v\n", err)
 			failed++
