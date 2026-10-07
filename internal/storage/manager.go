@@ -680,6 +680,11 @@ func (m *Manager) listServerIdentitiesLocked() ([]*ServerIdentity, error) {
 // would need a cross-server eviction invariant and is left as follow-up.
 const DefaultToolCallsBucketMaxBytes = 5 * 1024 * 1024
 
+// DefaultToolCallRetention is how long tool-call history is kept regardless of
+// the byte budget. Without an age cap, a quiet server's few records would stay
+// forever (they never exceed their budget) and keep old segment files alive.
+const DefaultToolCallRetention = 7 * 24 * time.Hour
+
 // DefaultDiagnosticsBucketMaxBytes bounds each per-server diagnostics bucket
 // (still stored in config.db). Same per-server, non-aggregate limitation as
 // DefaultToolCallsBucketMaxBytes above applies here too.
@@ -911,6 +916,11 @@ func (m *Manager) dropLegacyHistoryBuckets() {
 // RecordToolCall appends a tool call to the history log, then trims that
 // server's history back to DefaultToolCallsBucketMaxBytes.
 func (m *Manager) RecordToolCall(record *ToolCallRecord) error {
+	if record.ID == "" {
+		// The log is keyed by ID; the old bucket keyed by timestamp, so callers
+		// that never set one must keep working.
+		record.ID = fmt.Sprintf("%d-%s", time.Now().UnixNano(), record.ToolName)
+	}
 	data, err := truncateToolCallRecordToFit(record, MaxToolCallRecordBytes)
 	if err != nil {
 		return err
@@ -986,11 +996,22 @@ func trimBucketToByteBudgetKept(bucket *bbolt.Bucket, maxBytes int64, protectedK
 
 // GetServerToolCalls gets tool calls for a server, newest first.
 func (m *Manager) GetServerToolCalls(serverID string, limit int) ([]*ToolCallRecord, error) {
-	matches := m.toolCallLog.snapshot(func(r *ToolCallRecord) bool { return r.ServerID == serverID })
-	if limit >= 0 && len(matches) > limit {
-		matches = matches[:limit]
-	}
+	matches := m.toolCallLog.snapshotLimit(func(r *ToolCallRecord) bool { return r.ServerID == serverID }, limit)
 	return m.loadToolCalls(matches), nil
+}
+
+// GetToolCallByID returns one tool call by ID, or nil if it is not in the
+// history (never recorded, or already retained out).
+func (m *Manager) GetToolCallByID(id string) (*ToolCallRecord, error) {
+	e, ok := m.toolCallLog.lookup(id)
+	if !ok {
+		return nil, nil
+	}
+	rec, err := m.toolCallLog.load(e)
+	if errors.Is(err, errRecordGone) {
+		return nil, nil
+	}
+	return rec, err
 }
 
 func (m *Manager) loadToolCalls(entries []logEntry[ToolCallRecord]) []*ToolCallRecord {
@@ -1133,6 +1154,16 @@ func (m *Manager) TrimAllServerBuckets() (int, error) {
 
 	trimmedBuckets := 0
 	var errs []error
+
+	// History housekeeping rides this hourly sweep: age out old tool calls,
+	// then rewrite mostly-dead segments so a few long-lived records cannot pin
+	// whole files of dead data.
+	if n := m.toolCallLog.pruneOlderThan(time.Now().Add(-DefaultToolCallRetention)); n > 0 {
+		m.logger.Infow("Pruned tool-call history past retention", "deleted", n)
+	}
+	m.toolCallLog.compactSparse()
+	m.activityLog.compactSparse()
+
 	ids := make(map[string]bool, len(identities))
 	for _, identity := range identities {
 		ids[identity.ID] = true

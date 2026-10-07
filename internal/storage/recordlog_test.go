@@ -520,3 +520,191 @@ func TestManager_CleanupStaleServerDataDropsHistoryGroup(t *testing.T) {
 	assert.Equal(t, int64(0), m.toolCallLog.groupBytes(stale.ID), "stale server's file-backed history must be dropped with its identity")
 	assert.Greater(t, m.toolCallLog.groupBytes("live-server"), int64(0))
 }
+
+// --- regressions from the PR #14 adversarial review ---
+
+// A delete followed by a later append in the same segment used to drive the
+// segment's live count to zero mid-scan on restart and unlink a file that
+// still held live records.
+func TestRecordLog_RestartKeepsRecordsAppendedAfterDeleteInSameSegment(t *testing.T) {
+	dir := t.TempDir()
+	l := openTestLog(t, dir, 0)
+	base := time.Now().Add(-time.Hour)
+	appendRec(t, l, "A", "g", base, "a")
+	ok, err := l.tombstone("A")
+	require.NoError(t, err)
+	require.True(t, ok)
+	appendRec(t, l, "B", "g", base.Add(time.Second), "b-body")
+	require.NoError(t, l.close())
+
+	l2 := openTestLog(t, dir, 0)
+	defer l2.close()
+	require.Equal(t, []string{"B"}, ids(l2.snapshot(nil)))
+	e, _ := l2.lookup("B")
+	full, err := l2.load(e)
+	require.NoError(t, err, "B's segment must not have been deleted during startup")
+	assert.Equal(t, "b-body", full.Body)
+}
+
+func TestRecordLog_RestartKeepsRecordReappendedWithSameID(t *testing.T) {
+	dir := t.TempDir()
+	l := openTestLog(t, dir, 0)
+	base := time.Now().Add(-time.Hour)
+	appendRec(t, l, "A", "g", base, "old")
+	appendRec(t, l, "A", "g", base.Add(time.Second), "new")
+	require.NoError(t, l.close())
+
+	l2 := openTestLog(t, dir, 0)
+	defer l2.close()
+	require.Equal(t, []string{"A"}, ids(l2.snapshot(nil)))
+	e, _ := l2.lookup("A")
+	full, err := l2.load(e)
+	require.NoError(t, err)
+	assert.Equal(t, "new", full.Body)
+}
+
+// A tombstone lives in whichever segment was active when the delete happened.
+// If that segment is later garbage-collected, the older segment still holding
+// the deleted record must not resurrect it.
+func TestRecordLog_TombstoneOutlivesItsSegmentWhileOlderSegmentsRemain(t *testing.T) {
+	dir := t.TempDir()
+	body := strings.Repeat("b", 400)
+	l := openTestLog(t, dir, 1024)
+	base := time.Now().Add(-time.Hour)
+	// seg1: A (to be deleted) + X (stays live); fills the segment.
+	appendRec(t, l, "A", "g", base, body)
+	appendRec(t, l, "X", "g", base.Add(time.Second), body)
+	// seg2: Y, then the tombstone for A.
+	appendRec(t, l, "Y", "g", base.Add(2*time.Second), body)
+	ok, err := l.tombstone("A")
+	require.NoError(t, err)
+	require.True(t, ok)
+	// Y is pruned, so seg2 has no live records but carries A's tombstone.
+	l.pruneOlderThan(base.Add(2*time.Second + time.Millisecond)) // removes Y (and X? no: X is older)
+	require.NoError(t, l.close())
+
+	l2 := openTestLog(t, dir, 1024)
+	defer l2.close()
+	for _, id := range ids(l2.snapshot(nil)) {
+		assert.NotEqual(t, "A", id, "deleted record must not reappear after its tombstone's segment was pruned")
+	}
+}
+
+func TestRecordLog_CompactSparseReclaimsSegmentsPinnedByLongLivedRecords(t *testing.T) {
+	dir := t.TempDir()
+	l := openTestLog(t, dir, 2048)
+	defer l.close()
+	base := time.Now().Add(-time.Hour)
+	body := strings.Repeat("b", 300)
+	// Interleave one long-lived "quiet" record per segment with busy-server
+	// records that then get pruned.
+	n := 0
+	for seg := 0; seg < 6; seg++ {
+		appendRec(t, l, fmt.Sprintf("quiet%d", seg), "quiet", base.Add(time.Duration(n)*time.Second), body)
+		n++
+		for i := 0; i < 5; i++ {
+			appendRec(t, l, fmt.Sprintf("busy%d-%d", seg, i), "busy", base.Add(time.Duration(n)*time.Second), body)
+			n++
+		}
+	}
+	appendRec(t, l, "tail", "busy", time.Now(), body) // keep the active segment away from the candidates
+	l.dropGroup("busy")
+	pinned := len(segFiles(t, dir))
+	require.GreaterOrEqual(t, pinned, 6, "each quiet record pins its own segment")
+
+	reclaimed := l.compactSparse()
+	assert.Greater(t, reclaimed, 0)
+	assert.Less(t, len(segFiles(t, dir)), pinned)
+
+	// Every survivor is intact and still loadable, including via a stale index row.
+	for _, e := range l.snapshot(nil) {
+		full, err := l.load(e)
+		require.NoError(t, err)
+		assert.Equal(t, body, full.Body)
+	}
+}
+
+func TestRecordLog_CompactionSurvivesRestartAndStaleRowsFollowTheRecord(t *testing.T) {
+	dir := t.TempDir()
+	l := openTestLog(t, dir, 2048)
+	base := time.Now().Add(-time.Hour)
+	body := strings.Repeat("b", 300)
+	appendRec(t, l, "keep", "q", base, body)
+	for i := 0; i < 6; i++ {
+		appendRec(t, l, fmt.Sprintf("junk%d", i), "j", base.Add(time.Duration(i+1)*time.Second), body)
+	}
+	appendRec(t, l, "tail", "j", time.Now(), body)
+	stale, ok := l.lookup("keep")
+	require.True(t, ok)
+	l.dropGroup("j")
+	l.compactSparse()
+	require.Empty(t, segFilesWithPrefix(t, dir, "nonexistent"))
+
+	full, err := l.load(stale) // row captured before compaction moved the record
+	require.NoError(t, err, "a stale index row must follow the record to its new segment")
+	assert.Equal(t, body, full.Body)
+	require.NoError(t, l.close())
+
+	l2 := openTestLog(t, dir, 2048)
+	defer l2.close()
+	e, ok := l2.lookup("keep")
+	require.True(t, ok)
+	full, err = l2.load(e)
+	require.NoError(t, err)
+	assert.Equal(t, body, full.Body)
+}
+
+func TestRecordLog_SnapshotLimitReturnsNewestN(t *testing.T) {
+	l := openTestLog(t, t.TempDir(), 0)
+	defer l.close()
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i < 10; i++ {
+		appendRec(t, l, fmt.Sprintf("r%d", i), "g", base.Add(time.Duration(i)*time.Second), "x")
+	}
+	assert.Equal(t, []string{"r9", "r8", "r7"}, ids(l.snapshotLimit(nil, 3)))
+	assert.Len(t, l.snapshotLimit(nil, -1), 10)
+	assert.Empty(t, l.snapshotLimit(nil, 0))
+}
+
+func TestRecordLog_AppendRejectsEmptyID(t *testing.T) {
+	l := openTestLog(t, t.TempDir(), 0)
+	defer l.close()
+	rec := &testRec{TS: time.Now()}
+	data, _ := json.Marshal(rec)
+	assert.Error(t, l.append(rec, data))
+	assert.Equal(t, 0, l.count())
+	assert.Empty(t, segFiles(t, l.dir), "nothing may be written to disk for a record that cannot be indexed")
+}
+
+func TestManager_GetToolCallByIDAndAgeCap(t *testing.T) {
+	m, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+	require.NoError(t, m.RecordToolCall(&ToolCallRecord{ID: "fresh", ServerID: "s", ToolName: "t", Timestamp: time.Now(), Response: "resp"}))
+	require.NoError(t, m.RecordToolCall(&ToolCallRecord{ID: "ancient", ServerID: "quiet", ToolName: "t", Timestamp: time.Now().Add(-DefaultToolCallRetention - time.Hour), Response: "resp"}))
+
+	got, err := m.GetToolCallByID("fresh")
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, "resp", got.Response)
+	missing, err := m.GetToolCallByID("nope")
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+
+	_, err = m.TrimAllServerBuckets()
+	require.NoError(t, err)
+	gone, err := m.GetToolCallByID("ancient")
+	require.NoError(t, err)
+	assert.Nil(t, gone, "tool calls past retention must be pruned even when the server is within its byte budget")
+	still, _ := m.GetToolCallByID("fresh")
+	assert.NotNil(t, still)
+}
+
+func TestManager_RecordToolCallWithoutIDStillStored(t *testing.T) {
+	m, cleanup := setupTestStorageForActivity(t)
+	defer cleanup()
+	require.NoError(t, m.RecordToolCall(&ToolCallRecord{ServerID: "s", ToolName: "t", Timestamp: time.Now()}))
+	calls, err := m.GetServerToolCalls("s", 10)
+	require.NoError(t, err)
+	require.Len(t, calls, 1)
+	assert.NotEmpty(t, calls[0].ID)
+}

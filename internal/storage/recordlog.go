@@ -49,8 +49,10 @@ type recordLogSpec[T any] struct {
 }
 
 type segInfo struct {
-	live int   // live (not deleted/pruned) records in the segment
-	size int64 // bytes on disk
+	live      int   // live (not deleted/pruned) records in the segment
+	liveBytes int64 // bytes of the live records
+	tombs     int   // tombstone lines written into this segment
+	size      int64 // bytes on disk
 }
 
 // recordLog is an append-only, size-rotated JSONL store with an in-memory
@@ -84,6 +86,7 @@ type recordLog[T any] struct {
 	activeSize int64
 	nextSeg    uint64
 	closed     bool
+	loading    bool // index is being rebuilt from disk; never delete files meanwhile
 }
 
 func openRecordLog[T any](dir string, spec recordLogSpec[T], segMax int64, logger *zap.SugaredLogger) (*recordLog[T], error) {
@@ -138,36 +141,37 @@ func (l *recordLog[T]) loadExisting() error {
 	if err != nil {
 		return fmt.Errorf("list history segments: %w", err)
 	}
-	for i, seg := range segs {
-		last := i == len(segs)-1
-		if err := l.scanSegment(seg, last); err != nil {
+	// Segment files are never deleted mid-scan: a segment's live count can dip
+	// to zero before a later line in the same file adds a record back.
+	l.loading = true
+	scanned := make(map[uint64]bool, len(segs))
+	for _, seg := range segs {
+		if err := l.scanSegment(seg); err != nil {
 			l.logger.Warnw("Skipping unreadable history segment", "segment", l.segPath(seg), "error", err)
+		} else {
+			scanned[seg] = true
 		}
 		if seg >= l.nextSeg {
 			l.nextSeg = seg + 1
 		}
 	}
-	// Segments whose every record was tombstoned or pruned carry no value.
-	for seg, info := range l.segs {
-		if info.live == 0 && (len(segs) == 0 || seg != segs[len(segs)-1]) {
-			_ = os.Remove(l.segPath(seg))
-			delete(l.segs, seg)
-		}
-	}
+	l.loading = false
 	l.unsorted = true
 	if len(segs) > 0 {
 		last := segs[len(segs)-1]
-		if info := l.segs[last]; info != nil && info.size < l.segMax {
+		if info := l.segs[last]; scanned[last] && info != nil && info.size < l.segMax {
 			f, err := os.OpenFile(l.segPath(last), os.O_WRONLY|os.O_APPEND, 0o644)
 			if err == nil {
 				l.active, l.activeSeg, l.activeSize = f, last, info.size
 			}
 		}
 	}
+	// Drop segments that carry nothing worth keeping.
+	l.gcLocked()
 	return nil
 }
 
-func (l *recordLog[T]) scanSegment(seg uint64, last bool) error {
+func (l *recordLog[T]) scanSegment(seg uint64) error {
 	path := l.segPath(seg)
 	f, err := os.Open(path)
 	if err != nil {
@@ -188,9 +192,7 @@ func (l *recordLog[T]) scanSegment(seg uint64, last bool) error {
 		} else if len(line) > 0 {
 			// Partial trailing line from a crash mid-write. Drop it from the
 			// active segment so the next append starts on a clean line.
-			if last {
-				_ = os.Truncate(path, off)
-			}
+			_ = os.Truncate(path, off)
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -211,6 +213,7 @@ func (l *recordLog[T]) indexLine(seg uint64, off int64, line []byte, info *segIn
 		return
 	}
 	if line[0] == '-' {
+		info.tombs++
 		if e := l.byID[string(line[1:])]; e != nil {
 			l.removeLocked(e)
 		}
@@ -243,12 +246,13 @@ func (l *recordLog[T]) addLocked(rec *T, seg uint64, off int64, n int, info *seg
 		info = l.segs[seg]
 	}
 	info.live++
+	info.liveBytes += int64(n)
 	l.liveBytes += int64(n)
 	l.groupSize[group] += int64(n)
 }
 
-// removeLocked drops an entry from the index and deletes its segment file
-// once nothing live remains in it (never the segment being appended to).
+// removeLocked drops an entry from the index and garbage-collects segment
+// files that no longer hold anything worth keeping.
 func (l *recordLog[T]) removeLocked(e *logEntry[T]) {
 	if e.dead {
 		return
@@ -263,10 +267,36 @@ func (l *recordLog[T]) removeLocked(e *logEntry[T]) {
 	}
 	if info := l.segs[e.seg]; info != nil {
 		info.live--
-		if info.live <= 0 && (l.active == nil || e.seg != l.activeSeg) {
-			_ = os.Remove(l.segPath(e.seg))
-			delete(l.segs, e.seg)
+		info.liveBytes -= int64(e.n)
+		if info.live <= 0 {
+			l.gcLocked()
 		}
+	}
+}
+
+// gcLocked deletes segment files with no live records, except the one being
+// appended to. A segment holding tombstones is kept until no older segment
+// remains: the tombstone may be the only thing stopping a deleted record in an
+// older file from reappearing after a restart.
+func (l *recordLog[T]) gcLocked() {
+	if l.loading {
+		return
+	}
+	order := make([]uint64, 0, len(l.segs))
+	for seg := range l.segs {
+		order = append(order, seg)
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	olderRetained := false
+	for _, seg := range order {
+		info := l.segs[seg]
+		isActive := l.active != nil && seg == l.activeSeg
+		if info.live <= 0 && !isActive && (info.tombs == 0 || !olderRetained) {
+			_ = os.Remove(l.segPath(seg))
+			delete(l.segs, seg)
+			continue
+		}
+		olderRetained = true
 	}
 }
 
@@ -295,33 +325,46 @@ func (l *recordLog[T]) needsSortLocked() bool {
 	return l.unsorted || (l.deadN >= 256 && l.deadN*2 >= len(l.entries))
 }
 
+// writeLineLocked appends one line (data has no newline) to the active
+// segment, rotating first when it would overflow, and returns where it landed.
+func (l *recordLog[T]) writeLineLocked(data []byte) (seg uint64, off int64, err error) {
+	need := int64(len(data)) + 1
+	if l.active != nil && l.activeSize > 0 && l.activeSize+need > l.segMax {
+		l.retireActiveLocked()
+	}
+	if err = l.ensureActiveLocked(); err != nil {
+		return 0, 0, err
+	}
+	buf := make([]byte, 0, need)
+	buf = append(buf, data...)
+	buf = append(buf, '\n')
+	if _, err = l.active.Write(buf); err != nil {
+		// A short write may have left a partial line; abandon the segment
+		// so later records start on a clean line in a new file.
+		l.retireActiveLocked()
+		return 0, 0, fmt.Errorf("write history record: %w", err)
+	}
+	off = l.activeSize
+	l.activeSize += need
+	l.segs[l.activeSeg].size = l.activeSize
+	return l.activeSeg, off, nil
+}
+
 // append writes one already-marshaled record. data must contain no newline.
 func (l *recordLog[T]) append(rec *T, data []byte) error {
+	if id, _, _ := l.spec.identify(rec); id == "" {
+		return errors.New("history record has no ID")
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.closed {
 		return errors.New("history log is closed")
 	}
-	need := int64(len(data)) + 1
-	if l.active != nil && l.activeSize > 0 && l.activeSize+need > l.segMax {
-		l.retireActiveLocked()
-	}
-	if err := l.ensureActiveLocked(); err != nil {
+	seg, off, err := l.writeLineLocked(data)
+	if err != nil {
 		return err
 	}
-	buf := make([]byte, 0, need)
-	buf = append(buf, data...)
-	buf = append(buf, '\n')
-	if _, err := l.active.Write(buf); err != nil {
-		// A short write may have left a partial line; abandon the segment
-		// so later records start on a clean line in a new file.
-		l.retireActiveLocked()
-		return fmt.Errorf("write history record: %w", err)
-	}
-	off := l.activeSize
-	l.activeSize += need
-	l.segs[l.activeSeg].size = l.activeSize
-	l.addLocked(rec, l.activeSeg, off, len(data), nil)
+	l.addLocked(rec, seg, off, len(data), nil)
 	return nil
 }
 
@@ -341,18 +384,15 @@ func (l *recordLog[T]) ensureActiveLocked() error {
 	return nil
 }
 
-// retireActiveLocked stops appending to the current segment, deleting it if
-// nothing live remains in it.
+// retireActiveLocked stops appending to the current segment; it is then
+// subject to garbage collection like any other.
 func (l *recordLog[T]) retireActiveLocked() {
 	if l.active == nil {
 		return
 	}
 	_ = l.active.Close()
 	l.active = nil
-	if info := l.segs[l.activeSeg]; info != nil && info.live <= 0 {
-		_ = os.Remove(l.segPath(l.activeSeg))
-		delete(l.segs, l.activeSeg)
-	}
+	l.gcLocked()
 }
 
 // tombstone deletes a record by ID, durably across restarts.
@@ -363,32 +403,42 @@ func (l *recordLog[T]) tombstone(id string) (bool, error) {
 	if e == nil {
 		return false, nil
 	}
+	// Write the tombstone before removing the entry: removal may delete the
+	// record's segment, and the line must land in a segment that outlives it.
+	seg, _, err := l.writeLineLocked([]byte("-" + id))
+	if err == nil {
+		l.segs[seg].tombs++
+	}
 	l.removeLocked(e)
-	if err := l.ensureActiveLocked(); err != nil {
-		return true, err
-	}
-	if _, err := l.active.Write([]byte("-" + id + "\n")); err != nil {
+	if err != nil {
 		return true, fmt.Errorf("write tombstone: %w", err)
-	}
-	l.activeSize += int64(len(id)) + 2
-	if info := l.segs[l.activeSeg]; info != nil {
-		info.size = l.activeSize
 	}
 	return true, nil
 }
 
 // snapshot returns copies of the index rows matching match, newest first.
 func (l *recordLog[T]) snapshot(match func(*T) bool) []logEntry[T] {
-	l.mu.Lock()
-	if l.needsSortLocked() {
-		l.sortedLocked()
-	}
-	l.mu.Unlock()
+	return l.snapshotLimit(match, -1)
+}
 
-	l.mu.RLock()
+// snapshotLimit is snapshot capped at limit rows (limit < 0 means no cap).
+func (l *recordLog[T]) snapshotLimit(match func(*T) bool, limit int) []logEntry[T] {
+	for {
+		l.mu.RLock()
+		if !l.needsSortLocked() {
+			break
+		}
+		l.mu.RUnlock()
+		l.mu.Lock()
+		l.sortedLocked()
+		l.mu.Unlock()
+	}
 	defer l.mu.RUnlock()
 	var out []logEntry[T]
 	for i := len(l.entries) - 1; i >= 0; i-- {
+		if limit >= 0 && len(out) >= limit {
+			break
+		}
 		e := l.entries[i]
 		if e.dead || (match != nil && !match(e.light)) {
 			continue
@@ -409,8 +459,19 @@ func (l *recordLog[T]) lookup(id string) (logEntry[T], bool) {
 	return *e, true
 }
 
-// load reads the full record for an index row from disk.
+// load reads the full record for an index row from disk. If the row went stale
+// because compaction moved the record, it follows the record to its new home.
 func (l *recordLog[T]) load(e logEntry[T]) (*T, error) {
+	rec, err := l.loadAt(e)
+	if errors.Is(err, errRecordGone) {
+		if cur, ok := l.lookup(e.id); ok && (cur.seg != e.seg || cur.off != e.off) {
+			return l.loadAt(cur)
+		}
+	}
+	return rec, err
+}
+
+func (l *recordLog[T]) loadAt(e logEntry[T]) (*T, error) {
 	f, err := os.Open(l.segPath(e.seg))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -457,6 +518,69 @@ func (l *recordLog[T]) groups() []string {
 		out = append(out, g)
 	}
 	return out
+}
+
+// compactSparse rewrites mostly-dead segments. Segments are only deleted when
+// nothing live remains, so one long-lived record (say, a quiet server's) would
+// otherwise pin a whole segment of otherwise-dead data indefinitely. Live
+// records in segments that are under half live are copied to the active
+// segment and the old file is removed. Segments holding tombstones are left
+// alone. Returns the number of segments reclaimed.
+func (l *recordLog[T]) compactSparse() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return 0
+	}
+	cands := make(map[uint64][]*logEntry[T])
+	for seg, info := range l.segs {
+		if l.active != nil && seg == l.activeSeg {
+			continue
+		}
+		if info.tombs == 0 && info.live > 0 && info.liveBytes*2 < info.size {
+			cands[seg] = nil
+		}
+	}
+	if len(cands) == 0 {
+		return 0
+	}
+	for _, e := range l.entries {
+		if _, ok := cands[e.seg]; ok && !e.dead {
+			cands[e.seg] = append(cands[e.seg], e)
+		}
+	}
+	reclaimed := 0
+	for seg, entries := range cands {
+		src, err := os.Open(l.segPath(seg))
+		if err != nil {
+			continue
+		}
+		moved := 0
+		for _, e := range entries {
+			buf := make([]byte, e.n)
+			if _, err := src.ReadAt(buf, e.off); err != nil {
+				break
+			}
+			newSeg, newOff, err := l.writeLineLocked(buf)
+			if err != nil {
+				break
+			}
+			from := l.segs[seg]
+			from.live--
+			from.liveBytes -= int64(e.n)
+			to := l.segs[newSeg]
+			to.live++
+			to.liveBytes += int64(e.n)
+			e.seg, e.off = newSeg, newOff
+			moved++
+		}
+		_ = src.Close()
+		if moved == len(entries) {
+			reclaimed++
+		}
+	}
+	l.gcLocked()
+	return reclaimed
 }
 
 // pruneOlderThan removes records with a timestamp before cutoff.

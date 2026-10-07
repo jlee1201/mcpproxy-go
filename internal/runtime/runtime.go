@@ -841,42 +841,31 @@ func (r *Runtime) GetToolCallByID(id string) (*contracts.ToolCallRecord, error) 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Search through all server tool calls
-	identities, err := r.storageManager.ListServerIdentities()
+	call, err := r.storageManager.GetToolCallByID(id)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list server identities: %w", err)
+		return nil, fmt.Errorf("failed to load tool call: %w", err)
 	}
-
-	for _, identity := range identities {
-		calls, err := r.storageManager.GetServerToolCalls(identity.ID, 1000)
-		if err != nil {
-			continue
-		}
-
-		for _, call := range calls {
-			if call.ID == id {
-				return &contracts.ToolCallRecord{
-					ID:               call.ID,
-					ServerID:         call.ServerID,
-					ServerName:       call.ServerName,
-					ToolName:         call.ToolName,
-					Arguments:        call.Arguments,
-					Response:         call.Response,
-					Error:            call.Error,
-					Duration:         call.Duration,
-					Timestamp:        call.Timestamp,
-					ConfigPath:       call.ConfigPath,
-					RequestID:        call.RequestID,
-					Metrics:          convertTokenMetrics(call.Metrics),
-					ParentCallID:     call.ParentCallID,
-					ExecutionType:    call.ExecutionType,
-					MCPSessionID:     call.MCPSessionID,
-					MCPClientName:    call.MCPClientName,
-					MCPClientVersion: call.MCPClientVersion,
-					Annotations:      convertToolAnnotations(call.Annotations),
-				}, nil
-			}
-		}
+	if call != nil {
+		return &contracts.ToolCallRecord{
+			ID:               call.ID,
+			ServerID:         call.ServerID,
+			ServerName:       call.ServerName,
+			ToolName:         call.ToolName,
+			Arguments:        call.Arguments,
+			Response:         call.Response,
+			Error:            call.Error,
+			Duration:         call.Duration,
+			Timestamp:        call.Timestamp,
+			ConfigPath:       call.ConfigPath,
+			RequestID:        call.RequestID,
+			Metrics:          convertTokenMetrics(call.Metrics),
+			ParentCallID:     call.ParentCallID,
+			ExecutionType:    call.ExecutionType,
+			MCPSessionID:     call.MCPSessionID,
+			MCPClientName:    call.MCPClientName,
+			MCPClientVersion: call.MCPClientVersion,
+			Annotations:      convertToolAnnotations(call.Annotations),
+		}, nil
 	}
 
 	return nil, fmt.Errorf("tool call not found: %s", id)
