@@ -23,8 +23,8 @@ type OnlineCompactionOptions struct {
 	InitialDelay    time.Duration // first check after start; lets startup contention clear
 	Interval        time.Duration // period between checks
 	MinFileBytes    int64         // don't bother below this file size
-	MinReclaimBytes int64         // free+pending pages must be at least this many bytes...
-	MinReclaimRatio float64       // ...and at least this fraction of the file
+	MinReclaimBytes int64         // waste inside allocated pages (allocated - in-use) must be at least this many bytes...
+	MinReclaimRatio float64       // ...and at least this fraction of the allocated pages
 	MaxLiveBytes    int64         // skip if live data exceeds this: every DB op blocks while compacting
 	MinGap          time.Duration // minimum spacing between successful compactions
 	LockWait        time.Duration // how long to wait for in-flight transactions to drain
@@ -37,7 +37,7 @@ func DefaultOnlineCompactionOptions() OnlineCompactionOptions {
 		Interval:        10 * time.Minute,
 		MinFileBytes:    compactionThresholdBytes,
 		MinReclaimBytes: compactionMinReclaimableBytes,
-		MinReclaimRatio: 0.30,
+		MinReclaimRatio: 0.50,
 		MaxLiveBytes:    64 * 1024 * 1024,
 		MinGap:          time.Hour,
 		LockWait:        30 * time.Second,
@@ -55,6 +55,13 @@ type compactorState struct {
 
 	lastCompact time.Time // guarded by BoltDB.mu write lock / loop goroutine only
 	lastFailure time.Time // same guard; failed passes back off by MinGap too
+
+	// Allocated bytes (high-water mark) right after the last successful
+	// compaction. Waste below this was already as good as compaction could
+	// make it, so only growth beyond it counts as reclaimable. Guards against
+	// re-compacting forever when in-use bytes under-predict the packed size
+	// (large values packing badly into pages). Same guard as lastCompact.
+	lastCompactedAllocated int64
 
 	warnedLiveTooLarge atomic.Bool // log the MaxLiveBytes skip once, not every interval
 }
@@ -180,16 +187,27 @@ func (b *BoltDB) shouldCompactOnline(opts OnlineCompactionOptions) bool {
 	if err != nil {
 		return false
 	}
-	size := info.Size()
-	if size < opts.MinFileBytes {
+	if info.Size() < opts.MinFileBytes {
 		return false
 	}
-	stats := b.db.Stats()
-	free := int64(stats.FreePageN+stats.PendingPageN) * int64(b.db.Info().PageSize)
-	if free < opts.MinReclaimBytes || float64(free) < opts.MinReclaimRatio*float64(size) {
+	allocated, live, err := compactionEstimate(b.db)
+	if err != nil {
+		b.logger.Warnw("Online compaction skipped: could not estimate compacted size", "error", err)
 		return false
 	}
-	if live := size - free; live > opts.MaxLiveBytes {
+	// Reclaimable = fragmentation inside allocated pages, measured against the
+	// high-water mark, NOT the file size: bbolt pads the file with up to 16MB
+	// of growth slack that compaction cannot durably remove (the next growth
+	// re-adds it), so file-size-based gates re-fire forever.
+	floor := live
+	if b.compactor.lastCompactedAllocated > floor {
+		floor = b.compactor.lastCompactedAllocated
+	}
+	free := allocated - floor
+	if free < opts.MinReclaimBytes || float64(free) < opts.MinReclaimRatio*float64(allocated) {
+		return false
+	}
+	if live > opts.MaxLiveBytes {
 		if b.compactor.warnedLiveTooLarge.CompareAndSwap(false, true) {
 			b.logger.Warnw("Online compaction skipped: live data too large to compact while holding the database lock",
 				"live_bytes", live, "max_live_bytes", opts.MaxLiveBytes)
@@ -247,6 +265,9 @@ func (b *BoltDB) swapCompactedLocked() error {
 	old := b.db
 	b.db = dst
 	b.compactor.lastCompact = time.Now()
+	if alloc, _, err := compactionEstimate(dst); err == nil {
+		b.compactor.lastCompactedAllocated = alloc
+	}
 	if err := old.Close(); err != nil {
 		b.logger.Warnw("Failed to close pre-compaction db handle after swap", "error", err)
 	}
@@ -261,4 +282,34 @@ func (b *BoltDB) swapCompactedLocked() error {
 		"reclaimed_bytes", beforeInfo.Size()-after,
 		"db_paused_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// compactionEstimate returns the bytes allocated to pages (the high-water
+// mark) and an estimate of the bytes a compaction would pack them into: the
+// bytes actually in use across all buckets (bbolt.Compact repacks pages full)
+// plus a few pages of meta/freelist/root overhead.
+//
+// Free-list size is the wrong measure of reclaimable space. Retention deletes
+// leave leaf pages sparsely filled but still allocated, so a 62MB file can
+// hold ~12MB of data with only a handful of pages on the freelist (observed
+// 2026-10-07: 16KB pages, 5 free pages, 46MB allocated for ~12MB in use).
+// It takes its own read transaction.
+func compactionEstimate(db *bbolt.DB) (allocated, live int64, err error) {
+	var inuse, pageSize int64
+	err = db.View(func(tx *bbolt.Tx) error {
+		allocated = tx.Size()
+		// Info() reads the mmap pointer; only safe while a read tx holds
+		// bbolt's mmap lock, or it races a concurrent writer's remap.
+		pageSize = int64(db.Info().PageSize)
+		return tx.ForEach(func(_ []byte, b *bbolt.Bucket) error {
+			st := b.Stats() // aggregates nested buckets
+			inuse += int64(st.BranchInuse + st.LeafInuse)
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	const overheadPages = 8 // 2 meta + freelist + bucket-root pages, rounded up
+	return allocated, inuse + overheadPages*pageSize, nil
 }

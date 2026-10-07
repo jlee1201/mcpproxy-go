@@ -622,7 +622,7 @@ func (b *BoltDB) ListOAuthTokens() ([]*OAuthTokenRecord, error) {
 	return records, err
 }
 
-// compactionMinReclaimableBytes is the minimum estimated free-page space
+// compactionMinReclaimableBytes is the minimum estimated reclaimable space
 // (see estimateReclaimableBytes) worth reclaiming via a full-file
 // compaction. A file can sit above compactionThresholdBytes purely from
 // live data -- no free pages at all -- in which case bbolt.Compact would
@@ -750,8 +750,8 @@ func maybeCompactOnStartupForGOOS(dbPath string, logger *zap.SugaredLogger, goos
 	}
 }
 
-// estimateReclaimableBytes opens dbPath just long enough to read bbolt's
-// free-page stats, then closes it, to gate startup compaction on actual
+// estimateReclaimableBytes opens dbPath just long enough to measure waste
+// inside allocated pages (see compactionEstimate), then closes it, to gate startup compaction on actual
 // reclaimable space rather than raw file size (see
 // compactionMinReclaimableBytes). It deliberately does NOT open read-only:
 // bbolt only populates FreePageN eagerly at Open() when PreLoadFreelist is
@@ -772,8 +772,16 @@ func estimateReclaimableBytes(dbPath string, lockTimeout time.Duration) (int64, 
 	}
 	defer func() { _ = db.Close() }()
 
-	stats := db.Stats()
-	return int64(stats.FreePageN) * int64(db.Info().PageSize), nil
+	// Waste inside allocated pages, not freelist size: sparse-but-allocated
+	// pages are the bulk of it and never appear on the freelist.
+	allocated, live, err := compactionEstimate(db)
+	if err != nil {
+		return 0, err
+	}
+	if reclaimable := allocated - live; reclaimable > 0 {
+		return reclaimable, nil
+	}
+	return 0, nil
 }
 
 // Startup estimate retry budget: attempts x (lockTimeout + delay) is roughly

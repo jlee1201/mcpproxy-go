@@ -159,15 +159,19 @@ func TestCompactOnline_ConcurrentWritersLoseNothing(t *testing.T) {
 			}
 		}(w)
 	}
-	// Reader that nests View inside View, the pattern that would deadlock
-	// against a blocking writer lock.
+	// Reader that re-enters the BoltDB read lock, the pattern that would
+	// deadlock against a blocking writer lock (a pending Lock() queues new
+	// RLock calls). It nests only the wrapper's RWMutex, not two bbolt read
+	// transactions: nested bbolt read txs deadlock against a writer that needs
+	// to remap the file (bbolt's mmaplock), which is bbolt's own documented
+	// hazard and fires readily on 4KB-page Linux, independent of compaction.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for !stop.Load() {
-			_ = db.View(func(tx *bbolt.Tx) error {
-				return db.View(func(tx2 *bbolt.Tx) error { return nil })
-			})
+			db.mu.RLock()
+			_ = db.View(func(tx *bbolt.Tx) error { return nil })
+			db.mu.RUnlock()
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
@@ -434,4 +438,78 @@ func TestStartOnlineCompaction_NoopAfterClose(t *testing.T) {
 	require.NoError(t, db.Close())
 	db.StartOnlineCompaction(forceOpts())
 	assert.Nil(t, db.compactor.cancel, "must not spawn a compactor on a closed db")
+}
+
+// Retention deletes leave pages allocated but sparsely filled, with an almost
+// empty freelist. The gate must key off waste inside allocated pages, not
+// freelist size (2026-10-07: a 62MB config.db with 5 free pages never compacted).
+func TestCompactOnline_ReclaimsSparsePagesWithEmptyFreelist(t *testing.T) {
+	skipIfWindows(t)
+	dir := t.TempDir()
+	db, err := NewBoltDB(dir, testLogger(t))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	path := filepath.Join(dir, configDBFilename)
+
+	// Values are pageSize/8 so that bbolt's 2-keys-per-page minimum leaves
+	// pages ~25% full at ANY page size (4KB on linux, 16KB on darwin/arm64);
+	// FillPercent 0.1 makes sequential inserts split as early as allowed.
+	db.mu.RLock()
+	pageSize := db.db.Info().PageSize
+	db.mu.RUnlock()
+	val := make([]byte, pageSize/8)
+	keys := (3 << 20) / len(val) // ~3MB of data
+	require.NoError(t, db.Update(func(tx *bbolt.Tx) error {
+		b, err := tx.CreateBucketIfNotExists([]byte("sparse"))
+		if err != nil {
+			return err
+		}
+		b.FillPercent = 0.1
+		for i := 0; i < keys; i++ {
+			if err := b.Put([]byte(fmt.Sprintf("k%06d", i)), val); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	db.mu.RLock()
+	free := db.db.Stats().FreePageN
+	db.mu.RUnlock()
+	require.Less(t, free, 20, "fixture must leave the freelist nearly empty")
+
+	opts := OnlineCompactionOptions{
+		MinFileBytes:    1 << 20,
+		MinReclaimBytes: 1 << 20,
+		MinReclaimRatio: 0.50,
+		MaxLiveBytes:    1 << 40,
+		LockWait:        5 * time.Second,
+	}
+	before := fileSize(t, path)
+	require.True(t, db.shouldCompactOnline(opts), "sparse pages must count as reclaimable")
+
+	ok, err := db.compactOnline(context.Background(), opts)
+	require.NoError(t, err)
+	require.True(t, ok)
+	after := fileSize(t, path)
+	assert.Less(t, after, before/2, "before=%d after=%d", before, after)
+
+	var n int
+	require.NoError(t, db.View(func(tx *bbolt.Tx) error {
+		n = tx.Bucket([]byte("sparse")).Stats().KeyN
+		return nil
+	}))
+	assert.Equal(t, keys, n)
+
+	// The estimator tracks reality: in-use estimate is within 25% of the
+	// allocated bytes the compacted file actually has.
+	db.mu.RLock()
+	allocated, est, err := compactionEstimate(db.db)
+	db.mu.RUnlock()
+	require.NoError(t, err)
+	assert.InDelta(t, float64(allocated), float64(est), 0.25*float64(allocated), "est=%d allocated=%d", est, allocated)
+
+	// No refire: with MinGap out of the picture, an immediately repeated gate
+	// check must say no (bbolt's growth slack and bad page packing must not
+	// read as reclaimable forever).
+	assert.False(t, db.shouldCompactOnline(opts), "freshly compacted db must not look reclaimable again")
 }
