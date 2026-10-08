@@ -2376,9 +2376,8 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		}
 	}
 
-	// Continue with OAuth flow regardless of DCR result
-	// Public client OAuth (RFC 8252) with PKCE doesn't require client_id
-	// If server doesn't support this, it will reject the authorization request
+	// A failed DCR with no client_id never reaches here (dcrFailureAbort returns above):
+	// authorize requests require client_id (RFC 6749 s4.1.1).
 
 	c.logger.Info("🌟 Starting OAuth authentication flow",
 		zap.String("server", c.config.Name),
@@ -2387,7 +2386,7 @@ func (c *Client) handleOAuthAuthorization(ctx context.Context, authErr error, oa
 		zap.String("mode", oauthMode))
 
 	// Get the authorization URL
-	// Works with: static credentials, DCR, or public client OAuth (empty client_id + PKCE)
+	// Works with: static credentials, persisted DCR credentials, or a fresh DCR registration
 	var authURL string
 	var authURLErr error
 	func() {
@@ -2715,7 +2714,7 @@ func (c *Client) handleOAuthAuthorizationWithResult(ctx context.Context, authErr
 		c.logger.Info("📋 Attempting Dynamic Client Registration (optional)",
 			zap.String("server", c.config.Name))
 
-		// Note: DCR attempt is logged but we continue even if it fails
+		// A DCR failure without a client_id aborts below (dcrFailureAbort)
 		var regErr error
 		func() {
 			defer func() {
@@ -3197,14 +3196,12 @@ func (c *Client) StartOAuthFlowQuick(ctx context.Context) (result *OAuthStartRes
 // authorize URL without client_id, which providers (e.g. Runlayer) reject with a 422
 // "client_id Field required" page. A transient DCR failure (timeout, 5xx, 429, network)
 // should instead surface as a retryable error. Returns nil if a client_id is available.
+// Callers log regErr themselves. RegisterClient only sets the handler's client_id on
+// success, so the guard below is defensive.
 func (c *Client) dcrFailureAbort(oauthHandler *uptransport.OAuthHandler, regErr error, correlationID string) *contracts.OAuthFlowError {
 	if oauthHandler != nil && oauthHandler.GetClientID() != "" {
 		return nil
 	}
-	c.logger.Error("❌ DCR failed and no client_id available - aborting before opening browser",
-		zap.String("server", c.config.Name),
-		zap.String("correlation_id", correlationID),
-		zap.Error(regErr))
 	return &contracts.OAuthFlowError{
 		Success:       false,
 		ErrorType:     contracts.OAuthErrorDCRFailed,
